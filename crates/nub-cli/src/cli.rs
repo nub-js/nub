@@ -6008,6 +6008,9 @@ fn build_script_command(
         aug.apply_localstorage_env(|k, v| {
             command.env(k, v);
         });
+        aug.apply_threadpool_size(|k, v| {
+            command.env(k, v);
+        });
     }
     if let Some(runtime_json) = runtime_json {
         command.env(crate::project_config::RUNTIME_CONFIG_ENV, runtime_json);
@@ -7215,6 +7218,22 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
                 launcher_owned_env_keys.push(key.to_string());
             },
         );
+        // libuv threadpool sizing, the same install every other augmented launcher
+        // makes (spawn.rs THREADPOOL_SIZE_ENV); watch's supervisor re-execs the
+        // child with this environment, so it survives every restart.
+        if env::var_os(nub_core::node::spawn::THREADPOOL_SIZE_ENV).is_none() {
+            let size = nub_core::node::spawn::threadpool_size().to_string();
+            cmd.env(nub_core::node::spawn::THREADPOOL_SIZE_ENV, &size);
+            launcher_owned_env_keys.push(nub_core::node::spawn::THREADPOOL_SIZE_ENV.to_string());
+            nub_core::node::spawn::apply_expected_augmentation_marker(
+                nub_core::node::spawn::THREADPOOL_SIZE_ENV,
+                Some(std::ffi::OsStr::new(&size)),
+                |key, value| {
+                    cmd.env(key, value);
+                    launcher_owned_env_keys.push(key.to_string());
+                },
+            );
+        }
     }
     // Node's Windows watch supervisor first registers the long-spelled env-file
     // directory, then registers module paths reported by the watched child. If
@@ -7675,6 +7694,9 @@ fn apply_exec_augmentation(cmd: &mut std::process::Command, cwd: &Path) -> Resul
         cmd.env(key, value);
     });
     aug.apply_localstorage_env(|k, v| {
+        cmd.env(k, v);
+    });
+    aug.apply_threadpool_size(|k, v| {
         cmd.env(k, v);
     });
     cmd.env(crate::project_config::RUNTIME_CONFIG_ENV, runtime_json);

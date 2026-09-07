@@ -62,6 +62,43 @@ fn augmented_sizes_pool_to_cores() {
     );
 }
 
+/// `nub run` goes through the shared script-runner environment rather than the
+/// direct spawn, so it is covered on its own: the script's `node` child carries
+/// the same value a direct run gets.
+#[test]
+fn run_script_children_get_the_same_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(fixture(), dir.path().join("size.js")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "name": "tp", "private": true, "scripts": { "probe": "node size.js" } }"#,
+    )
+    .unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["run", "probe"])
+        .current_dir(dir.path())
+        .env_remove("UV_THREADPOOL_SIZE");
+    let output = cmd.output().expect("failed to spawn nub");
+    assert!(
+        output.status.success(),
+        "nub run exited {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .expect("fixture JSON line in `nub run` output");
+    let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+    let direct = run(&[], &[]);
+    assert_eq!(
+        v["size"], direct["size"],
+        "`nub run` must size the pool exactly as a direct run does"
+    );
+}
+
 /// A value the user set is theirs, whatever the core count.
 #[test]
 fn user_value_is_never_overwritten() {

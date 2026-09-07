@@ -1008,8 +1008,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // libuv threadpool sized to the cores (see THREADPOOL_SIZE_ENV). Only when the
         // user has not set it; inherited by the augmented subtree like NODE_OPTIONS,
         // and undone at a compat boundary through the restore markers.
-        if env::var_os(THREADPOOL_SIZE_ENV).is_none() {
-            let size = threadpool_size().to_string();
+        if let Some(size) = threadpool_size_to_install() {
             cmd.env(THREADPOOL_SIZE_ENV, &size);
             mark_augmented(&mut cmd, THREADPOOL_SIZE_ENV, Some(OsStr::new(&size)));
         }
@@ -2282,6 +2281,7 @@ pub fn compute_augmentation_env(
         shim_dir,
         node_path: vendored_node_path(Some(&preload)),
         neutralize_localstorage,
+        threadpool_size: threadpool_size_to_install(),
     })
 }
 
@@ -2300,9 +2300,26 @@ pub struct AugmentationEnv {
     /// apply it via [`AugmentationEnv::apply_localstorage_env`]. See
     /// `flags::should_neutralize_experimental_webstorage_localstorage`.
     pub neutralize_localstorage: bool,
+    /// The libuv threadpool size to install — `Some` unless the user already set
+    /// [`THREADPOOL_SIZE_ENV`]. Consumers apply it via
+    /// [`AugmentationEnv::apply_threadpool_size`].
+    pub threadpool_size: Option<String>,
 }
 
 impl AugmentationEnv {
+    /// Install the threadpool size (when nub owns it) together with its ownership
+    /// marker, so a compat boundary removes exactly what nub added.
+    pub fn apply_threadpool_size(&self, mut set_env: impl FnMut(&str, &OsStr)) {
+        if let Some(size) = &self.threadpool_size {
+            set_env(THREADPOOL_SIZE_ENV, OsStr::new(size));
+            apply_expected_augmentation_marker(
+                THREADPOOL_SIZE_ENV,
+                Some(OsStr::new(size)),
+                &mut set_env,
+            );
+        }
+    }
+
     /// Preserve the environment that a later compat-mode PATH-shim re-entry must
     /// restore before it launches plain Node. A separate presence bitmask keeps
     /// an explicitly empty value distinct from an absent variable.
@@ -2521,14 +2538,42 @@ static RESTORABLE_VARS: [RestorableVar; 6] = [
 /// A `UV_THREADPOOL_SIZE` already in the environment is the user's and is never
 /// overwritten; the variable is restorable, so a compat re-entry (`--node`,
 /// `NODE_COMPAT`) or a fresh nested nub sees the pre-augmentation environment.
+/// Every augmented launcher applies it: the direct spawn here, and `nub run`,
+/// `nubx`/`exec`, lifecycle scripts and `nub watch` through
+/// [`AugmentationEnv::apply_threadpool_size`] or its equivalent.
+///
+/// libuv creates the WHOLE pool on first use and aborts the process if one
+/// thread fails (`uv_thread_create_ex` → `abort()` in threadpool.c), and
+/// `available_parallelism` knows nothing of a cgroup `pids.max` or
+/// `RLIMIT_NPROC`. So the value is clamped by [`crate::resource_limits::spawn_headroom`],
+/// the same detector that keeps the package manager's pools under a
+/// constrained box's ceiling.
 pub const THREADPOOL_SIZE_ENV: &str = "UV_THREADPOOL_SIZE";
 
-/// `max(4, available cores)` — see [`THREADPOOL_SIZE_ENV`].
+/// The pool nub asks for on this box — see [`THREADPOOL_SIZE_ENV`].
 pub fn threadpool_size() -> usize {
-    std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
-        .max(4)
+        .unwrap_or(1);
+    threadpool_size_from(cores, crate::resource_limits::spawn_headroom())
+}
+
+/// `max(4, cores)`, clamped to the detected thread headroom and never below
+/// libuv's own default of 4 (where plain Node would abort just the same).
+pub fn threadpool_size_from(cores: usize, headroom: Option<usize>) -> usize {
+    let wanted = cores.max(4);
+    match headroom {
+        Some(room) if room < wanted => room.max(4),
+        _ => wanted,
+    }
+}
+
+/// The threadpool value an augmented launcher installs: `Some` when the user
+/// has not set [`THREADPOOL_SIZE_ENV`], `None` to leave theirs alone.
+fn threadpool_size_to_install() -> Option<String> {
+    env::var_os(THREADPOOL_SIZE_ENV)
+        .is_none()
+        .then(|| threadpool_size().to_string())
 }
 
 /// Stamp the exact value a parent installed for one rewritten environment
@@ -6026,6 +6071,22 @@ mod tests {
             "no preload resolved"
         );
         assert!(!is_reentrant_in(Some(""), Some(ours)), "empty NODE_OPTIONS");
+    }
+
+    #[test]
+    fn threadpool_size_is_cores_floored_at_four_and_clamped_to_headroom() {
+        // The rule nodejs/performance#193 proposes: max(4, cores).
+        assert_eq!(threadpool_size_from(1, None), 4);
+        assert_eq!(threadpool_size_from(4, None), 4);
+        assert_eq!(threadpool_size_from(10, None), 10);
+        assert_eq!(threadpool_size_from(64, None), 64);
+        // A detected thread ceiling clamps it — libuv aborts if one pool thread
+        // cannot be created — but never below the default plain Node would ask for.
+        assert_eq!(threadpool_size_from(64, Some(16)), 16);
+        assert_eq!(threadpool_size_from(64, Some(2)), 4);
+        assert_eq!(threadpool_size_from(8, Some(100)), 8);
+        // A restorable-var slot exists for it, so a compat boundary removes it.
+        assert!(RestorableVar::lookup(THREADPOOL_SIZE_ENV).is_some());
     }
 
     #[test]

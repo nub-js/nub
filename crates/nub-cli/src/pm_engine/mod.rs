@@ -68,7 +68,7 @@ pub mod platform_flags;
 pub mod present;
 pub mod publish_family;
 mod remix_compat;
-mod resource_limits;
+use nub_core::resource_limits;
 pub mod store_config_family;
 pub mod unsupported_config;
 pub mod use_align;
@@ -1860,6 +1860,9 @@ fn augmentation_to_lifecycle_overlay(
     // (webstorage flag-needed band, no user --localstorage-file); preload reads + deletes.
     aug.apply_localstorage_env(|k, v| {
         overlay.push((OsString::from(k), OsString::from(v)));
+    });
+    aug.apply_threadpool_size(|k, v| {
+        overlay.push((OsString::from(k), v.to_os_string()));
     });
     // Pin npm_node_execpath to the provisioned Node — the ABI fix. Independent
     // of the shim: it flows even on the no-shim path so node-gyp never falls
