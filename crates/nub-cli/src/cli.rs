@@ -258,7 +258,7 @@ fn overlay_env_file_vars(env_map: &mut HashMap<String, String>) {
     }
     if let Some(vars) = ENV_FILE_VARS.get() {
         for (k, v) in vars {
-            if env::var_os(k).is_none() {
+            if nub_core::workspace::env::env_file_may_set(k) {
                 env_map.insert(k.clone(), v.clone());
             }
         }
@@ -300,7 +300,7 @@ fn merge_child_env(
     // Overlay the explicit vars: shell env still wins; `--env-file` overrides any
     // `.env` value that survives (only relevant when no flag was passed).
     for (k, v) in explicit_vars {
-        if env::var_os(k).is_none() {
+        if nub_core::workspace::env::env_file_may_set(k) {
             env_map.insert(k.clone(), v.clone());
         }
     }
@@ -572,7 +572,7 @@ fn apply_env_file_vars(cmd: &mut std::process::Command) {
     }
     if let Some(vars) = ENV_FILE_VARS.get() {
         for (k, v) in vars {
-            if env::var_os(k).is_none() {
+            if nub_core::workspace::env::env_file_may_set(k) {
                 cmd.env(k, v);
             }
         }
@@ -601,7 +601,7 @@ pub(crate) fn dlx_child_env(compat_mode: bool) -> BTreeMap<String, String> {
         return values;
     }
     for (key, value) in ENV_FILE_VARS.get().into_iter().flatten() {
-        if env::var_os(key).is_none() {
+        if nub_core::workspace::env::env_file_may_set(key) {
             values.insert(key.clone(), value.clone());
         }
     }
@@ -4380,7 +4380,7 @@ fn load_runtime_env_sources_raw(paths: &[PathBuf]) -> Result<HashMap<String, Str
             )
         })?;
         for (key, value) in nub_core::workspace::env::parse_env(&content) {
-            if env::var_os(&key).is_some()
+            if !nub_core::workspace::env::env_file_may_set(&key)
                 || runtime_env_keys_equal(&key, "NODE_ENV", cfg!(windows))
             {
                 continue;
@@ -7220,19 +7220,39 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
         );
         // libuv threadpool sizing, the same install every other augmented launcher
         // makes (spawn.rs THREADPOOL_SIZE_ENV); watch's supervisor re-execs the
-        // child with this environment, so it survives every restart.
-        if env::var_os(nub_core::node::spawn::THREADPOOL_SIZE_ENV).is_none() {
-            let size = nub_core::node::spawn::threadpool_size().to_string();
-            cmd.env(nub_core::node::spawn::THREADPOOL_SIZE_ENV, &size);
-            launcher_owned_env_keys.push(nub_core::node::spawn::THREADPOOL_SIZE_ENV.to_string());
-            nub_core::node::spawn::apply_expected_augmentation_marker(
-                nub_core::node::spawn::THREADPOOL_SIZE_ENV,
-                Some(std::ffi::OsStr::new(&size)),
-                |key, value| {
-                    cmd.env(key, value);
-                    launcher_owned_env_keys.push(key.to_string());
-                },
-            );
+        // child with this environment, so it survives every restart. An env-file
+        // value is the user's: a forwarded file reaches Node as `--env-file`,
+        // which never overrides a value already in the command environment, so
+        // the install stands down — and an inherited nub default (a `nub run`
+        // script running `nub watch`) is removed so the file's value can land.
+        {
+            use nub_core::node::spawn::THREADPOOL_SIZE_ENV;
+            let file_sets_pool = env_vars.contains_key(THREADPOOL_SIZE_ENV);
+            let nub_default = nub_core::node::spawn::threadpool_size_is_nub_default();
+            let expected = if file_sets_pool {
+                if nub_default {
+                    cmd.env_remove(THREADPOOL_SIZE_ENV);
+                }
+                None
+            } else if env::var_os(THREADPOOL_SIZE_ENV).is_none() {
+                Some(nub_core::node::spawn::threadpool_size().to_string())
+            } else {
+                None
+            };
+            if let Some(size) = &expected {
+                cmd.env(THREADPOOL_SIZE_ENV, size);
+                launcher_owned_env_keys.push(THREADPOOL_SIZE_ENV.to_string());
+            }
+            if file_sets_pool || expected.is_some() {
+                nub_core::node::spawn::apply_expected_augmentation_marker(
+                    THREADPOOL_SIZE_ENV,
+                    expected.as_deref().map(std::ffi::OsStr::new),
+                    |key, value| {
+                        cmd.env(key, value);
+                        launcher_owned_env_keys.push(key.to_string());
+                    },
+                );
+            }
         }
     }
     // Node's Windows watch supervisor first registers the long-spelled env-file

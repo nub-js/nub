@@ -4,10 +4,14 @@
 //! Node reads the variable once at startup, so the spawn is the only place it
 //! can be set; nub sets it when the user has not, and leaves a user value alone.
 //! Under `--node` / `NODE_COMPAT` the variable is absent, the plain-Node
-//! fingerprint (libuv's own default of 4).
+//! fingerprint (libuv's own default of 4). A value from an env file is the
+//! user's too, on every launch path, while a shell value still beats the file.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn nub_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_nub"))
@@ -103,6 +107,106 @@ fn run_script_children_get_the_same_pool() {
 #[test]
 fn user_value_is_never_overwritten() {
     let v = run(&[], &[("UV_THREADPOOL_SIZE", "3")]);
+    assert_eq!(v["size"].as_str(), Some("3"));
+}
+
+/// A project whose `.env` sets the pool, with both fixtures and a `probe` script.
+fn project_with_env_file() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["size.js", "watch-size.js"] {
+        std::fs::copy(fixture().with_file_name(name), dir.path().join(name)).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "name": "tp", "private": true, "scripts": { "probe": "node size.js" } }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".env"), "UV_THREADPOOL_SIZE=3\n").unwrap();
+    dir
+}
+
+/// The first JSON line `nub <args>` prints from `dir`, killed if it outlives
+/// `limit` (a watch supervisor never exits on its own).
+fn first_json_line(dir: &Path, args: &[&str], env: &[(&str, &str)], limit: Duration) -> String {
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(args)
+        .current_dir(dir)
+        .env_remove("UV_THREADPOOL_SIZE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn nub");
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.trim_start().starts_with('{') {
+                let _ = tx.send(line);
+                break;
+            }
+        }
+    });
+    let line = rx.recv_timeout(limit);
+    let _ = child.kill();
+    let _ = child.wait();
+    line.unwrap_or_else(|_| {
+        panic!(
+            "no JSON line from `nub {}` within {limit:?}",
+            args.join(" ")
+        )
+    })
+}
+
+/// `.env` is the user's value on a direct run, and the shell still beats it.
+#[test]
+fn env_file_value_wins_on_a_direct_run_but_not_over_the_shell() {
+    let dir = project_with_env_file();
+    let from_file = first_json_line(dir.path(), &["size.js"], &[], Duration::from_secs(60));
+    let v: serde_json::Value = serde_json::from_str(&from_file).unwrap();
+    assert_eq!(
+        v["size"].as_str(),
+        Some("3"),
+        "the .env value must reach the script"
+    );
+    let from_shell = first_json_line(
+        dir.path(),
+        &["size.js"],
+        &[("UV_THREADPOOL_SIZE", "7")],
+        Duration::from_secs(60),
+    );
+    let v: serde_json::Value = serde_json::from_str(&from_shell).unwrap();
+    assert_eq!(
+        v["size"].as_str(),
+        Some("7"),
+        "a shell value must beat the .env value"
+    );
+}
+
+/// `nub run` installs nub's default, then the script's `node` re-enters nub
+/// through the shim, where `.env` is loaded: the installed default must read as
+/// nub's, not as a shell value the file may not touch.
+#[test]
+fn env_file_value_beats_the_installed_default_under_run() {
+    let dir = project_with_env_file();
+    let line = first_json_line(dir.path(), &["run", "probe"], &[], Duration::from_secs(60));
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["size"].as_str(), Some("3"));
+}
+
+/// Watch forwards `.env` to Node's own `--env-file`, which never overrides a
+/// value already in the command environment, so nub must not pre-install one.
+#[test]
+fn env_file_value_wins_in_watch_mode() {
+    let dir = project_with_env_file();
+    let line = first_json_line(
+        dir.path(),
+        &["watch", "watch-size.js"],
+        &[],
+        Duration::from_secs(90),
+    );
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(v["size"].as_str(), Some("3"));
 }
 

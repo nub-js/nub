@@ -2535,9 +2535,14 @@ static RESTORABLE_VARS: [RestorableVar; 6] = [
 /// 8. Cores come from `std::thread::available_parallelism`, which honors a cgroup
 /// CPU quota, so a container gets its quota, not the host's count.
 ///
-/// A `UV_THREADPOOL_SIZE` already in the environment is the user's and is never
-/// overwritten; the variable is restorable, so a compat re-entry (`--node`,
-/// `NODE_COMPAT`) or a fresh nested nub sees the pre-augmentation environment.
+/// A `UV_THREADPOOL_SIZE` the user set, in the shell or in an env file, is never
+/// overwritten. The shell case is the plain absence check below; the env-file
+/// case needs [`threadpool_size_is_nub_default`], because the launcher that
+/// installed nub's value never saw the file and a nested boundary (`nub run`'s
+/// script re-entering through the `node` shim, `nub watch` handing Node its
+/// `--env-file`) would otherwise read that value as the user's shell value. The
+/// variable is restorable, so a compat re-entry (`--node`, `NODE_COMPAT`) or a
+/// fresh nested nub sees the pre-augmentation environment.
 /// Every augmented launcher applies it: the direct spawn here, and `nub run`,
 /// `nubx`/`exec`, lifecycle scripts and `nub watch` through
 /// [`AugmentationEnv::apply_threadpool_size`] or its equivalent.
@@ -2566,6 +2571,20 @@ pub fn threadpool_size_from(cores: usize, headroom: Option<usize>) -> usize {
         Some(room) if room < wanted => room.max(4),
         _ => wanted,
     }
+}
+
+/// Whether the ambient [`THREADPOOL_SIZE_ENV`] is nub's own automatic value
+/// rather than the user's: present, and equal to the ownership marker the
+/// installing launcher stamped beside it. An env file may still set the pool
+/// size over such a value; over a shell value it may not.
+pub fn threadpool_size_is_nub_default() -> bool {
+    let Some(current) = env::var_os(THREADPOOL_SIZE_ENV) else {
+        return false;
+    };
+    let Some(var) = RestorableVar::lookup(THREADPOOL_SIZE_ENV) else {
+        return false;
+    };
+    matches!(expected_augmentation_value(var), Some(Some(expected)) if expected == current)
 }
 
 /// The threadpool value an augmented launcher installs: `Some` when the user
