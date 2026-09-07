@@ -144,7 +144,14 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
         if !e.specs.contains(&r.raw) {
             e.specs.push(r.raw.clone());
         }
-        e.files.insert(r.file.clone());
+        // Membership first, so a repeat reference from a file already recorded
+        // costs a lookup rather than a String clone that is then discarded.
+        // `classify` runs per package on the shipped install path (`scan_index`
+        // -> `reduce`), where a target referenced from one file forty times is
+        // ordinary, and nothing on that path ever reads `files`.
+        if !e.files.contains(r.file.as_str()) {
+            e.files.insert(r.file.clone());
+        }
     }
 
     by_pkg
