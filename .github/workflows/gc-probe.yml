@@ -1,0 +1,34 @@
+name: GC detector probe
+on:
+  push:
+    branches: [memory-aware-gc]
+    paths: [.github/workflows/gc-probe.yml]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Probe detector under a constrained service
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          source=Path('crates/nub-core/src/node/gc.rs').read_text()
+          start=source.index('fn read_constraint(')
+          end=source.index('#[cfg(test)]')
+          main='''fn main() {
+              let c=std::fs::read_to_string("/proc/self/cgroup").unwrap();
+              let m=std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+              println!("cgroup: {c}");
+              for line in m.lines().filter(|s|s.contains(" - cgroup")) { println!("mount: {line}"); }
+              let result=read_constraint(&c,&m,|p| {
+                  let result=std::fs::read_to_string(p);
+                  println!("read {p:?}: {result:?}"); result.ok()
+              });
+              println!("DETECTED: {result:?}");
+          }'''
+          Path('/tmp/gc-probe.rs').write_text('const MIB:u64=1024*1024;\n'+source[start:end]+main)
+          PY
+          rustc --edition=2024 /tmp/gc-probe.rs -o /tmp/gc-probe
+          sudo systemd-run --quiet --wait --pipe --collect --uid="$(id -u)" -p MemoryMax=512M -p MemorySwapMax=0 /tmp/gc-probe

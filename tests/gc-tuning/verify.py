@@ -79,7 +79,7 @@ if (require('node:worker_threads').isMainThread) {
             data = json.loads(result.stdout.strip().splitlines()[-1])
             assert data["node"] == "v" + version, data
             if label == "nub" and memory == 512 and data["mainHeap"] != 304:
-                diagnostic = subprocess.run(invocation + [node, "-e", """
+                diagnostic = subprocess.run(invocation + [node, "-e", r"""
 const fs = require('fs'), path = require('path');
 console.log(fs.readFileSync('/proc/self/cgroup','utf8'));
 console.log(fs.readFileSync('/proc/self/mountinfo','utf8').split('\n').filter(x=>x.includes(' - cgroup')).join('\n'));
