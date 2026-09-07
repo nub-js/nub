@@ -10,11 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn nub_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // deps/
-    path.pop(); // debug/ or release/
-    path.push("nub");
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_nub"))
 }
 
 fn fixture() -> PathBuf {
@@ -45,8 +41,8 @@ fn run(extra_args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
 }
 
 /// Augmented run: the pool is at least libuv's default of 4 and never exceeds the
-/// cores Node itself reports (a cgroup quota can make the two counts differ, so
-/// the exact value is not pinned).
+/// parallelism Node itself reports (the two runtimes read a cgroup quota
+/// differently, so the exact value is not pinned).
 #[test]
 fn augmented_sizes_pool_to_cores() {
     let v = run(&[], &[]);

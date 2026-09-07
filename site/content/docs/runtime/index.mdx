@@ -64,7 +64,7 @@ The compatibility tier routes module loading through an async `module.register()
 - **[Modern APIs](/docs/runtime/modern-apis)** — modern globals and built-ins (Temporal, URLPattern, WebSocket, EventSource, node:sqlite, and more) are present, polyfilled or unflagged per Node-version band.
 - **[Workers](/docs/runtime/workers)** — the browser-shape `Worker` global runs your `.ts` entry points, wrapping `node:worker_threads`.
 - **[Web Storage](/docs/runtime/web-storage)** — `localStorage` / `sessionStorage` behavior and the opt-in that backs persistent storage.
-- **Threadpool** — libuv's threadpool, which serves `fs`, `dns.lookup`, and async `zlib` and `crypto` calls, is sized to the machine's cores instead of Node's fixed 4. A `UV_THREADPOOL_SIZE` you set is used as is.
+- **Threadpool** — libuv's threadpool, which serves `fs`, `dns.lookup`, and async `zlib` and `crypto` calls, is sized to the cores available to the process, with a floor of 4, instead of Node's fixed 4. A `UV_THREADPOOL_SIZE` you set is used as is.
 
 ## Modern APIs
 
