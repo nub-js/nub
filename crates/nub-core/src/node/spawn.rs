@@ -1005,6 +1005,15 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // and re-entrant child shells skip it for free.
         cmd.env(VERSION_ENV, env!("CARGO_PKG_VERSION"));
 
+        // libuv threadpool sized to the cores (see THREADPOOL_SIZE_ENV). Only when the
+        // user has not set it; inherited by the augmented subtree like NODE_OPTIONS,
+        // and undone at a compat boundary through the restore markers.
+        if env::var_os(THREADPOOL_SIZE_ENV).is_none() {
+            let size = threadpool_size().to_string();
+            cmd.env(THREADPOOL_SIZE_ENV, &size);
+            mark_augmented(&mut cmd, THREADPOOL_SIZE_ENV, Some(OsStr::new(&size)));
+        }
+
         // Force the async loader-worker tier when this child hosts a foreign async
         // loader (tsx/ts-node/--import) on a Node whose sync/async hook composition
         // is broken — the sync fast tier would otherwise crash with
@@ -2451,7 +2460,7 @@ impl RestorableVar {
 
 /// PATH is the odd one out: nub COMPOSES it (`shim:.bin:system`) rather than
 /// replacing it, so it gets its own restore rule ([`restored_path`]).
-static RESTORABLE_VARS: [RestorableVar; 5] = [
+static RESTORABLE_VARS: [RestorableVar; 6] = [
     RestorableVar {
         name: "NODE_OPTIONS",
         compat: "__NUB_COMPAT_NODE_OPTIONS",
@@ -2487,7 +2496,40 @@ static RESTORABLE_VARS: [RestorableVar; 5] = [
         augmented_present: "__NUB_AUGMENTED_PATH_PRESENT",
         bit: 1 << 4,
     },
+    RestorableVar {
+        name: THREADPOOL_SIZE_ENV,
+        compat: "__NUB_COMPAT_UV_THREADPOOL_SIZE",
+        augmented: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE",
+        augmented_present: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT",
+        bit: 1 << 5,
+    },
 ];
+
+/// libuv's threadpool size, which Node reads ONCE at startup and never from
+/// `process.env` afterwards — so the spawn is the only place it can be set.
+///
+/// Node leaves libuv's default of 4 threads regardless of core count, and every
+/// `fs` call, `dns.lookup` (so every `fetch` to a new host), async `zlib` and async
+/// `crypto` (`pbkdf2`, `scrypt`, `randomBytes`) queues on those four. The Node
+/// performance team's open proposal (nodejs/performance#193) is exactly
+/// `max(4, cores)`; nub applies it. Measured on an 8-core box, Node 22.23.2, 4 → 8
+/// threads: pbkdf2 route +21–26% req/s, 400 concurrent `dns.lookup` 99 → 55 ms;
+/// main-thread-bound routes (gzip, file read) unchanged, 16 threads no better than
+/// 8. Cores come from `std::thread::available_parallelism`, which honors a cgroup
+/// CPU quota, so a container gets its quota, not the host's count.
+///
+/// A `UV_THREADPOOL_SIZE` already in the environment is the user's and is never
+/// overwritten; the variable is restorable, so a compat re-entry (`--node`,
+/// `NODE_COMPAT`) or a fresh nested nub sees the pre-augmentation environment.
+pub const THREADPOOL_SIZE_ENV: &str = "UV_THREADPOOL_SIZE";
+
+/// `max(4, available cores)` — see [`THREADPOOL_SIZE_ENV`].
+pub fn threadpool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(4)
+}
 
 /// Stamp the exact value a parent installed for one rewritten environment
 /// variable. A fresh child restores the captured ambient value only while the
