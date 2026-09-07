@@ -254,29 +254,35 @@ pub fn verify_precomputed_sha512(actual: &[u8; 64], expected: &str) -> Result<bo
     }
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
+    // A candidate that does not decode to a sha512 digest cannot match; it
+    // is skipped rather than fatal so a valid sibling digest still counts
+    // (the buffered path treats it the same way). Its reason is kept for
+    // the error when nothing matches.
+    let mut malformed = None;
     for expected_b64 in expected_digests {
         let mut expected_digest = [0u8; 64];
-        let decoded_len = match engine.decode_slice(expected_b64, &mut expected_digest) {
-            Ok(n) => n,
-            Err(e) => {
-                return Err(Error::Integrity(format!(
-                    "integrity field has malformed base64: {expected} ({e})"
-                )));
+        match engine.decode_slice(expected_b64, &mut expected_digest) {
+            Ok(64) => {
+                if expected_digest[..] == actual[..] {
+                    return Ok(true);
+                }
             }
-        };
-        if decoded_len != 64 {
-            return Err(Error::Integrity(format!(
-                "integrity field decoded to {decoded_len} bytes, expected 64 for sha512: {expected}"
-            )));
-        }
-        if expected_digest[..decoded_len] == actual[..] {
-            return Ok(true);
+            Ok(decoded_len) => {
+                malformed.get_or_insert(format!(
+                    "integrity field decoded to {decoded_len} bytes, expected 64 for sha512: {expected}"
+                ));
+            }
+            Err(e) => {
+                malformed.get_or_insert(format!(
+                    "integrity field has malformed base64: {expected} ({e})"
+                ));
+            }
         }
     }
     let actual_b64 = engine.encode(actual);
-    Err(Error::Integrity(format!(
-        "integrity mismatch: expected {expected}, got sha512-{actual_b64}",
-    )))
+    Err(Error::Integrity(malformed.unwrap_or_else(|| {
+        format!("integrity mismatch: expected {expected}, got sha512-{actual_b64}")
+    })))
 }
 
 /// Cross-check that an extracted tarball's `package.json` reports the
@@ -449,6 +455,11 @@ mod tests {
         }
         assert!(verify_precomputed_sha512(&digest, &format!("{wrong} {wrong}")).is_err());
         assert!(!verify_precomputed_sha512(&digest, &sha1).unwrap());
+        // A candidate that is not a digest at all does not veto a valid
+        // sibling on either path, and is the error when nothing matches.
+        assert!(verify_integrity(data, &format!("sha512-!!! {sha512}")).is_ok());
+        assert!(verify_precomputed_sha512(&digest, &format!("sha512-!!! {sha512}")).unwrap());
+        assert!(verify_precomputed_sha512(&digest, "sha512-!!!").is_err());
     }
 
     #[test]
