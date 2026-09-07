@@ -28,4 +28,29 @@ Notes on run 1:
 
 ## Run 2 — cache hit
 
+Run [34141508678](https://github.com/nubjs/nub/actions/runs/34141508678). Same matrix; the `*-cache` rows restored the cache run 1 saved.
+
+| row | tool setup step (includes the restore for cache rows) | first install | second install | cache restore | cache save |
+| --- | --- | --- | --- | --- | --- |
+| npm-nocache | 3s | 81,562 ms | 14,561 ms | — | — |
+| npm-cache | 9s (restore hit) | 20,996 ms | 18,919 ms | hit | 1s (no-op) |
+| pnpm-nocache | 1s + 1s | 8,813 ms | 4,119 ms | — | — |
+| pnpm-cache | 1s + 4s (restore hit) | 4,410 ms | 3,853 ms | hit | 0s |
+| bun-nocache | 2s | 3,538 ms | 872 ms | — | — |
+| nub-nocache | 5s | 8,167 ms | 1,894 ms | — | — |
+| nub-cache | 10s (restore hit) | 1,524 ms | 1,589 ms | hit | 1s (no-op) |
+| nub-npmlock-nocache | 5s | 8,705 ms | 1,934 ms | — | — |
+| nub-pnpmlock-nocache | 4s | 6,886 ms | 1,681 ms | — | — |
+| nub-nocache-c64 | 7s | 8,385 ms | 1,547 ms | — | — |
+| nub-nocache-c128 | 4s | 8,883 ms | 1,637 ms | — | — |
+
+Notes on run 2:
+
+- A restored npm cache takes `npm ci` from 81.6 s to 21.0 s, at the price of a 9 s restore inside the setup step; the warm-cache `npm ci` still re-extracts every tarball (18.9 s on the second install).
+- A restored nub store takes the install to 1.5 s, at the price of a ~5 s restore (the setup step went from 5 s to 10 s). Net against the no-cache row: 11.5 s versus 13.2 s for setup plus install, with a 6 s save on every miss.
+- bun's cold install measured 10.1 s in run 1 and 3.5 s here. Nub's ten cold samples across both runs (all lockfile and concurrency variants) span 6.7–10.2 s with a median of 7.8 s; pnpm's three span 8.3–8.8 s. The bun spread is why the matrix gained three extra cold rows for each of bun and nub (run 3).
+- Nub's fetch phase again reported 6.6–8.6 s for 58.4–58.9 MB regardless of `NUB_CONCURRENCY`.
+
+## Run 3 — extra cold samples
+
 _pending_

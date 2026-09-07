@@ -17,6 +17,7 @@ on:
     branches: [ci-install-probe]
     paths:
       - 'tests/ci-install-probe/**'
+      - '!tests/ci-install-probe/results.md'
       - 'tests/bench/install/fixtures/large/**'
       - '.github/workflows/ci-install-probe.yml'
   workflow_dispatch:
@@ -49,6 +50,13 @@ jobs:
           - { id: nub-pnpmlock-nocache,  tool: nub,  cache: "false", lock: pnpm-lock.yaml }
           - { id: nub-nocache-c64,       tool: nub,  cache: "false", lock: nub.lock, concurrency: "64" }
           - { id: nub-nocache-c128,      tool: nub,  cache: "false", lock: nub.lock, concurrency: "128" }
+          # Extra cold samples: bun's first two runs spread 3.5–10 s, so three more of each.
+          - { id: bun-nocache-2,         tool: bun,  cache: "false", lock: bun.lock }
+          - { id: bun-nocache-3,         tool: bun,  cache: "false", lock: bun.lock }
+          - { id: bun-nocache-4,         tool: bun,  cache: "false", lock: bun.lock }
+          - { id: nub-nocache-2,         tool: nub,  cache: "false", lock: nub.lock }
+          - { id: nub-nocache-3,         tool: nub,  cache: "false", lock: nub.lock }
+          - { id: nub-nocache-4,         tool: nub,  cache: "false", lock: nub.lock }
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
 
