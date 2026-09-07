@@ -293,12 +293,13 @@ fn a_relative_prefix_anchors_to_its_config_file() {
 #[test]
 fn a_prefix_that_resolves_to_nothing_is_refused_by_name() {
     let dir = project(&[("nub.jsonc", r#"{ "prefix": "no-such-wrapper --" }"#)]);
-    let run = run(dir.path(), &["probe.mjs"]);
-    assert!(!run.status.success(), "stdout: {}", run.stdout);
+    let refused = run(dir.path(), &["probe.mjs"]);
+    assert!(!refused.status.success(), "stdout: {}", refused.stdout);
     assert!(
-        run.stderr.contains("ERR_NUB_PREFIX_NOT_FOUND") && run.stderr.contains("no-such-wrapper"),
+        refused.stderr.contains("ERR_NUB_PREFIX_NOT_FOUND")
+            && refused.stderr.contains("no-such-wrapper"),
         "the error must name the code and the program: {}",
-        run.stderr
+        refused.stderr
     );
     // Compat mode is the escape hatch: a bare spawn that never resolves the
     // wrapper, so a broken prefix cannot take `--node` down with it.
