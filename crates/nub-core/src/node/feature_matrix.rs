@@ -499,11 +499,14 @@ static FEATURES: &[Feature] = &[
     // because Chromium uses the same V8 embedder-data slot — the reason the old path
     // survives, per the `--no-async-context-frame` docs).
     //
-    // Known upstream residue on the 22 line with the flag on, both also present on
-    // every 24+ default: an ALS store can stay referenced by an idle HTTP parser
-    // until the parser is reused (#61882, fixed on 24.x by #61995, not backported to
-    // 22 as of 22.23), and `vm.SourceTextModule` instances are retained through
-    // context frames after `evaluate()` (#63186, open).
+    // Not a memory regression on the 22 line, measured: an idle HTTP parser keeps the
+    // last request's ALS store alive until it is reused (#61882, fixed for the frame
+    // path on 24.15 by #61995, no 22 backport), but the legacy async_hooks path
+    // retains the same store on the same parser — 22.23.2 with the issue's request
+    // shape and a 64 KiB store held 3.3 MiB with the flag off and 3.2 MiB with it on,
+    // flat from 500 to 5000 requests, bounded by the idle-parser pool
+    // (`http.setMaxIdleHTTPParsers`). Injecting the flag changes what is retained by
+    // nothing.
     Feature {
         name: "async-context-frame",
         mitigations: &[(
