@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Linux/systemd acceptance: activation, explicit overrides, Workers, and fork."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--nub", required=True, type=Path)
+parser.add_argument("--node-dir", type=Path)
+args = parser.parse_args()
+nub = str(args.nub.resolve())
+fixture = Path(__file__).resolve().parents[1] / "fixtures/gc-startup/main.cjs"
+
+
+def checked(command):
+    return subprocess.check_output(command, text=True)
+
+
+with tempfile.TemporaryDirectory(prefix="gc-acceptance-") as temporary:
+    root = Path(temporary)
+    downloads = args.node_dir or root / "nodes"
+    downloads.mkdir(parents=True, exist_ok=True)
+    cases = 0
+    for version in ["22.23.2", "24.20.0", "26.8.1"]:
+        name = f"node-v{version}-linux-x64"
+        archive = downloads / f"{name}.tar.xz"
+        url = f"https://nodejs.org/dist/v{version}/"
+        if not archive.exists():
+            subprocess.run(["curl", "-fsS", url + archive.name, "-o", str(archive)], check=True)
+        sums = checked(["curl", "-fsS", url + "SHASUMS256.txt"])
+        digest = next(line.split()[0] for line in sums.splitlines() if line.split()[-1] == archive.name)
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
+        subprocess.run(["tar", "xf", str(archive), "-C", str(downloads)], check=True)
+        node = str((downloads / name / "bin/node").resolve())
+        project = root / version
+        project.mkdir()
+        (project / "home").mkdir()
+        (project / "main.cjs").write_bytes(fixture.read_bytes())
+        config = {"nodeExecutable": node}
+        (project / "nub.jsonc").write_text(json.dumps(config))
+        (project / "package.json").write_text(json.dumps({
+            "private": True, "scripts": {"probe": "node main.cjs"},
+        }))
+        early = """
+if (require('node:worker_threads').isMainThread) {
+  const worker = new (require('node:worker_threads').Worker)(
+    `require('node:worker_threads').parentPort.postMessage(require('node:v8').getHeapStatistics().heap_size_limit/2**20)`,
+    {eval:true,resourceLimits:{maxYoungGenerationSizeMb:8,maxOldGenerationSizeMb:128}});
+  worker.once('message', heap => require('node:assert/strict').equal(heap,140));
+}
+"""
+        (project / "early.cjs").write_text(early)
+        bins = project / "node_modules/.bin"
+        bins.mkdir(parents=True)
+        binary = bins / "gc-probe"
+        binary.write_text("#!/usr/bin/env node\n" + fixture.read_text())
+        binary.chmod(0o755)
+
+        def run(label, command, memory=512, extra_env=()):
+            global cases
+            env = ["PATH=" + str(Path(node).parent) + ":/usr/bin:/bin",
+                   "HOME=" + str(project / "home"), *extra_env]
+            result = subprocess.run([
+                "sudo", "-n", "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+                "--uid=" + str(os.getuid()), "--working-directory=" + str(project),
+                "-p", f"MemoryMax={memory}M", "-p", "MemorySwapMax=0",
+                "-p", "RuntimeMaxSec=90", "-p", "LimitCORE=0",
+                "/usr/bin/env", "-i", *env, *command,
+            ], text=True, capture_output=True, timeout=110)
+            assert result.returncode == 0, (version, label, result.stdout, result.stderr)
+            # Package-script runners may print the script name before its JSON.
+            data = json.loads(result.stdout.strip().splitlines()[-1])
+            assert data["node"] == "v" + version, data
+            cases += 1
+            print(json.dumps({"version": version, "case": label, "memory": memory,
+                              "mainHeap": data["mainHeap"], "forkHeap": data["fork"]["mainHeap"]}), flush=True)
+            return data["mainHeap"]
+
+        defaults = {}
+        for memory in [256, 512, 1024]:
+            defaults[memory] = run("node", [node, "main.cjs"], memory)
+            expected = 304 if memory <= 512 else defaults[memory]
+            assert run("nub", [nub, "--no-check", "main.cjs"], memory) == expected
+        for label, command, env, expected in [
+            ("application-args", ["main.cjs", "--port=3000"], (), 304),
+            ("node-bin", ["exec", "gc-probe"], (), 304),
+            ("package-script", ["run", "probe"], (), defaults[512]),
+            ("compat-argv", ["--node", "main.cjs"], (), defaults[512]),
+            ("compat-env", ["main.cjs"], ("NODE_COMPAT=1",), defaults[512]),
+            ("user-preload", ["main.cjs"], ("NODE_OPTIONS=--require ./early.cjs",), defaults[512]),
+            ("user-heap-env", ["main.cjs"], ("NODE_OPTIONS=--max-semi-space-size=4",), 268),
+            ("user-heap-argv", ["--max-semi-space-size=4", "main.cjs"], (), 268),
+        ]:
+            assert run(label, [nub, "--no-check", *command], extra_env=env) == expected
+        (project / "nub.jsonc").write_text(json.dumps({**config, "v8Flags": ["--max-semi-space-size=4"]}))
+        assert run("user-heap-config", [nub, "--no-check", "main.cjs"]) == 268
+        (project / "nub.jsonc").write_text(json.dumps(config))
+        (project / ".env").write_text("NODE_OPTIONS=--max-semi-space-size=4\n")
+        # Runtime-control variables from .env are deliberately ignored by Nub.
+        assert run("ignored-heap-dotenv", [nub, "--no-check", "main.cjs"]) == 304
+    print(f"GC_ACCEPTANCE_OK {cases} cases")

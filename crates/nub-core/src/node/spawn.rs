@@ -1487,6 +1487,34 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         cmd.env(k, v);
     }
 
+    // Only the ordinary fast CJS preload path has the startup ordering required
+    // by the main-isolate GC policy. Unknown/user preloads and environment owners
+    // stand down rather than risking a Worker created before the override resets.
+    cmd.env_remove(super::gc::STARTUP_ENV);
+    if !config.compat_mode
+        && preload.is_some()
+        && config.env_owner.is_none()
+        && config.pnp.is_none()
+        && config.runtime_node_options.is_empty()
+        && config.runtime_v8_flags.is_empty()
+        && !config.env_vars.contains_key("NODE_OPTIONS")
+        && env::var_os("NODE_OPTIONS").is_none_or(|value| value.to_str().is_some())
+        && super::gc::eligible(
+            &config.node.version,
+            config.user_args,
+            node_options.as_deref(),
+            super::gc::constrained_memory(),
+        )
+        && let Some(startup) = preload
+            .as_deref()
+            .map(|path| Path::new(path).with_file_name("gc-startup.cjs"))
+            .filter(|path| path.is_file())
+    {
+        let startup_arg = format!("--require={}", startup.display());
+        cmd.arg(super::gc::SEMI_SPACE_FLAG).arg(&startup_arg);
+        cmd.env(super::gc::STARTUP_ENV, startup_arg);
+    }
+
     // Compat is tree-wide, not only a choice made by this one launcher. The
     // restored PATH deliberately preserves unrelated inherited entries, which
     // may include a Nub shim from an outer logical invocation. Stamping the

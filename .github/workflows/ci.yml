@@ -1219,6 +1219,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.node == '22.15'
         run: tests/loader/run-matrix.sh
       - run: cargo test
+      - name: Constrained-memory GC acceptance
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        run: python3 tests/gc-tuning/verify.py --nub target/debug/nub
       # `compile` is not a default feature, so the bare `cargo test` above never
       # builds `src/compile/**` — including the bundler's emitted-chunk validity
       # gate, whose whole job is to stop `nub compile` reporting success on output

@@ -84,6 +84,16 @@ Both `--node` and a truthy `NODE_COMPAT` disable runtime augmentation — no hoo
 
 Two details make the switch trustworthy. Compat mode does not merely skip augmentation; it restores a parent's augmented environment to its pre-Nub state. And version provisioning stays on, because running on stock Node and running on no particular Node are different requests.
 
+## Main-heap memory tuning
+
+Direct Node launches on Linux use a small semi-space floor only in a measured, closed set of Node releases and cgroup budgets. File runs and Node-backed `exec`/`nubx` binaries share this launch path.
+
+The policy in [[crates/nub-core/src/node/gc.rs#eligible]] accepts Node 22.23.2, 24.20.0, and 26.8.1 with 256–512 MiB of constrained memory. Explicit startup options, PnP, environment-owner loaders, compatibility mode, and inherited augmented processes disable it. Watch and compiled launchers do not apply this policy.
+
+The launcher supplies `--max-semi-space-size=16` for main-isolate initialization. Before any application preload or entry code runs, the fast CJS preload resets the process-global flag to zero. V8 has already stored main's limit, while later Worker isolates can still apply their own `resourceLimits`. Keeping the global override would silently replace explicit Worker young-generation limits, even with an empty `execArgv`.
+
+This is a one-shot, release-specific startup operation, not a live GC controller. Adding a release requires auditing V8's flag readers and Node's preload ordering, then running constrained-memory and Worker/fork acceptance tests. The startup helper also rides argv so Workers with a replacement environment still run its argument cleanup. Both injected arguments are hidden from `process.execArgv`; application-created child processes do not inherit them as explicit heap settings. User heap flags remain visible and unchanged.
+
 ## Environment files
 
 Four files load in precedence order, with the real process environment always winning:
