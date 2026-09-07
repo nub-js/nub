@@ -14,7 +14,7 @@ pub fn eligible(
     version: &NodeVersion,
     user_args: &[String],
     node_options: Option<&str>,
-    memory: Option<u64>,
+    memory: impl FnOnce() -> Option<u64>,
 ) -> bool {
     matches!(
         version.0.to_string().as_str(),
@@ -22,7 +22,7 @@ pub fn eligible(
     ) && node_options.is_none_or(|options| options.trim().is_empty())
         // Everything after an entry path is application argv, not Node options.
         && !user_args.first().is_some_and(|arg| arg.starts_with('-'))
-        && memory.is_some_and(|bytes| (256 * MIB..=512 * MIB).contains(&bytes))
+        && memory() == Some(512 * MIB)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -133,7 +133,7 @@ fn read_constraint(
     // the process without reducing Node's automatic nursery; overriding that
     // already-larger nursery would not be a floor.
     let mut limit = value(&read(&leaf.join(hard))?)?.min(value(&read(&leaf.join(soft))?)?);
-    if !(256 * MIB..=512 * MIB).contains(&limit) {
+    if limit != 512 * MIB {
         return None;
     }
     for parent in leaf.ancestors().skip(1) {
@@ -158,6 +158,35 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::collections::HashMap;
 
+    fn eligible(
+        version: &NodeVersion,
+        args: &[String],
+        options: Option<&str>,
+        memory: Option<u64>,
+    ) -> bool {
+        super::eligible(version, args, options, || memory)
+    }
+
+    #[test]
+    fn ineligible_launches_do_not_read_memory_constraints() {
+        for (version, args, options) in [
+            ("24.20.1", vec!["app.js".into()], None),
+            ("24.20.0", vec!["--inspect".into()], None),
+            (
+                "24.20.0",
+                vec!["app.js".into()],
+                Some("--require before.cjs"),
+            ),
+        ] {
+            assert!(!super::eligible(
+                &version.parse().unwrap(),
+                &args,
+                options,
+                || panic!("ineligible launch read memory constraints")
+            ));
+        }
+    }
+
     #[test]
     fn policy_is_closed_and_explicit_options_win() {
         for version in ["22.23.2", "24.20.0", "26.8.1"] {
@@ -168,15 +197,7 @@ mod tests {
                 None,
                 Some(512 * MIB)
             ));
-            for limit in [256, 384, 512] {
-                assert!(eligible(
-                    &version,
-                    &["app.js".into()],
-                    None,
-                    Some(limit * MIB)
-                ));
-            }
-            for limit in [None, Some(255 * MIB), Some(513 * MIB)] {
+            for limit in [None, Some(256 * MIB), Some(384 * MIB), Some(513 * MIB)] {
                 assert!(!eligible(&version, &[], None, limit));
             }
             for options in [

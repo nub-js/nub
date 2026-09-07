@@ -67,7 +67,7 @@ The compatibility tier routes module loading through an async `module.register()
 
 ## Memory-constrained launches
 
-On Linux, direct Node launches can use a 16 MiB V8 semi-space when the process has a 256–512 MiB cgroup memory limit. This includes file runs and Node-backed `nub exec`/`nubx` binaries. The initial supported releases are Node 22.23.2, 24.20.0, and 26.8.1; other releases keep Node's defaults. This changes the main heap only. Workers retain their own defaults and explicit `resourceLimits`.
+On Linux, direct Node launches can use a 16 MiB V8 semi-space when the process has a 512 MiB cgroup memory limit. This includes file runs and Node-backed `nub exec`/`nubx` binaries. The supported releases are Node 22.23.2, 24.20.0, and 26.8.1; other releases and memory budgets keep Node's defaults. This changes the main heap only. Workers retain their own defaults and explicit `resourceLimits`.
 
 Nub skips this tuning when Node options are supplied through argv, `NODE_OPTIONS`, or project configuration, or when PnP or an external environment loader owns startup. Unknown memory limits, watch mode, compiled executables, and inherited augmented processes keep their existing behavior. Application arguments after the entry path do not disable tuning.
 

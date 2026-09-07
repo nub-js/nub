@@ -1503,7 +1503,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             &config.node.version,
             config.user_args,
             node_options.as_deref(),
-            super::gc::constrained_memory(),
+            super::gc::constrained_memory,
         )
         && let Some(startup) = preload
             .as_deref()

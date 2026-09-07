@@ -40,6 +40,8 @@ with tempfile.TemporaryDirectory(prefix="gc-acceptance-") as temporary:
         project.mkdir()
         (project / "home").mkdir()
         (project / "main.cjs").write_bytes(fixture.read_bytes())
+        (project / "pressure.cjs").write_bytes((Path(__file__).parent / "pressure.cjs").read_bytes())
+        checksums = set()
         config = {"nodeExecutable": node}
         (project / "nub.jsonc").write_text(json.dumps(config))
         (project / "package.json").write_text(json.dumps({
@@ -75,15 +77,19 @@ if (require('node:worker_threads').isMainThread) {
             # Package-script runners may print the script name before its JSON.
             data = json.loads(result.stdout.strip().splitlines()[-1])
             assert data["node"] == "v" + version, data
+            if "checksum" in data:
+                checksums.add(data["checksum"])
+                assert len(checksums) == 1, data
             cases += 1
             print(json.dumps({"version": version, "case": label, "memory": memory,
-                              "mainHeap": data["mainHeap"], "forkHeap": data["fork"]["mainHeap"]}), flush=True)
+                              "mainHeap": data["mainHeap"], "forkHeap": data.get("fork", {}).get("mainHeap"),
+                              "peakRssMiB": data.get("peakRssMiB"), "memoryEvents": data.get("memoryEvents")}), flush=True)
             return data["mainHeap"]
 
         defaults = {}
         for memory in [256, 512, 1024]:
             defaults[memory] = run("node", [node, "main.cjs"], memory)
-            expected = 304 if memory <= 512 else defaults[memory]
+            expected = 304 if memory == 512 else defaults[memory]
             assert run("nub", [nub, "--no-check", "main.cjs"], memory) == expected
         for label, command, env, expected in [
             ("application-args", ["main.cjs", "--port=3000"], (), 304),
@@ -102,4 +108,7 @@ if (require('node:worker_threads').isMainThread) {
         (project / ".env").write_text("NODE_OPTIONS=--max-semi-space-size=4\n")
         # Runtime-control variables from .env are deliberately ignored by Nub.
         assert run("ignored-heap-dotenv", [nub, "--no-check", "main.cjs"]) == 304
+        (project / ".env").unlink()
+        assert run("pressure-node", [node, "pressure.cjs"]) == defaults[512]
+        assert run("pressure-nub", [nub, "--no-check", "pressure.cjs"]) == 304
     print(f"GC_ACCEPTANCE_OK {cases} cases")
