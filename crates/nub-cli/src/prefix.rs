@@ -176,6 +176,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let other = tempfile::tempdir().expect("tempdir");
         assert!(same_dir(dir.path(), dir.path()));
+        // Only a path that exists canonicalizes; `..` through a real child
+        // lands on the same directory.
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
         assert!(same_dir(&dir.path().join("sub").join(".."), dir.path()));
         assert!(!same_dir(dir.path(), other.path()));
     }
