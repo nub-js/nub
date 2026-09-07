@@ -48,9 +48,26 @@ Notes on run 2:
 
 - A restored npm cache takes `npm ci` from 81.6 s to 21.0 s, at the price of a 9 s restore inside the setup step; the warm-cache `npm ci` still re-extracts every tarball (18.9 s on the second install).
 - A restored nub store takes the install to 1.5 s, at the price of a ~5 s restore (the setup step went from 5 s to 10 s). Net against the no-cache row: 11.5 s versus 13.2 s for setup plus install, with a 6 s save on every miss.
-- bun's cold install measured 10.1 s in run 1 and 3.5 s here. Nub's ten cold samples across both runs (all lockfile and concurrency variants) span 6.7–10.2 s with a median of 7.8 s; pnpm's three span 8.3–8.8 s. The bun spread is why the matrix gained three extra cold rows for each of bun and nub (run 3).
+- bun's cold install measured 10.1 s in run 1 and 3.5 s here. Nub's eleven cold samples across both runs (all lockfile and concurrency variants) span 6.7–10.2 s with a median of 7.8 s; pnpm's three span 8.3–8.8 s. The bun spread is why the matrix gained three extra cold rows for each of bun and nub (run 3).
 - Nub's fetch phase again reported 6.6–8.6 s for 58.4–58.9 MB regardless of `NUB_CONCURRENCY`.
 
 ## Run 3 — extra cold samples
 
-_pending_
+Run [34142057531](https://github.com/nubjs/nub/actions/runs/34142057531). Same matrix plus three extra no-cache rows each for bun and nub. Only the cold and second-install columns are new information; the cache rows behaved as in run 2.
+
+| row | first install | second install |
+| --- | --- | --- |
+| bun-nocache | 6,200 ms | 1,597 ms |
+| bun-nocache-2 | 3,930 ms | 2,517 ms |
+| bun-nocache-3 | 4,423 ms | 1,588 ms |
+| bun-nocache-4 | 4,435 ms | 1,875 ms |
+| nub-nocache | 6,770 ms | 1,716 ms |
+| nub-nocache-2 | 7,556 ms | 1,786 ms |
+| nub-nocache-3 | 7,029 ms | 1,395 ms |
+| nub-nocache-4 | 7,099 ms | 1,582 ms |
+| nub-nocache-c128 | **failed** | — |
+
+Notes on run 3:
+
+- Across the three runs, bun's six cold samples are 3.5, 3.9, 4.4, 4.4, 6.2 and 10.1 s (median 4.4 s); nub's fifteen cold samples (every lockfile and fan-out variant) span 6.7–10.2 s (median 7.1 s); pnpm's three are 8.3–8.8 s. Nub's fetch phase reported 6.5–7.3 s for 58.9 MB in every run-3 row.
+- `nub-nocache-c128` failed its cold install at 1,144/1,152 packages with `× stream error for @mui/material@5.18.0: HTTP error: error decoding response` and exit code 1; the same row succeeded in runs 1 and 2. A single stream decode error at a 128-wide fan-out was not retried and failed the install. The default fan-out on this runner is 16.
