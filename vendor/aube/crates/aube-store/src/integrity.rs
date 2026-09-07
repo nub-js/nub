@@ -39,21 +39,26 @@ impl IntegrityAlgo {
     }
 }
 
-/// Pick the hash to check from an SRI string. The value may carry
-/// several space-separated hashes — the W3C SRI grammar allows it and
-/// npm writes it: a package-lock.json entry can read
-/// `"integrity": "sha1-… sha512-…"` (Kong/grpc-reflection-js pins
+/// The digests to check from an SRI string: every candidate carrying the
+/// strongest algorithm the store supports, with any `?option` suffix
+/// stripped. The value may carry several space-separated hashes — the W3C
+/// SRI grammar allows it and npm writes it: a package-lock.json entry can
+/// read `"integrity": "sha1-… sha512-…"` (Kong/grpc-reflection-js pins
 /// `@types/minimist@1.2.0` that way, and a git dependency's nested
 /// `prepare` install feeds that lockfile straight here). ssri's rule is
-/// to verify against the strongest algorithm the client supports, so
-/// take that one; `SRI_PREFIXES` is already ordered strongest first.
-/// Reading the whole value as one token made every such entry an
-/// `integrity mismatch`.
-fn parse_sri(expected: &str) -> Option<(IntegrityAlgo, &str)> {
+/// to verify against the strongest algorithm the client supports and to
+/// accept when ANY digest of that algorithm matches, so every candidate
+/// of the chosen algorithm comes back; `SRI_PREFIXES` is already ordered
+/// strongest first. Reading the whole value as one token made every such
+/// entry an `integrity mismatch`.
+fn parse_sri(expected: &str) -> Option<(IntegrityAlgo, Vec<&str>)> {
     SRI_PREFIXES.iter().find_map(|(prefix, algo)| {
-        expected
+        let digests: Vec<&str> = expected
             .split_ascii_whitespace()
-            .find_map(|token| token.strip_prefix(prefix).map(|rest| (*algo, rest)))
+            .filter_map(|token| token.strip_prefix(prefix))
+            .map(|rest| rest.split('?').next().unwrap_or(rest))
+            .collect();
+        (!digests.is_empty()).then_some((*algo, digests))
     })
 }
 
@@ -145,7 +150,7 @@ pub fn validate_version(version: &str) -> bool {
 /// — the set npm and pnpm accept in `dist.integrity`. Returns `Ok(())`
 /// on match, `Err(Error::Integrity)` on mismatch or unknown algorithm.
 pub fn verify_integrity(data: &[u8], expected: &str) -> Result<(), Error> {
-    let Some((algo, expected_b64)) = parse_sri(expected) else {
+    let Some((algo, expected_digests)) = parse_sri(expected) else {
         return Err(Error::Integrity(format!(
             "unsupported integrity format (expected sha1/sha256/sha384/sha512-...): {expected}"
         )));
@@ -185,11 +190,13 @@ pub fn verify_integrity(data: &[u8], expected: &str) -> Result<(), Error> {
 
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
-    let mut expected_digest = [0u8; 64];
-    let matched = engine
-        .decode_slice(expected_b64, &mut expected_digest)
-        .map(|n| n == actual_len && expected_digest[..n] == actual[..])
-        .unwrap_or(false);
+    let matched = expected_digests.iter().any(|expected_b64| {
+        let mut expected_digest = [0u8; 64];
+        engine
+            .decode_slice(expected_b64, &mut expected_digest)
+            .map(|n| n == actual_len && expected_digest[..n] == actual[..])
+            .unwrap_or(false)
+    });
     if matched {
         Ok(())
     } else {
@@ -237,7 +244,7 @@ pub fn sha512_integrity_from_digest(digest: &[u8; 64]) -> String {
 /// re-hashes with the right algo. Returns `Err` on parse failure
 /// or SHA-512 mismatch.
 pub fn verify_precomputed_sha512(actual: &[u8; 64], expected: &str) -> Result<bool, Error> {
-    let Some((algo, expected_b64)) = parse_sri(expected) else {
+    let Some((algo, expected_digests)) = parse_sri(expected) else {
         return Err(Error::Integrity(format!(
             "unsupported integrity format (expected sha1/sha256/sha384/sha512-...): {expected}"
         )));
@@ -247,28 +254,29 @@ pub fn verify_precomputed_sha512(actual: &[u8; 64], expected: &str) -> Result<bo
     }
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
-    let mut expected_digest = [0u8; 64];
-    let decoded_len = match engine.decode_slice(expected_b64, &mut expected_digest) {
-        Ok(n) => n,
-        Err(e) => {
+    for expected_b64 in expected_digests {
+        let mut expected_digest = [0u8; 64];
+        let decoded_len = match engine.decode_slice(expected_b64, &mut expected_digest) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(Error::Integrity(format!(
+                    "integrity field has malformed base64: {expected} ({e})"
+                )));
+            }
+        };
+        if decoded_len != 64 {
             return Err(Error::Integrity(format!(
-                "integrity field has malformed base64: {expected} ({e})"
+                "integrity field decoded to {decoded_len} bytes, expected 64 for sha512: {expected}"
             )));
         }
-    };
-    if decoded_len != 64 {
-        return Err(Error::Integrity(format!(
-            "integrity field decoded to {decoded_len} bytes, expected 64 for sha512: {expected}"
-        )));
+        if expected_digest[..decoded_len] == actual[..] {
+            return Ok(true);
+        }
     }
-    if expected_digest[..decoded_len] == actual[..] {
-        Ok(true)
-    } else {
-        let actual_b64 = engine.encode(actual);
-        Err(Error::Integrity(format!(
-            "integrity mismatch: expected {expected}, got sha512-{actual_b64}",
-        )))
-    }
+    let actual_b64 = engine.encode(actual);
+    Err(Error::Integrity(format!(
+        "integrity mismatch: expected {expected}, got sha512-{actual_b64}",
+    )))
 }
 
 /// Cross-check that an extracted tarball's `package.json` reports the
@@ -415,13 +423,29 @@ mod tests {
         // beside a right sha1 is a mismatch, not a pass on the weak one.
         let wrong = sha512_integrity(b"other");
         assert!(verify_integrity(data, &format!("{sha1} {wrong}")).is_err());
-        // The streaming path sees the same value.
+        // Several digests of the strongest algorithm: any match accepts,
+        // whichever position the right one sits in — ssri's rule.
+        assert!(verify_integrity(data, &format!("{wrong} {sha512}")).is_ok());
+        assert!(verify_integrity(data, &format!("{sha512} {wrong}")).is_ok());
+        assert!(verify_integrity(data, &format!("{wrong} {wrong}")).is_err());
+        // An SRI option suffix (`?name=value`) is not part of the digest.
+        assert!(verify_integrity(data, &format!("{sha512}?foo=bar")).is_ok());
+        assert!(verify_integrity(data, &format!("{sha1} {sha512}?x")).is_ok());
+        // The streaming path sees the same values.
         let mut digest = [0u8; 64];
         digest.copy_from_slice(&Sha512::digest(data));
-        assert_eq!(
-            verify_precomputed_sha512(&digest, &format!("{sha1} {sha512}")).unwrap(),
-            true
-        );
+        for value in [
+            format!("{sha1} {sha512}"),
+            format!("{wrong} {sha512}"),
+            format!("{sha512}?foo=bar"),
+        ] {
+            assert!(
+                verify_precomputed_sha512(&digest, &value).unwrap(),
+                "{value}"
+            );
+        }
+        assert!(verify_precomputed_sha512(&digest, &format!("{wrong} {wrong}")).is_err());
+        assert!(!verify_precomputed_sha512(&digest, &sha1).unwrap());
     }
 
     #[test]

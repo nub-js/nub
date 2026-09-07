@@ -1532,14 +1532,15 @@ pub async fn run_root_hook(
 }
 
 /// Run a lifecycle hook of a WORKSPACE MEMBER. Spawns in `member_dir` with
-/// the member's own manifest, and puts every `<modules_dir>/.bin` from the
-/// member up to `workspace_root` on `PATH`, closest first — the walk npm's
-/// run-script does for a workspace script (`run_script` appends the root's
-/// own `.bin` after these). A member's script routinely reaches for a bin
-/// that only the root declares: puppeteer's `tools/eslint` runs `wireit`,
-/// a root devDependency, from its `prepare`. With only the member's own
-/// `.bin` on `PATH` that was a 127 on every install. For the root importer
-/// itself the chain is empty and this is [`run_root_hook`] plus `tool_dirs`.
+/// the member's own manifest, and puts the `<modules_dir>/.bin` of the
+/// member and of every ancestor directory on `PATH`, closest first — the
+/// walk npm's run-script does for any script (`set-path.js` goes all the way
+/// to the filesystem root, so a bin provided above the workspace root
+/// counts too). A member's script routinely reaches for a bin that only the
+/// root declares: puppeteer's `tools/eslint` runs `wireit`, a root
+/// devDependency, from its `prepare`. With only the member's own `.bin` on
+/// `PATH` that was a 127 on every install. `run_script` appends the root's
+/// own `.bin` after the chain; that duplicate is inert.
 ///
 /// `tool_dirs` go on `PATH` after the chain and before the root's `.bin`:
 /// the embedder's lazy `node-gyp` shim above all, which npm provides to
@@ -1561,7 +1562,7 @@ pub async fn run_member_hook(
     let Some(script_cmd) = manifest.scripts.get(name) else {
         return Ok(false);
     };
-    let chain = member_bin_chain(member_dir, workspace_root, modules_dir_name);
+    let chain = member_bin_chain(member_dir, modules_dir_name);
     let extra: Vec<&Path> = chain
         .iter()
         .map(PathBuf::as_path)
@@ -1581,27 +1582,16 @@ pub async fn run_member_hook(
     Ok(true)
 }
 
-/// The `.bin` directories a workspace member's script sees before the
-/// root's: `<dir>/<modules_dir>/.bin` for the member's directory and each
-/// ancestor below `workspace_root`, closest first. Mirrors npm, whose
-/// run-script walks every ancestor of the script's directory; a member
-/// outside the root (a `../sibling` importer) walks to the filesystem root
-/// the same way npm does.
-fn member_bin_chain(
-    member_dir: &Path,
-    workspace_root: &Path,
-    modules_dir_name: &str,
-) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut cursor = Some(member_dir);
-    while let Some(dir) = cursor {
-        if dir == workspace_root {
-            break;
-        }
-        chain.push(dir.join(modules_dir_name).join(".bin"));
-        cursor = dir.parent();
-    }
-    chain
+/// The `.bin` directories a workspace member's script sees:
+/// `<dir>/<modules_dir>/.bin` for the member's directory and every
+/// ancestor up to the filesystem root, closest first. Exactly npm's walk
+/// (`@npmcli/run-script` `set-path.js`), so a bin an enclosing project
+/// provides above the workspace root resolves here as it does there.
+fn member_bin_chain(member_dir: &Path, modules_dir_name: &str) -> Vec<PathBuf> {
+    member_dir
+        .ancestors()
+        .map(|dir| dir.join(modules_dir_name).join(".bin"))
+        .collect()
 }
 
 /// Run a named root-package script if it's defined. Used by commands
@@ -2725,21 +2715,18 @@ mod member_bin_chain_tests {
     use std::path::{Path, PathBuf};
 
     /// A nested member (`test/installation`) sees its own `.bin`, then its
-    /// parent member's, closest first; the root's is appended by `run_script`.
-    /// The root importer itself contributes nothing.
+    /// parent member's, then the root's, then anything above — closest
+    /// first, out to the filesystem root, as npm walks it.
     #[test]
-    fn member_bin_chain_walks_every_ancestor_below_the_root_closest_first() {
-        let root = Path::new("/p");
+    fn member_bin_chain_walks_every_ancestor_to_the_filesystem_root_closest_first() {
         assert_eq!(
-            member_bin_chain(Path::new("/p/test/installation"), root, "node_modules"),
+            member_bin_chain(Path::new("/p/test/installation"), "node_modules"),
             vec![
                 PathBuf::from("/p/test/installation/node_modules/.bin"),
                 PathBuf::from("/p/test/node_modules/.bin"),
+                PathBuf::from("/p/node_modules/.bin"),
+                PathBuf::from("/node_modules/.bin"),
             ]
-        );
-        assert_eq!(
-            member_bin_chain(root, root, "node_modules"),
-            Vec::<PathBuf>::new()
         );
     }
 }
