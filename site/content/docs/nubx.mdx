@@ -97,7 +97,7 @@ nub exec eslint . --fix
 nub exec --node tsc --noEmit   # augmentation off
 ```
 
-When nothing matches, `nub exec` prints an install hint and exits 127. Its flags mirror `pnpm exec` — see the [full docs](https://pnpm.io/cli/exec) on pnpm.io.
+When nothing matches, `nub exec` prints an install hint and exits 127. It takes the same workspace flags as `nub run` — [`--filter`](/docs/run#--filter), `-r`, `--parallel` — and `--node`.
 
 ## `nub dlx`
 
