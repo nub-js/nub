@@ -1,0 +1,165 @@
+# Branch-scoped probe: how long does a dependency install take on a GitHub-hosted
+# runner under each package manager, with and without the actions/cache round
+# trip, on ONE fixture (tests/bench/install/fixtures/large: 1,168 packages)?
+#
+# Every row stages the fixture into $RUNNER_TEMP with only the lockfile its tool
+# reads, times the install with millisecond wall-clock, wipes node_modules and
+# times a second install against the now-warm store, and records the tool's own
+# setup cost. Cache save/restore costs come from the jobs API (see harvest.sh):
+# the save runs in a post-step this workflow cannot time from inside.
+#
+# Push once for the cache-miss run (every cache row saves), push an empty commit
+# for the cache-hit run. tests/ci-install-probe/README.md has the protocol.
+name: ci-install-probe
+
+on:
+  push:
+    branches: [ci-install-probe]
+    paths:
+      - 'tests/ci-install-probe/**'
+      - 'tests/bench/install/fixtures/large/**'
+      - '.github/workflows/ci-install-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FIXTURE: tests/bench/install/fixtures/large
+  NUB_VERSION: 0.8.3
+  NODE_MAJOR: "24"
+
+jobs:
+  probe:
+    name: ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: npm-nocache,           tool: npm,  cache: "false", lock: package-lock.json }
+          - { id: npm-cache,             tool: npm,  cache: "true",  lock: package-lock.json }
+          - { id: pnpm-nocache,          tool: pnpm, cache: "false", lock: pnpm-lock.yaml }
+          - { id: pnpm-cache,            tool: pnpm, cache: "true",  lock: pnpm-lock.yaml }
+          - { id: bun-nocache,           tool: bun,  cache: "false", lock: bun.lock }
+          - { id: nub-nocache,           tool: nub,  cache: "false", lock: nub.lock }
+          - { id: nub-cache,             tool: nub,  cache: "true",  lock: nub.lock }
+          - { id: nub-npmlock-nocache,   tool: nub,  cache: "false", lock: package-lock.json }
+          - { id: nub-pnpmlock-nocache,  tool: nub,  cache: "false", lock: pnpm-lock.yaml }
+          - { id: nub-nocache-c64,       tool: nub,  cache: "false", lock: nub.lock, concurrency: "64" }
+          - { id: nub-nocache-c128,      tool: nub,  cache: "false", lock: nub.lock, concurrency: "128" }
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+
+      - name: Stage fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          fx="$RUNNER_TEMP/fx"
+          mkdir -p "$fx"
+          cp "$FIXTURE/package.json" "$FIXTURE/${{ matrix.lock }}" "$fx/"
+          echo "FX=$fx" >> "$GITHUB_ENV"
+          # setup-node/setup-nub key their caches on a lockfile path in the checkout.
+          echo "LOCK_PATH=$FIXTURE/${{ matrix.lock }}" >> "$GITHUB_ENV"
+          ls -la "$fx"
+
+      # ---- tool setup (each row runs exactly one of these) ------------------
+      - name: Setup Node (npm)
+        if: matrix.tool == 'npm' && matrix.cache == 'false'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - name: Setup Node (npm, cache)
+        if: matrix.tool == 'npm' && matrix.cache == 'true'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+          cache: npm
+          cache-dependency-path: ${{ env.LOCK_PATH }}
+
+      - name: Setup pnpm
+        if: matrix.tool == 'pnpm'
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+        with:
+          version: 10
+      - name: Setup Node (pnpm)
+        if: matrix.tool == 'pnpm' && matrix.cache == 'false'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - name: Setup Node (pnpm, cache)
+        if: matrix.tool == 'pnpm' && matrix.cache == 'true'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+          cache: pnpm
+          cache-dependency-path: ${{ env.LOCK_PATH }}
+
+      - name: Setup Bun
+        if: matrix.tool == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+
+      - name: Setup nub
+        if: matrix.tool == 'nub'
+        uses: nubjs/setup-nub@47e5e7393d50f4e9544ddaf756aa277972afba2d  # v0
+        with:
+          nub-version: ${{ env.NUB_VERSION }}
+          node-version: ${{ env.NODE_MAJOR }}
+          cache: ${{ matrix.cache }}
+          cache-dependency-path: ${{ env.LOCK_PATH }}
+
+      # setup-nub installs nub with `npm install -g`; time the alternative it could
+      # use instead — the per-platform release tarball — for the same version.
+      - name: Time a release-tarball install of nub
+        if: matrix.tool == 'nub'
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/nub-tarball"; mkdir -p "$d"
+          s=$(date +%s%3N)
+          curl -fsSL "https://github.com/nubjs/nub/releases/download/v${NUB_VERSION}/nub-linux-x64.tar.gz" | tar -xz -C "$d"
+          e=$(date +%s%3N)
+          echo "TARBALL_INSTALL_MS=$((e - s))"
+          find "$d" -maxdepth 3 -type f | head -5
+
+      # ---- the measurement ---------------------------------------------------
+      - name: Install (cold node_modules)
+        shell: bash
+        working-directory: ${{ env.FX }}
+        env:
+          NUB_CONCURRENCY: ${{ matrix.concurrency }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.tool }}" in
+            npm)  cmd=(npm ci) ;;
+            pnpm) cmd=(pnpm install --frozen-lockfile) ;;
+            bun)  cmd=(bun install --frozen-lockfile) ;;
+            nub)  cmd=(nub install --frozen-lockfile) ;;
+          esac
+          echo "tool version: $(${{ matrix.tool }} --version 2>/dev/null | head -1)"
+          [ -n "${NUB_CONCURRENCY:-}" ] && echo "NUB_CONCURRENCY=$NUB_CONCURRENCY"
+          s=$(date +%s%3N); "${cmd[@]}"; e=$(date +%s%3N)
+          ms=$((e - s))
+          echo "INSTALL_MS=$ms"
+          echo "::notice title=${{ matrix.id }} first install::${ms} ms"
+          echo "files: $(find node_modules -type f | wc -l)  react: $(node -p "require('./node_modules/react/package.json').version")"
+
+      - name: Install again (warm store, node_modules wiped)
+        shell: bash
+        working-directory: ${{ env.FX }}
+        env:
+          NUB_CONCURRENCY: ${{ matrix.concurrency }}
+        run: |
+          set -euo pipefail
+          rm -rf node_modules
+          case "${{ matrix.tool }}" in
+            npm)  cmd=(npm ci) ;;
+            pnpm) cmd=(pnpm install --frozen-lockfile --offline) ;;
+            bun)  cmd=(bun install --frozen-lockfile) ;;
+            nub)  cmd=(nub install --frozen-lockfile --offline) ;;
+          esac
+          s=$(date +%s%3N); "${cmd[@]}"; e=$(date +%s%3N)
+          ms=$((e - s))
+          echo "SECOND_INSTALL_MS=$ms"
+          echo "::notice title=${{ matrix.id }} second install::${ms} ms"
