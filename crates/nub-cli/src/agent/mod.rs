@@ -297,18 +297,27 @@ mod tests {
 
     #[test]
     fn docs_tree_is_baked_with_url_path_slugs_matching_in_doc_links() {
-        // The baked table must hold exactly the docs tree on disk, keyed by the
-        // `/docs/...` URL path each page is linked by internally (so a markdown
-        // link target is a valid `--page` argument): `index.mdx` collapses to
-        // its section root, the top-level one to `/docs`. The expected set is
-        // DERIVED from `site/content/docs` rather than pinned here, so a docs
-        // move is a docs-only change and never a Rust one — a pinned list once
-        // dragged the full Rust matrix onto every docs restructure. It also
-        // catches a stale bake: the shared target dir can hand a worktree a
-        // sibling's baked tree, which no pinned list could tell apart.
-        let docs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../site/content/docs");
+        // The baked table must be exactly the docs tree on disk — every page,
+        // keyed by the `/docs/...` URL path it is linked by internally (so a
+        // markdown link target is a valid `--page` argument), with the title
+        // lifted out of the frontmatter and the frontmatter stripped from the
+        // body. The expectation is DERIVED from `site/content/docs` rather than
+        // pinned here, so a docs move is a docs-only change and never a Rust one
+        // — a pinned list once dragged the full Rust matrix onto every docs
+        // restructure. Comparing whole tuples, not just slugs, also catches a
+        // stale bake: the shared target dir can hand a worktree a sibling's
+        // baked tree, which a slug list from a page that still exists could not
+        // tell apart from a fresh one.
+        //
+        // The docs root is resolved at RUN time: `env!` would freeze the
+        // compiling worktree's path into a test binary that the shared target
+        // dir then hands to sibling worktrees.
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let docs_dir = manifest_dir.join("../../site/content/docs");
         let mut expected = Vec::new();
-        collect_slugs(&docs_dir, &docs_dir, &mut expected);
+        collect_pages(&docs_dir, &docs_dir, &mut expected);
         expected.sort();
         assert!(
             !expected.is_empty(),
@@ -316,44 +325,49 @@ mod tests {
             docs_dir.display()
         );
 
-        let mut baked: Vec<String> = DOCS.iter().map(|(s, _, _)| (*s).to_string()).collect();
+        let mut baked: Vec<(String, String, String)> = DOCS
+            .iter()
+            .map(|(s, t, b)| ((*s).to_string(), (*t).to_string(), (*b).to_string()))
+            .collect();
         baked.sort();
+        let baked_slugs: Vec<&str> = baked.iter().map(|(s, _, _)| s.as_str()).collect();
+        let expected_slugs: Vec<&str> = expected.iter().map(|(s, _, _)| s.as_str()).collect();
         assert_eq!(
-            baked, expected,
-            "baked docs must match the tree under site/content/docs (stale bake or slug rule drift)"
+            baked_slugs, expected_slugs,
+            "baked slugs must match the tree under site/content/docs (stale bake or slug rule drift)"
         );
+        for ((slug, title, body), (_, want_title, want_body)) in baked.iter().zip(&expected) {
+            assert_eq!(
+                title, want_title,
+                "{slug}: title must come from the page's frontmatter"
+            );
+            assert_eq!(
+                body, want_body,
+                "{slug}: body must be the page with its frontmatter stripped"
+            );
+        }
         assert!(
-            baked.contains(&"/docs".to_string()),
+            baked_slugs.contains(&"/docs"),
             "top-level index.mdx collapses to /docs"
         );
         assert!(
-            !baked.iter().any(|s| s.ends_with("/index")),
-            "section-root `index` slugs must collapse to the parent: {baked:?}"
+            !baked_slugs.iter().any(|s| s.ends_with("/index")),
+            "section-root `index` slugs must collapse to the parent: {baked_slugs:?}"
         );
-        // Frontmatter is stripped from every body, and the title was lifted out
-        // of it (a page with no title falls back to its slug, never empty).
-        for (slug, title, body) in DOCS.iter() {
-            assert!(
-                !title.is_empty(),
-                "{slug}: title must come from frontmatter or slug"
-            );
-            assert!(
-                !body.trim_start().starts_with("---"),
-                "{slug}: frontmatter must be stripped from the printed body"
-            );
-        }
     }
 
-    /// The build script's slug rule, restated: every `.mdx` under the docs
-    /// root, `index` collapsing to its parent (`runtime/index` -> `/docs/runtime`,
-    /// the root `index` -> `/docs`). Kept in the test rather than shared with
-    /// `build.rs` on purpose — a shared helper would make the test agree with
-    /// the bake by construction.
-    fn collect_slugs(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    /// The build script's slug and frontmatter rules, restated: every `.mdx`
+    /// under the docs root, `index` collapsing to its parent (`runtime/index` ->
+    /// `/docs/runtime`, the root `index` -> `/docs`); the title is the
+    /// frontmatter `title:` (quotes stripped, the slug when absent) and the body
+    /// is everything past the closing fence. Kept in the test rather than shared
+    /// with `build.rs` on purpose — a shared helper would make the test agree
+    /// with the bake by construction.
+    fn collect_pages(root: &Path, dir: &Path, out: &mut Vec<(String, String, String)>) {
         for entry in std::fs::read_dir(dir).expect("readable docs dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
-                collect_slugs(root, &path, out);
+                collect_pages(root, &path, out);
             } else if path.extension().is_some_and(|e| e == "mdx") {
                 let rel = path
                     .strip_prefix(root)
@@ -367,11 +381,30 @@ mod tests {
                     Some((last, head)) if last == "index" => head.join("/"),
                     _ => parts.join("/"),
                 };
-                out.push(if tail.is_empty() {
+                let slug = if tail.is_empty() {
                     "/docs".to_string()
                 } else {
                     format!("/docs/{tail}")
-                });
+                };
+                let raw = std::fs::read_to_string(&path)
+                    .expect("readable page")
+                    .replace("\r\n", "\n");
+                let (title, body) = match raw.strip_prefix("---\n").and_then(|rest| {
+                    let end = rest.find("\n---")?;
+                    Some((&rest[..end], &rest[end + 4..]))
+                }) {
+                    Some((front, after)) => {
+                        let title = front
+                            .lines()
+                            .find_map(|l| l.trim().strip_prefix("title:"))
+                            .map(|t| t.trim().trim_matches(['"', '\'']).to_string())
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or_else(|| slug.clone());
+                        (title, after.strip_prefix('\n').unwrap_or(after).to_string())
+                    }
+                    None => (slug.clone(), raw.clone()),
+                };
+                out.push((slug, title, body));
             }
         }
     }

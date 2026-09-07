@@ -355,9 +355,12 @@ unset NUB_SHARED_TARGET NUB_BUILD_JOBS NUB_BUILD_FG NUB_BUILD_TARGET_OUT
 # tree baked last — a branch that moves docs pages tests a sibling's tree. A
 # rerun-if-env-changed on a cargo-set variable cannot catch that (cargo tracks only
 # the variables it receives), so hand it one: a content hash of the working-tree
-# docs, which the build script declares. Same bytes, same key, no rerun.
-NUB_DOCS_KEY=$(find "$root/site/content/docs" -type f -print0 2>/dev/null | sort -z \
-  | xargs -0 cat 2>/dev/null | "$digest" 2>/dev/null | cut -c1-12 || true)
+# docs, which the build script declares. Same tree, same key, no rerun. The
+# digest covers each file's RELATIVE path and its own digest, so a rename, a move
+# or an added empty page changes the key while an identical tree in another
+# worktree does not.
+NUB_DOCS_KEY=$(cd "$root" && find site/content/docs -type f -print0 2>/dev/null | sort -z \
+  | xargs -0 "$digest" 2>/dev/null | "$digest" 2>/dev/null | cut -c1-12 || true)
 export NUB_DOCS_KEY
 
 exec env CARGO_TARGET_DIR="$target" $wrapper_off $qos cargo "$@"
