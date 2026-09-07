@@ -178,6 +178,23 @@ Add your own in a [nub.jsonc](/docs/config#conditions) and every run in the proj
 
 Every resolution in the project matches against them, a bare-specifier [preload](/docs/config#preload) included.
 
+### The Nub runtime key
+
+Nub is registered in the WinterTC [runtime keys](https://runtime-keys.proposal.wintertc.org/) report alongside `bun`, `deno` and `workerd`. Every augmented run matches the `nub` condition, so a package that publishes a branch for it resolves there.
+
+```json title="node_modules/example/package.json"
+{
+  "exports": {
+    ".": {
+      "nub": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}
+```
+
+Compat mode is the exception. Passing `--node` runs with Node's own conditions and nothing else, so the same import resolves to `default`.
+
 ## Yarn Plug'n'Play
 
 Nub enables Plug'n'Play automatically. Walking up from the working directory, it detects a `.pnp.cjs` at the project root and injects it ahead of its own preload (`--require .pnp.cjs` on the fast tier, the `NODE_OPTIONS` equivalent on the compat tier), so PnP's resolver patches install first and Nub's TypeScript resolution layers on top.
