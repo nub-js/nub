@@ -1539,7 +1539,13 @@ pub async fn run_root_hook(
 /// that only the root declares: puppeteer's `tools/eslint` runs `wireit`,
 /// a root devDependency, from its `prepare`. With only the member's own
 /// `.bin` on `PATH` that was a 127 on every install. For the root importer
-/// itself the chain is empty and this is [`run_root_hook`].
+/// itself the chain is empty and this is [`run_root_hook`] plus `tool_dirs`.
+///
+/// `tool_dirs` go on `PATH` after the chain and before the root's `.bin`:
+/// the embedder's lazy `node-gyp` shim above all, which npm provides to
+/// every lifecycle script from its own bundled copy (`node-gyp-bin`). A
+/// root `preinstall` that runs `node-gyp install` (theia) runs before any
+/// dependency exists, so nothing but such a shim can satisfy it.
 ///
 /// Returns `Ok(false)` if the script isn't defined. The caller gates on
 /// `--ignore-scripts`.
@@ -1549,13 +1555,18 @@ pub async fn run_member_hook(
     modules_dir_name: &str,
     manifest: &PackageJson,
     hook: LifecycleHook,
+    tool_dirs: &[&Path],
 ) -> Result<bool, Error> {
     let name = hook.script_name();
     let Some(script_cmd) = manifest.scripts.get(name) else {
         return Ok(false);
     };
     let chain = member_bin_chain(member_dir, workspace_root, modules_dir_name);
-    let extra: Vec<&Path> = chain.iter().map(PathBuf::as_path).collect();
+    let extra: Vec<&Path> = chain
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(tool_dirs.iter().copied())
+        .collect();
     run_script(
         member_dir,
         workspace_root,

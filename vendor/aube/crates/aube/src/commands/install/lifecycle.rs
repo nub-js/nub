@@ -6,23 +6,14 @@ use super::side_effects_cache::{
     SideEffectsCacheConfig, SideEffectsCacheEntry, SideEffectsCacheRestore,
 };
 
-/// Run a root-package lifecycle hook, announcing it to the user if defined
-/// and turning aube_scripts::Error into a miette::Report with context.
-/// Silent when the hook isn't defined in package.json.
-pub(super) async fn run_root_lifecycle(
-    project_dir: &std::path::Path,
-    modules_dir_name: &str,
-    manifest: &aube_manifest::PackageJson,
-    hook: aube_scripts::LifecycleHook,
-) -> miette::Result<()> {
-    run_root_lifecycle_script(project_dir, modules_dir_name, manifest, hook.script_name()).await
-}
-
-/// Run a post-link lifecycle hook of one importer — the root or a workspace
-/// member — with the member's `.bin` chain up to the workspace root on
-/// `PATH` (see [`aube_scripts::run_member_hook`]). Silent when the hook
-/// isn't defined; the failure names the importer, since "root" was what a
-/// member's failing `prepare` used to be reported as.
+/// Run a lifecycle hook of one importer — the root or a workspace member —
+/// with the member's `.bin` chain up to the workspace root on `PATH`, plus
+/// the lazy `node-gyp` shim when neither the project nor the ambient `PATH`
+/// has one (see [`aube_scripts::run_member_hook`]; the shim is the same one
+/// dependency builds get, and stays out of the way when a real node-gyp
+/// resolves). Silent when the hook isn't defined; the failure names the
+/// importer, since "root" was what a member's failing `prepare` used to be
+/// reported as.
 pub(super) async fn run_importer_lifecycle(
     workspace_root: &std::path::Path,
     importer_dir: &std::path::Path,
@@ -41,12 +32,16 @@ pub(super) async fn run_importer_lifecycle(
         importer_path
     };
     tracing::debug!("Running {label} {script_name} script...");
+    let project_bin_dir = workspace_root.join(modules_dir_name).join(".bin");
+    let node_gyp_bin_dir = node_gyp_bootstrap::lazy_shim_bin_dir(&project_bin_dir)?;
+    let tool_dirs: Vec<&std::path::Path> = node_gyp_bin_dir.iter().map(|d| d.as_path()).collect();
     aube_scripts::run_member_hook(
         importer_dir,
         workspace_root,
         modules_dir_name,
         manifest,
         hook,
+        &tool_dirs,
     )
     .await
     .map_err(|e| miette!("{label} {script_name} script failed: {e}"))?;
