@@ -4705,6 +4705,7 @@ fn run_file_in_dir(args: &[String], compat_mode: bool, cwd: &Path, exec_ua: bool
     // `!compat_mode`, so `--node` skips it regardless).
     let pnp_ctx = nub_core::pnp::detect(cwd);
     let config = nub_core::node::spawn::SpawnConfig {
+        runtime_has_preloads: !runtime.preload.is_empty(),
         // Put the loader in front of Node when one owns this project.
         env_owner: env_owner
             .as_ref()

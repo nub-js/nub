@@ -124,6 +124,14 @@ for(let dir='/sys/fs/cgroup'+group;dir.startsWith('/sys/fs/cgroup');dir=path.dir
         # Runtime-control variables from .env are deliberately ignored by Nub.
         assert run("ignored-heap-dotenv", [nub, "--no-check", "main.cjs"]) == 304
         (project / ".env").unlink()
+        for label, settings in [
+            ("user-conditions", {"conditions": ["development"]}),
+            ("user-prefix", {"prefix": ["/usr/bin/env"]}),
+            ("user-config-preload", {"preload": ["./early.cjs"]}),
+        ]:
+            (project / "nub.jsonc").write_text(json.dumps({**config, **settings}))
+            assert run(label, [nub, "--no-check", "main.cjs"]) == defaults[512]
+        (project / "nub.jsonc").write_text(json.dumps(config))
         assert run("pressure-node", [node, "pressure.cjs"]) == defaults[512]
         assert run("pressure-nub", [nub, "--no-check", "pressure.cjs"]) == 304
     print(f"GC_ACCEPTANCE_OK {cases} cases")
