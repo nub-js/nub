@@ -47,6 +47,15 @@ pub struct Reference {
     pub(crate) package: String,
     /// The raw specifier (kept for the report — shows the exact subpath).
     pub(crate) raw: String,
+    /// The package-root-relative file the reference was found in.
+    ///
+    /// Provenance BITS say which entry surface reaches a reference; this says
+    /// where the reference physically is, which is a different question and the
+    /// one a reviewer asks first. It separates a deep-path root that is a real
+    /// legacy entry point (`integration/react.js`) from one that is test or
+    /// build scaffolding a package shipped because it declares no `files`
+    /// (`integration_tests_server/index.js`) — indistinguishable by bit.
+    pub(crate) file: String,
     /// Guarded (try/catch or a conditional branch) at every occurrence collapses
     /// to soft; a single unguarded occurrence makes the package hard.
     pub(crate) soft: bool,
@@ -200,6 +209,7 @@ fn walk_generic<S: FileSource>(source: &S, entry_points: &[Entry], opts: WalkOpt
                 result.references.push(Reference {
                     package,
                     raw: occ.spec.clone(),
+                    file: rel.clone(),
                     soft: occ.soft,
                     from_main: fflags & FROM_MAIN != 0,
                     from_subpath: fflags & FROM_SUBPATH != 0,

@@ -4048,12 +4048,15 @@ fn write_preload_chain(dir: &Path, esm: bool, entries: &[String]) -> Result<Opti
 
 /// A resolver for BARE `nub.jsonc` `preload` entries, with the condition set the
 /// chainer's channel implies (`import` for the `.mjs` chainer, `require` for the
-/// `.cjs` one) — the same conditions Node itself would use for that flag.
+/// `.cjs` one) — the same conditions Node itself would use for that flag. That set
+/// includes [`NUB_CONDITION`], because this resolves a specifier the child Node
+/// would otherwise resolve for itself, with the runtime key already on its argv.
 ///
 fn bare_preload_resolver(esm: bool) -> oxc_resolver::Resolver {
     oxc_resolver::Resolver::new(oxc_resolver::ResolveOptions {
         condition_names: vec![
             "node".to_string(),
+            NUB_CONDITION.to_string(),
             if esm { "import" } else { "require" }.to_string(),
         ],
         extensions: vec![".js".into(), ".json".into(), ".node".into()],
@@ -4176,6 +4179,15 @@ fn ensure_tsconfig_parses(dir: &str, explicit: Option<&str>) -> Result<()> {
     );
 }
 
+/// Nub's runtime key, set as an `exports`/`imports` condition on every run the CLI
+/// augments and honored by the compile bundler, which resolves `exports` ahead of
+/// time and so has to pick the same file.
+///
+/// The key follows the WinterTC runtime-keys convention
+/// (<https://runtime-keys.proposal.wintertc.org/>); the registry entry is proposed
+/// separately and this does not wait on it.
+pub(crate) const NUB_CONDITION: &str = "nub";
+
 pub(crate) fn runtime_node_options(
     runtime: &mut crate::project_config::RuntimeConfig,
     node: &nub_core::node::discovery::ResolvedNode,
@@ -4210,6 +4222,19 @@ pub(crate) fn runtime_node_options_with(
     }
 
     let mut seen_conditions = std::collections::HashSet::new();
+    // Nub's runtime key, in the slot `bun`, `deno` and `workerd` occupy. It rides
+    // every run the CLI augments so a package can point an `exports` branch at what
+    // nub adds — TypeScript source above all — and is absent under `--node`/
+    // `NODE_COMPAT`, which skip this function entirely and so run with Node's own
+    // condition set. Conditions are a SET: this only ever offers a branch a package
+    // opted into, and a package with no `nub` key resolves as it does under plain Node.
+    //
+    // Scoped to the CLI on purpose. The standalone `@nubjs/loader` installs the same
+    // transform hooks but deliberately does NOT add this, because its contract is that
+    // a file resolves identically under it, under tsx, and under plain Node — the brand
+    // stays in the outer invocation and out of the user's import graph.
+    seen_conditions.insert(NUB_CONDITION.to_string());
+    options.push(format!("--conditions={NUB_CONDITION}"));
     for condition in &runtime.conditions {
         if condition.is_empty() || condition.chars().any(char::is_whitespace) {
             bail!("nub.jsonc `conditions` entries must be non-empty and contain no whitespace");

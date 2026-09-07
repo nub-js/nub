@@ -322,11 +322,18 @@ fn bundle_inner(
         // ONLY for `(Node, Cjs)` and leaves verbatim everywhere else — and under a
         // CJS format Rolldown already declares both globals, so the plugin is
         // redundant there and should simply be skipped.
-        format: Some(if compile_emits_cjs() {
-            OutputFormat::Cjs
-        } else {
-            OutputFormat::Esm
-        }),
+        //
+        // A CJS shape was built behind an env gate and removed, so the reason is
+        // worth keeping: its only purpose was a V8 startup snapshot, which needs a
+        // CommonJS main (`minimalRunCjs` rejects an ESM entry). Snapshots do not
+        // pay here. On code-shaped init — classes, closures, registries, i.e. what
+        // an app is — one measured 0.95x, SLOWER than plain, winning 2 of 13
+        // rounds; the 1.48x a snapshot wins on data-shaped init does not transfer,
+        // and the blob runs 30 MB for 0.2 MB of source. A graph touching
+        // `node:http` cannot be snapshotted at all, because `HTTPParser` carries
+        // V8 embedder fields. Precompilation does NOT imply CJS in general:
+        // Bun ships `format: "esm"` with `bytecode: true`.
+        format: Some(OutputFormat::Esm),
         platform: Some(Platform::Node),
         // An authored ESM module has no `require` binding. Rolldown's Node ESM
         // default installs `createRequire(import.meta.url)` for every unbound
@@ -347,24 +354,8 @@ fn bundle_inner(
         // Compiled chunks always execute as ESM, regardless of the source
         // package's `type` field. Keeping that fact in their extension lets Node
         // load extracted artifacts without a synthetic package boundary.
-        entry_filenames: Some(
-            if compile_emits_cjs() {
-                "[name].cjs"
-            } else {
-                "[name].mjs"
-            }
-            .to_string()
-            .into(),
-        ),
-        chunk_filenames: Some(
-            if compile_emits_cjs() {
-                "[name]-[hash].cjs"
-            } else {
-                "[name]-[hash].mjs"
-            }
-            .to_string()
-            .into(),
-        ),
+        entry_filenames: Some("[name].mjs".to_string().into()),
+        chunk_filenames: Some("[name]-[hash].mjs".to_string().into()),
         minify: Some(minify_options(opts)),
         // The ONLY keep-names switch we touch. Rolldown threads this single flag
         // into both the finalizer's `__name` helper and the minifier's
@@ -388,7 +379,23 @@ fn bundle_inner(
         },
         resolve: Some(ResolveOptions {
             alias: alias_entries(&opts.alias)?,
-            condition_names: (!opts.conditions.is_empty()).then(|| opts.conditions.clone()),
+            // Nub's runtime key leads the set, so a package resolves to the same
+            // branch here as it does on a `nub <file>` run. `exports` is resolved
+            // at BUILD time in a compiled binary, so a bundler that omitted the
+            // condition would silently ship a different file than the one the same
+            // program loads uninstalled. Additive, not substitutive — the defaults
+            // still apply (see
+            // `a_custom_condition_is_added_to_the_defaults_not_substituted_for_them`).
+            condition_names: Some(
+                std::iter::once(crate::cli::NUB_CONDITION.to_string())
+                    .chain(
+                        opts.conditions
+                            .iter()
+                            .filter(|name| name.as_str() != crate::cli::NUB_CONDITION)
+                            .cloned(),
+                    )
+                    .collect(),
+            ),
             // `module` BEFORE `main`, inverting Rolldown's node-platform default
             // (`["main", "module"]`) to Rollup's order. A legacy dual package
             // with no `exports` map points `main` at a UMD build whose factory
@@ -1642,22 +1649,7 @@ fn is_node_commonjs_module(module: &rolldown_common::ModuleInfo) -> bool {
 /// first statement, and reaching a property means calling into the loader
 /// earlier than the loader's own chunk starts.
 fn compile_commonjs_require_intro() -> String {
-    let intro = compile_commonjs_require_intro_esm();
-    if compile_emits_cjs() {
-        // `import.meta` is a syntax error in a CommonJS chunk. Rolldown polyfills
-        // it for (Node, Cjs) in USER code, but this intro is spliced in verbatim
-        // and never passes through that transform.
-        return intro.replace("import.meta.url", "__filename");
-    }
-    intro
-}
-
-fn compile_commonjs_require_intro_esm() -> String {
     let loader = COMPILE_COMMONJS_LOADER;
-    // `import.meta` is a syntax error in a CommonJS chunk. Rolldown polyfills it
-    // for (Node, Cjs) in USER code, but this intro is spliced in verbatim and
-    // never passes through that transform.
-
     format!(
         "{COMPILE_COMMONJS_REQUIRE_MARKER}\n\
          {loader}.resolve = (id, options) => __nubRequire().resolve(id, options);\n\
@@ -1729,20 +1721,6 @@ fn compile_commonjs_require_intro_esm() -> String {
 /// one deliberate exception: it shadows exactly the name the module body means.
 const ROLLDOWN_MODULE_WRAPPERS: [&str; 4] = ["__commonJS", "__commonJSMin", "__esm", "__esmMin"];
 const ROLLDOWN_COMMONJS_WRAPPERS: [&str; 2] = ["__commonJS", "__commonJSMin"];
-
-/// Whether this build emits CommonJS chunks instead of ESM.
-///
-/// A V8 startup snapshot is the only mechanism that skips module EVALUATION
-/// rather than compilation, and Node runs a snapshot main through
-/// `minimalRunCjs` — an ESM entry is rejected outright. Bun has the identical
-/// constraint (`--format` "defaults to esm, or cjs with --bytecode"), so a
-/// CommonJS shape is the prerequisite for precompilation on either runtime.
-///
-/// Env-gated while the surface is settled; the intended trigger is a `--snapshot`
-/// flag with the format an implementation detail the user never names.
-fn compile_emits_cjs() -> bool {
-    std::env::var_os("__NUB_COMPILE_CJS").is_some()
-}
 
 /// The re-entrancy guard nub wraps every ASYNC module initializer in, and the
 /// reason it exists: Rolldown lowers each import edge into its own `await`, which
@@ -6251,6 +6229,39 @@ mod tests {
         assert!(
             emits_literal(&default, "import"),
             "without --conditions the import branch must win; got:\n{default}"
+        );
+    }
+
+    /// Nub's runtime key reaches the bundler's resolver with no flag passed, so a
+    /// package's `nub` branch picks the file a `nub <file>` run would load.
+    ///
+    /// `exports` is resolved at BUILD time here, and a resolution that skipped the key
+    /// would fail silently: the compiled binary ships the `default` branch while the
+    /// same program run uncompiled loads the other one. The negative half is what
+    /// catches that, since a bundle that resolved nothing also fails the first
+    /// assertion.
+    #[test]
+    fn the_nub_runtime_key_selects_its_exports_branch_with_no_flag() {
+        const PKG: &str = r#"{
+            "name": "keyed",
+            "exports": { ".": { "nub": "./nub.js", "default": "./default.js" } }
+        }"#;
+        const FILES: &[(&str, &str)] = &[
+            ("nub.js", "export const WHICH = 'runtime-key';\n"),
+            ("default.js", "export const WHICH = 'default-branch';\n"),
+        ];
+        const SRC: &str = "import { WHICH } from 'keyed';\nglobalThis.OUT = WHICH;\n";
+
+        let mut plain = opts();
+        plain.minify = false;
+        let selected = bundle_with_package(SRC, "keyed", PKG, FILES, &plain);
+        assert!(
+            emits_literal(&selected, "runtime-key"),
+            "the bundler must resolve the `nub` branch with no flag passed; got:\n{selected}"
+        );
+        assert!(
+            !emits_literal(&selected, "default-branch"),
+            "and it must not also pull the default branch in; got:\n{selected}"
         );
     }
 

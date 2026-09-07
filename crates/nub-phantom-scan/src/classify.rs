@@ -5,7 +5,7 @@
 //! try/catch). The classification then answers the one question that matters —
 //! is this reference covered by something a consumer install makes resolvable?
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -66,7 +66,26 @@ pub struct Finding {
     pub(crate) from_deep_path: bool,
     /// Example raw specifiers (deduped) showing how it was referenced.
     pub specifiers: Vec<String>,
+    /// Example source files (deduped, sorted, capped at [`MAX_EXAMPLE_FILES`])
+    /// the reference was found in, package-root-relative.
+    ///
+    /// The provenance bits say which entry surface REACHES a reference; this
+    /// says where it physically lives, and the two answer different questions.
+    /// A deep-path-only finding is real-but-lower-confidence precisely because
+    /// the bit cannot distinguish a legacy entry point a consumer imports from
+    /// test or build scaffolding a package shipped by declaring no `files`, and
+    /// the path is what settles it.
+    pub files: Vec<String>,
+    /// How many distinct files reference the package, before the cap — so a
+    /// truncated [`Finding::files`] is visible as truncated rather than reading
+    /// as the whole set.
+    pub file_count: usize,
 }
+
+/// Cap on [`Finding::files`]. A package referenced from every file in a large
+/// tree would otherwise dominate the report; a handful of examples is what a
+/// reviewer reads, and `file_count` carries the rest.
+const MAX_EXAMPLE_FILES: usize = 8;
 
 impl Finding {
     /// The subpath-adapter class the GVS-default bug hinges on: a HARD phantom
@@ -104,6 +123,7 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
         from_types: bool,
         from_deep_path: bool,
         specs: Vec<String>,
+        files: BTreeSet<String>,
     }
     let mut by_pkg: BTreeMap<String, Agg> = BTreeMap::new();
     for r in references {
@@ -114,6 +134,7 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
             from_types: false,
             from_deep_path: false,
             specs: Vec::new(),
+            files: BTreeSet::new(),
         });
         e.all_soft &= r.soft;
         e.from_main |= r.from_main;
@@ -122,6 +143,14 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
         e.from_deep_path |= r.from_deep_path;
         if !e.specs.contains(&r.raw) {
             e.specs.push(r.raw.clone());
+        }
+        // Membership first, so a repeat reference from a file already recorded
+        // costs a lookup rather than a String clone that is then discarded.
+        // `classify` runs per package on the shipped install path (`scan_index`
+        // -> `reduce`), where a target referenced from one file forty times is
+        // ordinary, and nothing on that path ever reads `files`.
+        if !e.files.contains(r.file.as_str()) {
+            e.files.insert(r.file.clone());
         }
     }
 
@@ -145,6 +174,8 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
                 from_types: agg.from_types,
                 from_deep_path: agg.from_deep_path,
                 specifiers: agg.specs,
+                file_count: agg.files.len(),
+                files: agg.files.into_iter().take(MAX_EXAMPLE_FILES).collect(),
             }
         })
         .collect()
@@ -237,7 +268,7 @@ fn is_self(manifest: &Manifest, package: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, classify};
+    use super::{MAX_EXAMPLE_FILES, Verdict, classify};
     use crate::graph::Reference;
     use crate::manifest::Manifest;
 
@@ -247,6 +278,7 @@ mod tests {
             .map(|(p, raw, soft)| Reference {
                 package: (*p).to_string(),
                 raw: (*raw).to_string(),
+                file: "index.js".to_string(),
                 soft: *soft,
                 from_main: true,
                 from_subpath: false,
@@ -278,6 +310,7 @@ mod tests {
         let type_ref = |raw: &str, package: &str| Reference {
             package: package.to_string(),
             raw: raw.to_string(),
+            file: "index.d.ts".to_string(),
             soft: false,
             from_main: false,
             from_subpath: false,
@@ -335,6 +368,7 @@ mod tests {
         let runtime = Reference {
             package: "geojson".to_string(),
             raw: "geojson".to_string(),
+            file: "index.js".to_string(),
             soft: false,
             from_main: true,
             from_subpath: false,
@@ -394,6 +428,7 @@ mod tests {
         let deep = |pkg: &str| Reference {
             package: pkg.to_string(),
             raw: pkg.to_string(),
+            file: format!("lib/integration/{pkg}.js"),
             soft: false,
             from_main: false,
             from_subpath: false,
@@ -427,6 +462,7 @@ mod tests {
         let subpath_only = Reference {
             package: "zod".into(),
             raw: "zod/v4/core".into(),
+            file: "zod.js".into(),
             soft: false,
             from_main: false,
             from_subpath: true,
@@ -436,6 +472,7 @@ mod tests {
         let main_reached = Reference {
             package: "junk".into(),
             raw: "junk".into(),
+            file: "index.js".into(),
             soft: false,
             from_main: true,
             from_subpath: false,
@@ -447,5 +484,55 @@ mod tests {
         let junk = f.iter().find(|x| x.package == "junk").unwrap();
         assert!(zod.is_subpath_adapter());
         assert!(!junk.is_subpath_adapter());
+    }
+
+    /// A finding carries the files it was found in, deduped and sorted, with the
+    /// pre-cap count beside them.
+    ///
+    /// This is what separates a deep-path root that is a real legacy entry point
+    /// from one that is scaffolding a package shipped by declaring no `files` —
+    /// a distinction the provenance bits cannot make, because both reach the
+    /// same `from_deep_path` verdict. Without the count a truncated list would
+    /// read as the complete set, and "every referencing file is scaffolding" is
+    /// exactly the claim a reviewer would then get wrong.
+    #[test]
+    fn a_finding_records_the_files_it_was_found_in() {
+        let m = Manifest::parse(br#"{"name":"pkg"}"#).unwrap();
+        let at = |file: &str| Reference {
+            package: "react".to_string(),
+            raw: "react".to_string(),
+            file: file.to_string(),
+            soft: false,
+            from_main: false,
+            from_subpath: false,
+            from_types: false,
+            from_deep_path: true,
+        };
+        // Two references from one file collapse; the order of arrival does not
+        // survive into the report.
+        let f = classify(
+            &m,
+            &[
+                at("integration/react.js"),
+                at("integration_tests_server/index.js"),
+                at("integration/react.js"),
+            ],
+        );
+        assert_eq!(f[0].file_count, 2, "distinct files, not occurrences");
+        assert_eq!(
+            f[0].files,
+            vec![
+                "integration/react.js".to_string(),
+                "integration_tests_server/index.js".to_string()
+            ]
+        );
+
+        // Past the cap the list truncates and the count keeps the truth.
+        let many: Vec<Reference> = (0..MAX_EXAMPLE_FILES + 5)
+            .map(|i| at(&format!("src/{i:02}.js")))
+            .collect();
+        let f = classify(&m, &many);
+        assert_eq!(f[0].files.len(), MAX_EXAMPLE_FILES);
+        assert_eq!(f[0].file_count, MAX_EXAMPLE_FILES + 5);
     }
 }
