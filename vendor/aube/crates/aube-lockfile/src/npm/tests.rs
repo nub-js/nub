@@ -4126,7 +4126,7 @@ fn test_parse_npm_workspace_importer_records_required_peers() {
         .iter()
         .map(|d| (d.name.as_str(), d.specifier.as_deref().unwrap(), d.dep_type))
         .collect();
-    recorded.sort();
+    recorded.sort_by(|a, b| a.0.cmp(b.0));
     assert_eq!(
         recorded,
         vec![

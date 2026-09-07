@@ -4185,7 +4185,32 @@ pub(crate) fn runtime_node_options(
     runtime: &mut crate::project_config::RuntimeConfig,
     node: &nub_core::node::discovery::ResolvedNode,
 ) -> Result<Vec<String>> {
-    runtime_node_options_with(runtime, node, FoldInherited::Yes)
+    runtime_node_options_with(runtime, node, FoldInherited::Yes, TsconfigGate::Required)
+}
+
+/// The options a PM verb hands its lifecycle scripts. Same set as a run, except a
+/// tsconfig that will not read is tolerated: the install is what makes the
+/// `extends` target exist (ava's `"extends": "@sindresorhus/tsconfig"` is a
+/// devDependency), so refusing here left every fresh clone unable to install.
+pub(crate) fn lifecycle_node_options(
+    runtime: &mut crate::project_config::RuntimeConfig,
+    node: &nub_core::node::discovery::ResolvedNode,
+) -> Result<Vec<String>> {
+    runtime_node_options_with(runtime, node, FoldInherited::Yes, TsconfigGate::BestEffort)
+}
+
+/// What an unreadable tsconfig does to the run whose options are being built.
+///
+/// `Required` is every path that executes the user's program (#731: running under
+/// options the author never wrote is the silent wrong answer). `BestEffort` is the
+/// lifecycle-script path of the PM verbs, where the config's `extends` target is
+/// routinely a package the verb is about to install: the run proceeds without the
+/// config-derived conditions and without a report — nothing is guessed at, and the
+/// child that re-enters nub to run a TypeScript file still applies the gate itself.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TsconfigGate {
+    Required,
+    BestEffort,
 }
 
 /// Whether inherited `NODE_OPTIONS` preloads may be folded into nub's chainer.
@@ -4205,6 +4230,7 @@ pub(crate) fn runtime_node_options_with(
     runtime: &mut crate::project_config::RuntimeConfig,
     node: &nub_core::node::discovery::ResolvedNode,
     fold: FoldInherited,
+    tsconfig_gate: TsconfigGate,
 ) -> Result<Vec<String>> {
     let accepted = nub_core::node::discovery::accepted_env_flags(node.path.as_std_path());
     let mut options = Vec::new();
@@ -4252,6 +4278,8 @@ pub(crate) fn runtime_node_options_with(
     // `extends`. Skipped entirely in compat mode by the caller, like every other
     // config-derived flag.
     if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.to_string_lossy();
+        let explicit = runtime.tsconfig.as_deref();
         // A tsconfig that will not parse is FATAL, not a warning (#731). Reporting it
         // and carrying on still runs the program under options its author never
         // wrote — the same silent-wrong-answer the issue reported, only quieter — and
@@ -4260,11 +4288,22 @@ pub(crate) fn runtime_node_options_with(
         // out `strict`, `target` and `paths`, so the base is usually where the load
         // lives. `--node` / `NODE_COMPAT` skip this whole function, so the escape
         // hatch for a config nub cannot read is the one that already turns off every
-        // other config-derived behavior.
-        ensure_tsconfig_parses(&cwd.to_string_lossy(), runtime.tsconfig.as_deref())?;
-        for condition in
-            nub_tsconfig::custom_conditions(&cwd.to_string_lossy(), runtime.tsconfig.as_deref())
-        {
+        // other config-derived behavior. The lifecycle path (`BestEffort`) is the one
+        // exception, and it takes the same "guess at nothing" line: no conditions at
+        // all from a config it cannot read.
+        let conditions = match tsconfig_gate {
+            TsconfigGate::Required => {
+                ensure_tsconfig_parses(&cwd, explicit)?;
+                nub_tsconfig::custom_conditions(&cwd, explicit)
+            }
+            TsconfigGate::BestEffort
+                if nub_tsconfig::probe_diagnostics(&cwd, explicit).is_empty() =>
+            {
+                nub_tsconfig::custom_conditions(&cwd, explicit)
+            }
+            TsconfigGate::BestEffort => Vec::new(),
+        };
+        for condition in conditions {
             // A condition name with whitespace is a user error in THEIR tsconfig that
             // `tsc` itself tolerates, so it cannot be fatal here the way a bad
             // nub.jsonc entry is: skip it and leave the rest of the set intact.
@@ -6950,7 +6989,12 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
         let status = nub_core::node::spawn::status_forwarding_signals(&mut cmd)?;
         return Ok(nub_core::node::spawn::exit_code_from_status(&status));
     }
-    let runtime_node_options = runtime_node_options_with(&mut runtime, &node, FoldInherited::No)?;
+    let runtime_node_options = runtime_node_options_with(
+        &mut runtime,
+        &node,
+        FoldInherited::No,
+        TsconfigGate::Required,
+    )?;
     let runtime_v8_flags = runtime_v8_flags(&runtime)?;
     let runtime_json = runtime_config_json(&runtime)?;
 
