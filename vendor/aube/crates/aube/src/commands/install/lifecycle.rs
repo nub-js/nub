@@ -18,6 +18,41 @@ pub(super) async fn run_root_lifecycle(
     run_root_lifecycle_script(project_dir, modules_dir_name, manifest, hook.script_name()).await
 }
 
+/// Run a post-link lifecycle hook of one importer — the root or a workspace
+/// member — with the member's `.bin` chain up to the workspace root on
+/// `PATH` (see [`aube_scripts::run_member_hook`]). Silent when the hook
+/// isn't defined; the failure names the importer, since "root" was what a
+/// member's failing `prepare` used to be reported as.
+pub(super) async fn run_importer_lifecycle(
+    workspace_root: &std::path::Path,
+    importer_dir: &std::path::Path,
+    importer_path: &str,
+    modules_dir_name: &str,
+    manifest: &aube_manifest::PackageJson,
+    hook: aube_scripts::LifecycleHook,
+) -> miette::Result<()> {
+    let script_name = hook.script_name();
+    if !manifest.scripts.contains_key(script_name) {
+        return Ok(());
+    }
+    let label = if importer_path == "." {
+        "root"
+    } else {
+        importer_path
+    };
+    tracing::debug!("Running {label} {script_name} script...");
+    aube_scripts::run_member_hook(
+        importer_dir,
+        workspace_root,
+        modules_dir_name,
+        manifest,
+        hook,
+    )
+    .await
+    .map_err(|e| miette!("{label} {script_name} script failed: {e}"))?;
+    Ok(())
+}
+
 /// Run a named root-package lifecycle script.
 ///
 /// Most install hooks use [`aube_scripts::LifecycleHook`], but pnpm's

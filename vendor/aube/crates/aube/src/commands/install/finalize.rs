@@ -4,7 +4,7 @@ use super::bin_linking::{
 };
 use super::dep_selection::DepSelection;
 use super::lifecycle::{
-    JailBuildPolicy, run_dep_lifecycle_scripts, run_root_lifecycle, unreviewed_dep_builds,
+    JailBuildPolicy, run_dep_lifecycle_scripts, run_importer_lifecycle, unreviewed_dep_builds,
 };
 use super::side_effects_cache::{
     SideEffectsCacheConfig, SideEffectsCacheLocation, side_effects_cache_root,
@@ -455,7 +455,15 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
                 aube_scripts::LifecycleHook::PostInstall,
                 aube_scripts::LifecycleHook::Prepare,
             ] {
-                run_root_lifecycle(&project_dir, modules_dir_name, importer_manifest, hook).await?;
+                run_importer_lifecycle(
+                    cwd,
+                    &project_dir,
+                    importer_path,
+                    modules_dir_name,
+                    importer_manifest,
+                    hook,
+                )
+                .await?;
             }
         }
         phase_timings.record("root_lifecycle", phase_start.elapsed());

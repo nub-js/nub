@@ -1531,6 +1531,68 @@ pub async fn run_root_hook(
     run_root_script_by_name(project_dir, modules_dir_name, manifest, hook.script_name()).await
 }
 
+/// Run a lifecycle hook of a WORKSPACE MEMBER. Spawns in `member_dir` with
+/// the member's own manifest, and puts every `<modules_dir>/.bin` from the
+/// member up to `workspace_root` on `PATH`, closest first — the walk npm's
+/// run-script does for a workspace script (`run_script` appends the root's
+/// own `.bin` after these). A member's script routinely reaches for a bin
+/// that only the root declares: puppeteer's `tools/eslint` runs `wireit`,
+/// a root devDependency, from its `prepare`. With only the member's own
+/// `.bin` on `PATH` that was a 127 on every install. For the root importer
+/// itself the chain is empty and this is [`run_root_hook`].
+///
+/// Returns `Ok(false)` if the script isn't defined. The caller gates on
+/// `--ignore-scripts`.
+pub async fn run_member_hook(
+    member_dir: &Path,
+    workspace_root: &Path,
+    modules_dir_name: &str,
+    manifest: &PackageJson,
+    hook: LifecycleHook,
+) -> Result<bool, Error> {
+    let name = hook.script_name();
+    let Some(script_cmd) = manifest.scripts.get(name) else {
+        return Ok(false);
+    };
+    let chain = member_bin_chain(member_dir, workspace_root, modules_dir_name);
+    let extra: Vec<&Path> = chain.iter().map(PathBuf::as_path).collect();
+    run_script(
+        member_dir,
+        workspace_root,
+        modules_dir_name,
+        manifest,
+        name,
+        script_cmd,
+        &extra,
+        None,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The `.bin` directories a workspace member's script sees before the
+/// root's: `<dir>/<modules_dir>/.bin` for the member's directory and each
+/// ancestor below `workspace_root`, closest first. Mirrors npm, whose
+/// run-script walks every ancestor of the script's directory; a member
+/// outside the root (a `../sibling` importer) walks to the filesystem root
+/// the same way npm does.
+fn member_bin_chain(
+    member_dir: &Path,
+    workspace_root: &Path,
+    modules_dir_name: &str,
+) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut cursor = Some(member_dir);
+    while let Some(dir) = cursor {
+        if dir == workspace_root {
+            break;
+        }
+        chain.push(dir.join(modules_dir_name).join(".bin"));
+        cursor = dir.parent();
+    }
+    chain
+}
+
 /// Run a named root-package script if it's defined. Used by commands
 /// (pack, publish, version) that need to run lifecycle hooks outside
 /// the install-focused [`LifecycleHook`] enum. Returns `Ok(false)` if
@@ -2643,6 +2705,31 @@ mod break_cas_hardlinks_tests {
             std::path::Path::new("real.txt")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod member_bin_chain_tests {
+    use super::member_bin_chain;
+    use std::path::{Path, PathBuf};
+
+    /// A nested member (`test/installation`) sees its own `.bin`, then its
+    /// parent member's, closest first; the root's is appended by `run_script`.
+    /// The root importer itself contributes nothing.
+    #[test]
+    fn member_bin_chain_walks_every_ancestor_below_the_root_closest_first() {
+        let root = Path::new("/p");
+        assert_eq!(
+            member_bin_chain(Path::new("/p/test/installation"), root, "node_modules"),
+            vec![
+                PathBuf::from("/p/test/installation/node_modules/.bin"),
+                PathBuf::from("/p/test/node_modules/.bin"),
+            ]
+        );
+        assert_eq!(
+            member_bin_chain(root, root, "node_modules"),
+            Vec::<PathBuf>::new()
+        );
     }
 }
 
