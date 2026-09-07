@@ -1,0 +1,20 @@
+# Known-red corpus entries: "<owner/repo> <reason>". Same discipline as the other
+# harnesses: this list must SHRINK. A listed repo that installs and checks clean
+# fails the run (XPASS-STALE), so the green flip is recorded by deleting its line
+# in the same commit as the fix.
+
+# rollup's postinstall runs patch-package against packages it does not depend on
+# directly (`@types/rimraf` and one more). npm hoists them to the root; nub's
+# isolated layout keeps only direct dependencies there, so the patch targets are
+# absent. Installs with `node-linker=hoisted` in the project's .npmrc.
+rollup/rollup postinstall patch-package expects transitive packages hoisted to the root
+
+# A peer npm auto-installs and marks `peer: true`, reached only through a transitive
+# package's peer edge, is pruned as unreachable; and with no satisfying ancestor a peer
+# resolves to the newest copy in the graph or an out-of-range ancestor copy where the
+# lockfile places a satisfying one. Fixed in #923; these lines go with it.
+avajs/ava react-dom pruned under react-element-to-jsx-string; eslint-plugin-react gets an out-of-range eslint (#923)
+motdotla/dotenv react-dom pruned under react-element-to-jsx-string (#923)
+axios/axios @types/node pruned under cosmiconfig-typescript-loader (#923)
+promptfoo/promptfoo search-insights pruned under the algolia autocomplete plugin (#923)
+puppeteer/puppeteer typescript out of range under @typescript-eslint/utils (#923), and browserslist missing beside a nested @babel/helper-compilation-targets
