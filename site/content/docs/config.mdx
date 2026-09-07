@@ -270,7 +270,7 @@ nub run build        # dotenvx run -- sh -c "<the build script>"
 nub watch server.ts  # dotenvx run -- node --watch server.ts
 ```
 
-A script is wrapped as a whole, so a script that starts no Node process still runs behind the prefix. The prefix is set once per project: a `nub run` inside a script, or a wrapper written in Node, does not wrap the same project again. Tools that run someone else's CLI — `nubx` and [`nub dlx`](/docs/runner/dlx) — do not take it.
+A script is wrapped as a whole, so a script that starts no Node process still runs behind the prefix. The prefix is set once per project: a `nub run` inside a script, or a wrapper written in Node, does not wrap the same project again. Tools that run someone else's CLI — `nubx` and [`nub dlx`](/docs/nubx#nub-dlx) — do not take it.
 
 The program resolves from the project's `node_modules/.bin`, then `PATH`, so a wrapper installed as a devDependency works with no global install. A path is also accepted, absolute or relative to the file:
 
