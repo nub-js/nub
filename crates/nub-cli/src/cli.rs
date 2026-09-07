@@ -579,6 +579,17 @@ fn apply_env_file_vars(cmd: &mut std::process::Command) {
     }
 }
 
+/// Whether the explicit `--env-file` layer sets `key` for the child. A launcher
+/// that installs nub's threadpool default checks this first: the file's value is
+/// the user's, and the default must not land on top of it.
+fn env_file_sets(key: &str) -> bool {
+    !no_env_file()
+        && ENV_FILE_VARS.get().is_some_and(|vars| {
+            vars.keys()
+                .any(|k| nub_core::workspace::env::env_keys_equal(k, key))
+        })
+}
+
 /// Build the fetched tool's env overlay. The engine spawns the tool itself, so
 /// the explicit `--env-file` vars have to be handed over as a map rather than
 /// applied to a `Command` the way [`apply_env_file_vars`] does.
@@ -6008,9 +6019,13 @@ fn build_script_command(
         aug.apply_localstorage_env(|k, v| {
             command.env(k, v);
         });
-        aug.apply_threadpool_size(|k, v| {
-            command.env(k, v);
-        });
+        // An explicit `--env-file` pool size (in `env_vars`, applied below) is
+        // the user's; nub's default and its ownership marker stand down.
+        if !env_file_sets(nub_core::node::spawn::THREADPOOL_SIZE_ENV) {
+            aug.apply_threadpool_size(|k, v| {
+                command.env(k, v);
+            });
+        }
     }
     if let Some(runtime_json) = runtime_json {
         command.env(crate::project_config::RUNTIME_CONFIG_ENV, runtime_json);
@@ -7227,7 +7242,9 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
         // script running `nub watch`) is removed so the file's value can land.
         {
             use nub_core::node::spawn::THREADPOOL_SIZE_ENV;
-            let file_sets_pool = env_vars.contains_key(THREADPOOL_SIZE_ENV);
+            let file_sets_pool = env_vars
+                .keys()
+                .any(|k| nub_core::workspace::env::env_keys_equal(k, THREADPOOL_SIZE_ENV));
             let nub_default = nub_core::node::spawn::threadpool_size_is_nub_default();
             let expected = if file_sets_pool {
                 if nub_default {
@@ -7716,9 +7733,14 @@ fn apply_exec_augmentation(cmd: &mut std::process::Command, cwd: &Path) -> Resul
     aug.apply_localstorage_env(|k, v| {
         cmd.env(k, v);
     });
-    aug.apply_threadpool_size(|k, v| {
-        cmd.env(k, v);
-    });
+    // `apply_env_file_vars` staged the explicit `--env-file` values before this
+    // augmentation, and a pool size among them is the user's: nub's default must
+    // not overwrite it (the other augmentation vars deliberately do, A19).
+    if !env_file_sets(nub_core::node::spawn::THREADPOOL_SIZE_ENV) {
+        aug.apply_threadpool_size(|k, v| {
+            cmd.env(k, v);
+        });
+    }
     cmd.env(crate::project_config::RUNTIME_CONFIG_ENV, runtime_json);
     // Stamp the env-owner markers wherever the adapter is injected — without them
     if let Some((k, val)) = force_async_tier {

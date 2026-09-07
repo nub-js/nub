@@ -399,8 +399,18 @@ fn warn_node_env_from_dotenv_ignored() {
 /// each launch path.
 pub fn env_file_may_set(key: &str) -> bool {
     std::env::var_os(key).is_none()
-        || (key == crate::node::spawn::THREADPOOL_SIZE_ENV
+        || (env_keys_equal(key, crate::node::spawn::THREADPOOL_SIZE_ENV)
             && crate::node::spawn::threadpool_size_is_nub_default())
+}
+
+/// Environment-key equality on this platform: Windows collapses ASCII case,
+/// Unix keeps `FOO` and `foo` distinct.
+pub fn env_keys_equal(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 /// Load .env* files from the project root, returning the key-value

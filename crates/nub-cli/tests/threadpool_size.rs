@@ -195,6 +195,79 @@ fn env_file_value_beats_the_installed_default_under_run() {
     assert_eq!(v["size"].as_str(), Some("3"));
 }
 
+/// A non-Node local bin under `nub exec` has its `--env-file` values staged
+/// before augmentation runs; the pool default must not land on top of them.
+#[cfg(unix)]
+#[test]
+fn env_file_value_survives_exec_of_a_non_node_bin() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "name": "tp", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("custom.env"), "UV_THREADPOOL_SIZE=5\n").unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("pool-echo");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+echo "{\"size\":\"$UV_THREADPOOL_SIZE\"}"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let from_file = first_json_line(
+        dir.path(),
+        &["--env-file=custom.env", "exec", "pool-echo"],
+        &[],
+        Duration::from_secs(60),
+    );
+    let v: serde_json::Value = serde_json::from_str(&from_file).unwrap();
+    assert_eq!(
+        v["size"].as_str(),
+        Some("5"),
+        "the --env-file value must reach the bin"
+    );
+    let plain = first_json_line(
+        dir.path(),
+        &["exec", "pool-echo"],
+        &[],
+        Duration::from_secs(60),
+    );
+    let v: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    let size: usize = v["size"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("nub's default must be a number");
+    assert!(
+        size >= 4,
+        "without a file the bin gets nub's default, got {size}"
+    );
+}
+
+/// Windows environment keys are case-insensitive, so a differently cased key in
+/// `.env` is the same user value, at the nested `nub run` boundary as well.
+#[cfg(windows)]
+#[test]
+fn env_file_key_case_is_folded_on_windows() {
+    let dir = project_with_env_file();
+    std::fs::write(dir.path().join(".env"), "uv_threadpool_size=3\n").unwrap();
+    for args in [&["size.js"][..], &["run", "probe"][..]] {
+        let line = first_json_line(dir.path(), args, &[], Duration::from_secs(60));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v["size"].as_str(),
+            Some("3"),
+            "under `nub {}`",
+            args.join(" ")
+        );
+    }
+}
+
 /// Watch forwards `.env` to Node's own `--env-file`, which never overrides a
 /// value already in the command environment, so nub must not pre-install one.
 #[test]
