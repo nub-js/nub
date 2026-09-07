@@ -39,10 +39,22 @@ impl IntegrityAlgo {
     }
 }
 
+/// Pick the hash to check from an SRI string. The value may carry
+/// several space-separated hashes — the W3C SRI grammar allows it and
+/// npm writes it: a package-lock.json entry can read
+/// `"integrity": "sha1-… sha512-…"` (Kong/grpc-reflection-js pins
+/// `@types/minimist@1.2.0` that way, and a git dependency's nested
+/// `prepare` install feeds that lockfile straight here). ssri's rule is
+/// to verify against the strongest algorithm the client supports, so
+/// take that one; `SRI_PREFIXES` is already ordered strongest first.
+/// Reading the whole value as one token made every such entry an
+/// `integrity mismatch`.
 fn parse_sri(expected: &str) -> Option<(IntegrityAlgo, &str)> {
-    SRI_PREFIXES
-        .iter()
-        .find_map(|(prefix, algo)| expected.strip_prefix(prefix).map(|rest| (*algo, rest)))
+    SRI_PREFIXES.iter().find_map(|(prefix, algo)| {
+        expected
+            .split_ascii_whitespace()
+            .find_map(|token| token.strip_prefix(prefix).map(|rest| (*algo, rest)))
+    })
 }
 
 /// Validate a package name and return the `safe_name` form used as a
@@ -382,6 +394,35 @@ pub fn shasum_to_sri(shasum: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-hash SRI value verifies against its strongest supported
+    /// hash, whichever position it sits in, and a legacy-only value
+    /// still verifies. npm's own lockfiles carry the `sha1-… sha512-…`
+    /// shape.
+    #[test]
+    fn multi_hash_sri_verifies_the_strongest_hash() {
+        let data = b"hello world";
+        let sha512 = sha512_integrity(data);
+        use base64::Engine;
+        let sha1 = format!(
+            "sha1-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha1::digest(data))
+        );
+        assert!(verify_integrity(data, &format!("{sha1} {sha512}")).is_ok());
+        assert!(verify_integrity(data, &format!("{sha512} {sha1}")).is_ok());
+        assert!(verify_integrity(data, &sha1).is_ok());
+        // The strongest hash is the one that counts: a wrong sha512
+        // beside a right sha1 is a mismatch, not a pass on the weak one.
+        let wrong = sha512_integrity(b"other");
+        assert!(verify_integrity(data, &format!("{sha1} {wrong}")).is_err());
+        // The streaming path sees the same value.
+        let mut digest = [0u8; 64];
+        digest.copy_from_slice(&Sha512::digest(data));
+        assert_eq!(
+            verify_precomputed_sha512(&digest, &format!("{sha1} {sha512}")).unwrap(),
+            true
+        );
+    }
 
     #[test]
     fn shasum_to_sri_matches_npm_classic_encoding() {

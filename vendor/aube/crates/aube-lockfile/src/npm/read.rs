@@ -137,12 +137,16 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
                     format!("linked package '{install_name}' points to missing target '{target}'"),
                 )
             })?;
-            let version = target_entry.version.clone().ok_or_else(|| {
-                Error::parse(
-                    path,
-                    format!("linked package '{install_name}' target '{target}' has no version"),
-                )
-            })?;
+            // npm writes no `version` on a local package whose manifest
+            // declares none (a test fixture linked as `file:test/fixture`
+            // is the common shape — mocha ships one). The resolver
+            // defaults such a package to `0.0.0` (`install::workspace`);
+            // mirror that so a read graph matches a fresh resolve instead
+            // of refusing a lockfile npm itself wrote.
+            let version = target_entry
+                .version
+                .clone()
+                .unwrap_or_else(|| "0.0.0".to_string());
             let local = LocalSource::Link(PathBuf::from(target));
             (
                 target_entry,
@@ -375,10 +379,23 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
     // frozen install rejects the lockfile with
     // `specifiers in the lockfile don't match package.json` — the same
     // way the non-root workspace importers below already thread it.
-    let push_direct =
+    //
+    // One row per name, first section wins, in the resolver's own
+    // priority (`dependencies` > `devDependencies` >
+    // `optionalDependencies`, `seed_direct_deps`). A manifest may list
+    // one package under two sections — promptfoo carries
+    // `@anthropic-ai/claude-agent-sdk` as both a dev and an optional dep,
+    // and npm mirrors both onto the root entry. Recording both rows made
+    // the section check read the optional row as
+    // `manifest section is devDependencies, lockfile section is
+    // optionalDependencies` and refuse every frozen install.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push_direct =
         |dep_name: &str, specifier: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
             let root_path = format!("node_modules/{dep_name}");
-            if let Some(info) = install_path_info.get(&root_path) {
+            if let Some(info) = install_path_info.get(&root_path)
+                && seen.insert(info.name.clone())
+            {
                 direct.push(DirectDep {
                     name: info.name.clone(),
                     dep_path: info.dep_path.clone(),
@@ -395,6 +412,9 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
     }
     for (dep_name, specifier) in &root.optional_dependencies {
         push_direct(dep_name, specifier, DepType::Optional, &mut direct);
+    }
+    for (dep_name, specifier) in required_peers_not_declared(&root) {
+        push_direct(dep_name, specifier, DepType::Production, &mut direct);
     }
 
     // npm symlinks every workspace member (and any other top-level
@@ -502,6 +522,7 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
             continue;
         };
         let mut direct = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for (dep_name, specifier, dep_type) in package_entry
             .dependencies
             .iter()
@@ -518,10 +539,15 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
                     .iter()
                     .map(|(name, spec)| (name, spec, DepType::Optional)),
             )
+            .chain(
+                required_peers_not_declared(package_entry)
+                    .map(|(name, spec)| (name, spec, DepType::Production)),
+            )
         {
             if let Some(target_install_path) =
                 crate::npm::layout::resolve_nested(target, dep_name, &install_path_info)
                 && let Some(info) = install_path_info.get(&target_install_path)
+                && seen.insert(info.name.clone())
             {
                 direct.push(DirectDep {
                     name: info.name.clone(),
@@ -534,6 +560,31 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
         graph.importers.insert(target.clone(), direct);
     }
     Ok(graph)
+}
+
+/// An importer's required peers that no dependency section already
+/// declares, as (name, range) — the ones npm 7+ auto-installs into an
+/// ancestor `node_modules/` and that aube's own resolver seeds onto the
+/// importer as a `Production` direct dep carrying the peer range
+/// (`auto_install_peers`). The reader has to surface them the same way:
+/// the freshness check compares the manifest's required peers against the
+/// importer's recorded specifiers, so leaving them out read every
+/// workspace member with a peer as `manifest adds <peer>@<range>` under
+/// `--frozen-lockfile` (apollo-server's `@apollo/cache-control-types`,
+/// socket.io's cluster adapter). An optional peer (`peerDependenciesMeta`)
+/// is never auto-installed, so it stays out.
+fn required_peers_not_declared(
+    entry: &RawNpmPackage,
+) -> impl Iterator<Item = (&String, &String)> + '_ {
+    entry.peer_dependencies.iter().filter(|(name, _)| {
+        !entry
+            .peer_dependencies_meta
+            .get(*name)
+            .is_some_and(|meta| meta.optional)
+            && !entry.dependencies.contains_key(*name)
+            && !entry.dev_dependencies.contains_key(*name)
+            && !entry.optional_dependencies.contains_key(*name)
+    })
 }
 
 /// Lift a pre-npm-7 nested-`dependencies` tree into the flat,

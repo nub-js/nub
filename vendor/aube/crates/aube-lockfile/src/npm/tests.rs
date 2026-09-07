@@ -4074,3 +4074,246 @@ fn test_write_npm_root_bin_paths_shed_leading_dot_slash() {
         "only the leading ./ segments are shed; the rest of the path is kept"
     );
 }
+
+/// A workspace member's required peer is recorded on its importer with
+/// the peer range as the specifier — the same shape the resolver seeds
+/// under `auto_install_peers`, and the one the freshness check compares
+/// the manifest's peers against. Two providers, both real: a hoisted
+/// registry copy at the root (apollo-server's `graphql`) and a root
+/// link to a sibling member (socket.io's `socket.io-adapter`). An
+/// optional peer stays out, and a peer the member also declares as a
+/// dependency is not recorded twice.
+#[test]
+fn test_parse_npm_workspace_importer_records_required_peers() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "root",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/@scope/adapter": { "resolved": "packages/adapter", "link": true },
+                "node_modules/@scope/plugin": { "resolved": "packages/plugin", "link": true },
+                "node_modules/graphql": { "version": "16.11.0" },
+                "node_modules/react": { "version": "19.2.0" },
+                "packages/adapter": { "version": "2.5.8" },
+                "packages/plugin": {
+                    "name": "@scope/plugin",
+                    "version": "0.3.0",
+                    "dependencies": { "react": "^19" },
+                    "peerDependencies": {
+                        "@scope/adapter": "~2.5.5",
+                        "graphql": "14.x || 15.x || 16.x",
+                        "react": ">=18",
+                        "vue": "^3"
+                    },
+                    "peerDependenciesMeta": { "vue": { "optional": true } }
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let plugin = graph
+        .importers
+        .get("packages/plugin")
+        .expect("plugin importer");
+    let mut recorded: Vec<(&str, &str, DepType)> = plugin
+        .iter()
+        .map(|d| (d.name.as_str(), d.specifier.as_deref().unwrap(), d.dep_type))
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![
+            ("@scope/adapter", "~2.5.5", DepType::Production),
+            ("graphql", "14.x || 15.x || 16.x", DepType::Production),
+            ("react", "^19", DepType::Production),
+        ],
+        "required peers ride the importer as Production deps with the peer range; \
+         the optional `vue` and a second `react` row do not"
+    );
+    let adapter = plugin.iter().find(|d| d.name == "@scope/adapter").unwrap();
+    assert!(
+        matches!(
+            graph.packages[&adapter.dep_path].local_source,
+            Some(LocalSource::Link(ref p)) if p == Path::new("packages/adapter")
+        ),
+        "a peer satisfied by a root link resolves to the linked member"
+    );
+}
+
+/// The root importer gets the same treatment: a required peer the root
+/// manifest does not also list as a dependency is recorded from
+/// `node_modules/<peer>`.
+#[test]
+fn test_parse_npm_root_importer_records_required_peer() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "lib",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "lib",
+                    "version": "1.0.0",
+                    "peerDependencies": { "react": ">=18" }
+                },
+                "node_modules/react": { "version": "19.2.0", "peer": true }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let root = graph.importers.get(".").expect("root importer");
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].name, "react");
+    assert_eq!(root[0].specifier.as_deref(), Some(">=18"));
+    assert_eq!(root[0].dep_type, DepType::Production);
+}
+
+/// A member nested inside another member resolves through the parent
+/// member's own `node_modules` before the root, the way Node's upward
+/// walk does from `test/installation/`. puppeteer's lockfile keeps
+/// `diff@9` at `test/node_modules/diff` for both `test` and
+/// `test/installation`; jumping from the member straight to the root
+/// found the wrong copy (or none) and the frozen check refused the file.
+#[test]
+fn test_parse_npm_nested_member_resolves_through_parent_members_node_modules() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "root",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "version": "1.0.0",
+                    "workspaces": ["test", "test/installation"]
+                },
+                "node_modules/@t/test": { "resolved": "test", "link": true },
+                "node_modules/@t/installation": { "resolved": "test/installation", "link": true },
+                "node_modules/diff": { "version": "7.0.0" },
+                "node_modules/glob": { "version": "13.0.6" },
+                "test": {
+                    "name": "@t/test",
+                    "version": "1.0.0",
+                    "dependencies": { "diff": "9.0.0" }
+                },
+                "test/node_modules/diff": { "version": "9.0.0" },
+                "test/installation": {
+                    "name": "@t/installation",
+                    "version": "1.0.0",
+                    "dependencies": { "diff": "^9.0.0" },
+                    "devDependencies": { "glob": "13.0.6" }
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let installation = graph
+        .importers
+        .get("test/installation")
+        .expect("nested member importer");
+    let diff = installation.iter().find(|d| d.name == "diff").unwrap();
+    assert_eq!(
+        graph.packages[&diff.dep_path].version, "9.0.0",
+        "the parent member's copy wins over the root's"
+    );
+    let glob = installation.iter().find(|d| d.name == "glob").unwrap();
+    assert_eq!(
+        graph.packages[&glob.dep_path].version, "13.0.6",
+        "a dep absent from every ancestor still falls back to the root"
+    );
+}
+
+/// npm writes no `version` on a local package whose manifest has none.
+/// mocha links a test fixture that way (`file:test/compiler-fixtures/...`
+/// with a name-only package.json). The reader takes the resolver's own
+/// `0.0.0` default rather than refusing the lockfile.
+#[test]
+fn test_parse_npm_link_target_without_version() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "mocha",
+            "version": "11.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "mocha",
+                    "version": "11.0.0",
+                    "devDependencies": { "@test/esm-only-loader": "./test/fixtures/esm-only-loader" }
+                },
+                "node_modules/@test/esm-only-loader": {
+                    "resolved": "test/fixtures/esm-only-loader",
+                    "link": true
+                },
+                "test/fixtures/esm-only-loader": { "name": "@test/esm-only-loader", "dev": true }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let root = graph.importers.get(".").expect("root importer");
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].name, "@test/esm-only-loader");
+    assert_eq!(root[0].dep_type, DepType::Dev);
+    let pkg = &graph.packages[&root[0].dep_path];
+    assert_eq!(pkg.version, "0.0.0");
+    assert!(matches!(
+        pkg.local_source,
+        Some(LocalSource::Link(ref p)) if p == Path::new("test/fixtures/esm-only-loader")
+    ));
+}
+
+/// A package listed under two manifest sections is one importer row,
+/// classified by the resolver's section priority. promptfoo declares
+/// `@anthropic-ai/claude-agent-sdk` as both a dev and an optional dep;
+/// npm mirrors both onto the root entry, and a second `Optional` row
+/// tripped the section-drift check on every frozen install.
+#[test]
+fn test_parse_npm_dep_in_two_sections_is_one_importer_row() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "root",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "devDependencies": { "sdk": "0.3.250" },
+                    "optionalDependencies": { "sdk": "0.3.250" }
+                },
+                "node_modules/@scope/app": { "resolved": "packages/app", "link": true },
+                "node_modules/sdk": { "version": "0.3.250", "devOptional": true },
+                "packages/app": {
+                    "name": "@scope/app",
+                    "version": "1.0.0",
+                    "dependencies": { "sdk": "0.3.250" },
+                    "optionalDependencies": { "sdk": "0.3.250" }
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let root: Vec<_> = graph.importers[&".".to_string()]
+        .iter()
+        .filter(|d| d.name == "sdk")
+        .collect();
+    assert_eq!(root.len(), 1, "one row for the root, not one per section");
+    assert_eq!(root[0].dep_type, DepType::Dev);
+    let app: Vec<_> = graph.importers["packages/app"]
+        .iter()
+        .filter(|d| d.name == "sdk")
+        .collect();
+    assert_eq!(app.len(), 1, "one row for the member, not one per section");
+    assert_eq!(app[0].dep_type, DepType::Production);
+}
