@@ -141,6 +141,21 @@ fn test_path() -> std::ffi::OsString {
     std::env::join_paths([which_node_dir(), "/usr/bin".into(), "/bin".into()]).expect("join PATH")
 }
 
+/// Join a reader thread within `timeout`, or give up and report `None`.
+fn wait_for<T: Send + 'static>(
+    handle: std::thread::JoinHandle<Option<T>>,
+    timeout: std::time::Duration,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    handle.join().ok().flatten()
+}
+
 fn runs(tally: &Path) -> usize {
     std::fs::read_to_string(tally).map_or(0, |s| s.lines().count())
 }
@@ -244,18 +259,11 @@ fn nub_watch_puts_the_prefix_in_front_of_node() {
             .map_while(Result::ok)
             .find(|line| line.contains("FROM_WRAPPER"))
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !first_line.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let line = wait_for(first_line, std::time::Duration::from_secs(60));
     let _ = child.kill();
     let _ = child.wait();
 
-    let line = first_line
-        .join()
-        .ok()
-        .flatten()
-        .expect("nub watch printed no probe output within 60s");
+    let line = line.expect("nub watch printed no probe output within 60s");
     assert!(
         line.contains(r#""FROM_WRAPPER":"yes""#) && line.contains(r#""WRAPPED_PROGRAM":"node""#),
         "nub watch must run Node behind the wrapper; got: {line}"
@@ -292,6 +300,11 @@ fn a_prefix_that_resolves_to_nothing_is_refused_by_name() {
         "the error must name the code and the program: {}",
         run.stderr
     );
+    // Compat mode is the escape hatch: a bare spawn that never resolves the
+    // wrapper, so a broken prefix cannot take `--node` down with it.
+    let compat = run(dir.path(), &["--node", "probe.mjs"]);
+    assert!(compat.status.success(), "stderr: {}", compat.stderr);
+    assert_eq!(compat.var("FROM_WRAPPER"), None);
 }
 
 #[test]

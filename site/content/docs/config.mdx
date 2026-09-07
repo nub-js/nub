@@ -14,6 +14,7 @@ Put `nub.jsonc` at the project root — the workspace root in a monorepo. Every 
   "nodeOptions": ["--enable-source-maps"], // any flag NODE_OPTIONS accepts
   "v8Flags": ["--stack-size=2000"],        // the full V8 set, via the command line
   "nodeCompat": false,                     // true = disable all Nub augmentation
+  "prefix": "dotenvx run --",              // a wrapper in front of file runs, scripts, and watch
   "envFile": [".env", ".env.local"],       // true = cascade | false = none | "varlock"
 
   // text | jsonc | json5 | toml | yaml | ts | tsx | jsx
@@ -72,7 +73,7 @@ The global file is read leniently, because it applies to every project on your m
 
 ### Relative paths
 
-Five fields take paths: [`preload`](#preload), [`envFile`](#envfile), [`tsconfig`](#tsconfig), and [`nodeExecutable`](#nodeexecutable) and [`prefix`](#prefix) in their path forms. A relative path resolves against the directory of the file that set it — not your working directory.
+Five fields take paths: [`preload`](#preload), [`envFile`](#envfile), [`tsconfig`](#tsconfig), plus [`nodeExecutable`](#nodeexecutable) and [`prefix`](#prefix) in their path forms. A relative path resolves against the directory of the file that set it — not your working directory.
 
 For a project `nub.jsonc` that is the file's own directory — in a monorepo, wherever the nearest one is, which need not be the package you are running from. For the global file it is your config directory.
 
@@ -280,7 +281,7 @@ The program resolves from the project's `node_modules/.bin`, then `PATH`, so a w
 }
 ```
 
-Nub still loads [environment files](/docs/runtime/env) before it starts the wrapper. A wrapper that owns the environment itself pairs the prefix with `"envFile": false`.
+The Node process still receives [environment files](/docs/runtime/env) as before; on a file run the wrapper starts with them set too. A wrapper that owns the environment itself pairs the prefix with `"envFile": false`. Compatibility mode (`--node`) runs without the prefix.
 
 ### `envFile`
 

@@ -803,24 +803,23 @@ pub struct SpawnResult {
     status: ExitStatus,
 }
 
-/// Spawn Node with Nub's augmentation pipeline.
+/// Build the command that launches a program nub puts in front of Node — the
+/// env-owner loader, or the configured `prefix`.
 ///
-/// Build the command that launches the env-owner loader.
-///
-/// On Windows an npm-installed loader is a `.cmd` batch file, which
+/// On Windows an npm-installed program is a `.cmd` batch file, which
 /// `CreateProcess` cannot launch directly — it has to go through `cmd /C`, the
 /// same route `bin_launcher` and `npm_upgrade_command_invocation` already take
 /// for exactly this reason. Rust's `std::process` does auto-convert, but its own
 /// docs say that behavior "may be removed in the future and so should not be
 /// relied upon", and it returns `InvalidInput` for arguments it cannot escape.
-pub fn loader_command(loader: &Path) -> Command {
-    let shim = cmd_shim_for(loader);
+pub fn loader_command(program: &Path) -> Command {
+    let shim = cmd_shim_for(program);
     if let Some((interpreter, flag)) = shim.split_first() {
         let mut cmd = Command::new(interpreter);
-        cmd.args(flag).arg(loader);
+        cmd.args(flag).arg(program);
         return cmd;
     }
-    Command::new(loader)
+    Command::new(program)
 }
 
 /// The `cmd /C` a Windows batch shim needs in front of it, as argv to splice

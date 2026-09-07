@@ -17,9 +17,13 @@
 //! wrapper whose own bin is a `#!/usr/bin/env node` script, re-enters nub in the
 //! same project and would wrap again without bound.
 //!
-//! nub's own `.env*` loading is unchanged by the field: the values it loads are
-//! in the wrapper's environment when it starts. A wrapper that must own the
-//! environment outright pairs the field with `"envFile": false`.
+//! nub's own `.env*` loading is unchanged by the field, surface by surface: a
+//! file run hands the loaded values to the wrapper, a script keeps them
+//! Node-scoped (the inner `node` loads them, the shell never sees them), and a
+//! watch passes them to Node as `--env-file` arguments behind the wrapper. A
+//! wrapper that must own the environment outright pairs the field with
+//! `"envFile": false`. Compat mode (`--node`, `NODE_COMPAT`, `nodeCompat`) is a
+//! bare spawn and takes no prefix, as it takes no env-owner loader.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -119,7 +123,7 @@ fn locate(program: &str, bin_dirs: &[PathBuf]) -> Option<PathBuf> {
     if as_path.components().count() > 1 || as_path.is_absolute() {
         return as_path.is_file().then(|| as_path.to_path_buf());
     }
-    let names = candidate_names(program);
+    let names = candidate_names(program, cfg!(windows));
     let in_bin = bin_dirs
         .iter()
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
@@ -133,14 +137,19 @@ fn locate(program: &str, bin_dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The spellings a bare name may resolve to. Windows needs the npm `.cmd` shim
-/// and a native `.exe` as well as the bare file.
-fn candidate_names(program: &str) -> Vec<String> {
-    if cfg!(windows) {
+/// The spellings a bare name may resolve to, in preference order.
+///
+/// On Windows an npm install writes an extensionless POSIX shim BESIDE the
+/// runnable `.cmd`, and `CreateProcess` cannot run the former — so the
+/// launchers come first and the bare name last, the order the local-bin
+/// resolver already uses.
+fn candidate_names(program: &str, windows: bool) -> Vec<String> {
+    if windows {
         vec![
-            program.to_string(),
             format!("{program}.cmd"),
             format!("{program}.exe"),
+            format!("{program}.bat"),
+            program.to_string(),
         ]
     } else {
         vec![program.to_string()]
@@ -169,6 +178,17 @@ mod tests {
             locate(file.to_str().expect("utf8"), &[]),
             Some(file.clone())
         );
+    }
+
+    /// npm leaves `wrap` (a POSIX script) next to `wrap.cmd` on Windows; only
+    /// the latter can be spawned, so it must win.
+    #[test]
+    fn a_windows_lookup_prefers_the_runnable_launcher() {
+        assert_eq!(
+            candidate_names("wrap", true),
+            ["wrap.cmd", "wrap.exe", "wrap.bat", "wrap"].map(String::from)
+        );
+        assert_eq!(candidate_names("wrap", false), ["wrap".to_string()]);
     }
 
     #[test]

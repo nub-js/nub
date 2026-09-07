@@ -4601,8 +4601,10 @@ fn run_file_in_dir(args: &[String], compat_mode: bool, cwd: &Path, exec_ua: bool
         );
     }
     // The configured `prefix` wraps a `nub <file>` run only: a bin launched for
-    // `nubx` / `nub exec` (`exec_ua`) and the `node` hijack are outside its scope.
-    let prefix = if exec_ua || NODE_HIJACK.load(Ordering::Relaxed) {
+    // `nubx` / `nub exec` (`exec_ua`) and the `node` hijack are outside its scope,
+    // and compat mode is plain Node — the escape hatch stays a bare spawn, as it
+    // does for the env-owner loader.
+    let prefix = if exec_ua || compat_mode || NODE_HIJACK.load(Ordering::Relaxed) {
         None
     } else {
         crate::prefix::Prefix::resolve(
@@ -5904,11 +5906,19 @@ fn build_script_command(
     // with cmd-escaped args (unchanged), it was never the verbatim default.
     // A configured `prefix` wraps the SHELL, so a body that never starts Node
     // still runs behind it; the marker it carries stops a `nub run` inside the
-    // body from wrapping the same project again.
-    let prefix = crate::prefix::Prefix::resolve(
-        &project.root,
-        &nub_core::workspace::scripts::bin_dirs(&project.root, project.workspace_root.as_deref()),
-    )?;
+    // body from wrapping the same project again. Not in compat mode, which is a
+    // bare spawn on every surface.
+    let prefix = if compat_mode {
+        None
+    } else {
+        crate::prefix::Prefix::resolve(
+            &project.root,
+            &nub_core::workspace::scripts::bin_dirs(
+                &project.root,
+                project.workspace_root.as_deref(),
+            ),
+        )?
+    };
     let mut command = match prefix.as_ref() {
         Some(prefix) => {
             let mut command = prefix.command();
@@ -7159,21 +7169,25 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
     // expansion-dependent var it injects.
     //
     // The configured `prefix` goes in front of all of that, the loader included,
-    // exactly as `spawn_node` orders it.
-    let prefix = crate::prefix::Prefix::resolve(
-        project
-            .as_ref()
-            .map_or(cwd.as_path(), |project| project.root.as_path()),
-        &project
-            .as_ref()
-            .map(|project| {
-                nub_core::workspace::scripts::bin_dirs(
-                    &project.root,
-                    project.workspace_root.as_deref(),
-                )
-            })
-            .unwrap_or_default(),
-    )?;
+    // exactly as `spawn_node` orders it — and, like the loader, not in compat mode.
+    let prefix = if compat_mode {
+        None
+    } else {
+        crate::prefix::Prefix::resolve(
+            project
+                .as_ref()
+                .map_or(cwd.as_path(), |project| project.root.as_path()),
+            &project
+                .as_ref()
+                .map(|project| {
+                    nub_core::workspace::scripts::bin_dirs(
+                        &project.root,
+                        project.workspace_root.as_deref(),
+                    )
+                })
+                .unwrap_or_default(),
+        )?
+    };
     let owner_target = env_owner
         .as_ref()
         .and_then(crate::env_owner::EnvOwner::spawn_target);
