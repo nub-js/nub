@@ -178,9 +178,9 @@ Add your own in a [nub.jsonc](/docs/config#conditions) and every run in the proj
 
 Every resolution in the project matches against them, a bare-specifier [preload](/docs/config#preload) included.
 
-### The Nub runtime key
+### The Nub condition
 
-Nub is registered in the WinterTC [runtime keys](https://runtime-keys.proposal.wintertc.org/) report alongside `bun`, `deno` and `workerd`. Every augmented run matches the `nub` condition, so a package that publishes a branch for it resolves there.
+The Nub CLI matches a `nub` condition on every run it augments, so a package that publishes a branch for it resolves there. The name follows the same [runtime keys](https://runtime-keys.proposal.wintertc.org/) convention `bun`, `deno` and `workerd` use.
 
 ```json title="node_modules/example/package.json"
 {
@@ -193,7 +193,7 @@ Nub is registered in the WinterTC [runtime keys](https://runtime-keys.proposal.w
 }
 ```
 
-Compat mode is the exception. Passing `--node` runs with Node's own conditions and nothing else, so the same import resolves to `default`.
+Two runs do not match it. Passing `--node` runs with Node's own conditions and nothing else, and the standalone [loader](https://www.npmjs.com/package/@nubjs/loader) leaves Node's condition set alone so a file resolves the same way under it as under tsx. Both fall through to `default`.
 
 ## Yarn Plug'n'Play
 

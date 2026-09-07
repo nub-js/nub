@@ -4172,11 +4172,13 @@ fn ensure_tsconfig_parses(dir: &str, explicit: Option<&str>) -> Result<()> {
     );
 }
 
-/// Nub's runtime key in the WinterTC registry, set as an `exports`/`imports`
-/// condition on every augmented run and honored by the compile bundler, which
-/// resolves `exports` ahead of time and so has to pick the same file.
+/// Nub's runtime key, set as an `exports`/`imports` condition on every run the CLI
+/// augments and honored by the compile bundler, which resolves `exports` ahead of
+/// time and so has to pick the same file.
 ///
-/// Registry: <https://runtime-keys.proposal.wintertc.org/>
+/// The key follows the WinterTC runtime-keys convention
+/// (<https://runtime-keys.proposal.wintertc.org/>); the registry entry is proposed
+/// separately and this does not wait on it.
 pub(crate) const NUB_CONDITION: &str = "nub";
 
 pub(crate) fn runtime_node_options(
@@ -4213,12 +4215,17 @@ pub(crate) fn runtime_node_options_with(
     }
 
     let mut seen_conditions = std::collections::HashSet::new();
-    // Nub's WinterTC runtime key, alongside `bun`, `deno` and `workerd`. It rides
-    // every augmented run so a package can point an `exports` branch at what nub
-    // adds — TypeScript source above all — and is absent under `--node`/`NODE_COMPAT`,
-    // which skip this function entirely and so run with Node's own condition set.
-    // Conditions are a SET: this only ever offers a branch a package opted into, and
-    // a package with no `nub` key resolves exactly as it does under plain Node.
+    // Nub's runtime key, in the slot `bun`, `deno` and `workerd` occupy. It rides
+    // every run the CLI augments so a package can point an `exports` branch at what
+    // nub adds — TypeScript source above all — and is absent under `--node`/
+    // `NODE_COMPAT`, which skip this function entirely and so run with Node's own
+    // condition set. Conditions are a SET: this only ever offers a branch a package
+    // opted into, and a package with no `nub` key resolves as it does under plain Node.
+    //
+    // Scoped to the CLI on purpose. The standalone `@nubjs/loader` installs the same
+    // transform hooks but deliberately does NOT add this, because its contract is that
+    // a file resolves identically under it, under tsx, and under plain Node — the brand
+    // stays in the outer invocation and out of the user's import graph.
     seen_conditions.insert(NUB_CONDITION.to_string());
     options.push(format!("--conditions={NUB_CONDITION}"));
     for condition in &runtime.conditions {
