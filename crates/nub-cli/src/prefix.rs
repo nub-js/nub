@@ -162,7 +162,7 @@ mod tests {
             Some(bin.join("wrap"))
         );
         // A path form is taken as written and must exist.
-        assert_eq!(locate("./missing/wrap", &[bin.clone()]), None);
+        assert_eq!(locate("./missing/wrap", std::slice::from_ref(&bin)), None);
         let file = dir.path().join("wrap.sh");
         std::fs::write(&file, "").expect("write");
         assert_eq!(
