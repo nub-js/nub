@@ -66,17 +66,32 @@ if (require('node:worker_threads').isMainThread) {
             global cases
             env = ["PATH=" + str(Path(node).parent) + ":/usr/bin:/bin",
                    "HOME=" + str(project / "home"), *extra_env]
-            result = subprocess.run([
+            invocation = [
                 "sudo", "-n", "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
                 "--uid=" + str(os.getuid()), "--working-directory=" + str(project),
                 "-p", f"MemoryMax={memory}M", "-p", "MemorySwapMax=0",
                 "-p", "RuntimeMaxSec=90", "-p", "LimitCORE=0",
-                "/usr/bin/env", "-i", *env, *command,
-            ], text=True, capture_output=True, timeout=110)
+                "/usr/bin/env", "-i", *env,
+            ]
+            result = subprocess.run(invocation + command, text=True, capture_output=True, timeout=110)
             assert result.returncode == 0, (version, label, result.stdout, result.stderr)
             # Package-script runners may print the script name before its JSON.
             data = json.loads(result.stdout.strip().splitlines()[-1])
             assert data["node"] == "v" + version, data
+            if label == "nub" and memory == 512 and data["mainHeap"] != 304:
+                diagnostic = subprocess.run(invocation + [node, "-e", """
+const fs = require('fs'), path = require('path');
+console.log(fs.readFileSync('/proc/self/cgroup','utf8'));
+console.log(fs.readFileSync('/proc/self/mountinfo','utf8').split('\n').filter(x=>x.includes(' - cgroup')).join('\n'));
+const group = fs.readFileSync('/proc/self/cgroup','utf8').split('\n').find(x=>x.startsWith('0::')).slice(3);
+for(let dir='/sys/fs/cgroup'+group;dir.startsWith('/sys/fs/cgroup');dir=path.dirname(dir)) {
+  for(const key of ['memory.max','memory.high']) {
+    try { console.log(dir+'/'+key,fs.readFileSync(dir+'/'+key,'utf8').trim()); }
+    catch(error) { console.log(dir+'/'+key,error.code); }
+  }
+}
+"""], text=True, capture_output=True, timeout=110)
+                raise AssertionError((data, diagnostic.stdout, diagnostic.stderr))
             if "checksum" in data:
                 checksums.add(data["checksum"])
                 assert len(checksums) == 1, data
