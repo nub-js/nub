@@ -231,6 +231,10 @@ function installWatchReporting(core) {
 // `type` (transpile — there is no user hook to do it, and Node's strip-only mode
 // can't handle enums/namespaces). See makeHooks().load.
 let __userHooksRegistered = false;
+// Narrower: a user registration that brought a `load` hook, so it can transform
+// what nub hands back. A resolve-only user hook that labels a `.ts` file with a
+// bare `commonjs`/`module` still relies on nub as the transformer.
+let __userLoadHookRegistered = false;
 function installUserHookDetector() {
   if (typeof module_.registerHooks !== "function") return;
   const orig = module_.registerHooks;
@@ -238,7 +242,10 @@ function installUserHookDetector() {
   let seen = 0;
   const wrapped = function (...args) {
     // Call #1 is nub's own preload registration; #2+ are user hooks.
-    if (seen >= 1) __userHooksRegistered = true;
+    if (seen >= 1) {
+      __userHooksRegistered = true;
+      if (args[0] && typeof args[0].load === "function") __userLoadHookRegistered = true;
+    }
     seen += 1;
     return orig.apply(this, args);
   };
@@ -698,8 +705,8 @@ function makeHooks(core, watchReporting, foreignLoaderFlagPresent = foreignAsync
       const source = readFileSync(path);
       const pkgType = core.getPackageType(dirname(path));
       const format = core.moduleFormatFor(ext, pkgType, path, source.toString("utf8"));
-      if (format === "commonjs") return { format: "commonjs", source: null, shortCircuit: true };
-      return { format, source, shortCircuit: true };
+      if (format === "commonjs") return { format: "commonjs", source: null, responseURL: url, shortCircuit: true };
+      return { format, source, responseURL: url, shortCircuit: true };
     } catch {
       return null;
     }
@@ -773,7 +780,22 @@ function makeHooks(core, watchReporting, foreignLoaderFlagPresent = foreignAsync
     // user's outer hook, which does the real ESM->CJS conversion, matching Node.
     // Native 'module-typescript'/'commonjs-typescript' formats still fall through to
     // nub's transpile below, so normal augmentation is unchanged.
-    if (__userHooksRegistered && context && context.format === "typescript") {
+    //
+    // tsx 4.2x writes the bare `commonjs`/`module` form instead of 'typescript'
+    // (`outerHookOwnsFormat`), and the hook that wrote it must also be able to
+    // transform what it gets back: a user registration WITH a load hook
+    // (`__userLoadHookRegistered`), or a loader registered through
+    // `module.register` (`userAsyncLoaderActive`), which the registerHooks counter
+    // cannot see and which nub has no way to inspect. A resolve-only user hook
+    // that labels a `.ts` file keeps nub as its transformer. The 'typescript'
+    // branch keeps its own narrower gate: a non-transpiling async loader (a
+    // telemetry `--import`) must not turn a bare 'typescript' from Node's own
+    // CJS loader into a step-aside.
+    if (context && (
+      (__userHooksRegistered && context.format === "typescript") ||
+      ((__userLoadHookRegistered || userAsyncLoaderActive(foreignLoaderFlagPresent)) &&
+        core.outerHookOwnsFormat(context.format, ext) && !core.isDependency(url))
+    )) {
       return nextLoad(url, context);
     }
 
@@ -1027,10 +1049,36 @@ function installCjsRequireHooks(core, withClassicTranspile) {
   // missing. An explicit `require("dep/x/sub.cjs")` is unaffected either way — an
   // exact path is found by stat, without consulting the extension list at all.
   const NUB_ADDED_EXTS = [".ts", ".cts", ".mts", ".tsx", ".jsx", ".cjs"];
+  // A `require.extensions` handler that is ALREADY registered for one of these
+  // when this runs belongs to a transpiler the user chose, and it stays in charge
+  // of that extension: nub's classic shim neither replaces it nor pre-judges its
+  // files as ES modules at resolve time. Every `--require` runs before any `--import`, so on
+  // the compat tier — where nub's own preload is an `--import` — tsx's
+  // `--require`d preflight installs its `.ts` handler FIRST; nub then overwrote
+  // it, and a file tsx would have compiled to CJS (mixed `import` + `require`,
+  // the shape its ESM hook hands to the CJS loader) died in nub's handler as
+  // "Cannot require() this file — it is an ES module". Node itself registers only
+  // `.js`/`.json`/`.node`, so nothing but a user transpiler holds one of these
+  // keys here.
+  const foreignExts = new Set(
+    [...core.TRANSPILE_EXTS, ...core.allDataExts(), ...NUB_ADDED_EXTS].filter((ext) =>
+      ext !== ".js" && ext !== ".json" && ext !== ".node" && Object.hasOwn(module_._extensions, ext)),
+  );
+  // Ownership of a key is decided per lookup, never frozen at start-up: user code
+  // may install or replace a handler after nub's preload (`--import tsx` runs
+  // after every `--require`), and from then on that key is the user's own
+  // widening of LOAD_AS_FILE, exactly as under plain Node plus their handler —
+  // `require("dep/sub")` finding a dependency's `sub.ts` through it is the answer
+  // to preserve. A key is nub's only while BOTH hold: nub introduced it (it was
+  // not in `foreignExts` — a user's `.cjs` handler that nub merely wraps still
+  // counts as theirs) and it still holds a function nub registered below
+  // (`nubHandlers`). Anything else is not nub's to strip, nor to pre-judge.
+  const nubHandlers = new Set();
+  const nubOwnsExt = (ext) => !foreignExts.has(ext) && nubHandlers.has(module_._extensions[ext]);
   const withoutNubAddedExtensions = (fn) => {
     const saved = [];
     for (const ext of NUB_ADDED_EXTS) {
-      if (Object.hasOwn(module_._extensions, ext)) {
+      if (nubOwnsExt(ext)) {
         saved.push([ext, module_._extensions[ext]]);
         delete module_._extensions[ext];
       }
@@ -1043,7 +1091,7 @@ function installCjsRequireHooks(core, withClassicTranspile) {
   };
   const isDepAddedExtHit = (filename) =>
     typeof filename === "string" &&
-    NUB_ADDED_EXTS.includes(pathExtname(filename)) &&
+    nubOwnsExt(pathExtname(filename)) &&
     core.isDependency(pathToFileURL(filename).href);
 
   module_._resolveFilename = function (request, parent, isMain, options) {
@@ -1066,7 +1114,8 @@ function installCjsRequireHooks(core, withClassicTranspile) {
       // and 4 from `require.resolve` up to 22.14, but 22.15 and 22.16 pass 4 for both
       // while still lacking native TS — and the translator crash is present on
       // exactly those versions. A clean error beats an opaque crash, so this stays.
-      if (withClassicTranspile && core.requireTargetIsEsm(resolved, pathExtname(resolved))) {
+      if (withClassicTranspile && nubOwnsExt(pathExtname(resolved)) &&
+          core.requireTargetIsEsm(resolved, pathExtname(resolved))) {
         throw requireEsmError(resolved);
       }
       return resolved;
@@ -1195,6 +1244,7 @@ function installCjsRequireHooks(core, withClassicTranspile) {
     if (core.TRANSPILE_EXTS.has(ext)) return transpileExtension(mod, filename);
     return nativeJs.call(module_._extensions, mod, filename);
   };
+  nubHandlers.add(nubExtension);
 
   // Registered for every extension either path may claim, so the dispatcher is
   // reached at all; `nubExtension` then decides. Node's own `.js`/`.json`/`.node`
@@ -1215,7 +1265,7 @@ function installCjsRequireHooks(core, withClassicTranspile) {
   // resolution identical across tiers.
   const CODE_EXTS = new Set([".ts", ".cts", ".mts", ".tsx", ".jsx"]);
   for (const ext of new Set([...core.TRANSPILE_EXTS, ...core.allDataExts()])) {
-    if (ext === ".js" || ext === ".json" || ext === ".node") continue;
+    if (ext === ".js" || ext === ".json" || ext === ".node" || foreignExts.has(ext)) continue;
     Object.defineProperty(module_._extensions, ext, {
       value: nubExtension,
       enumerable: CODE_EXTS.has(ext),
@@ -1243,7 +1293,7 @@ function installCjsRequireHooks(core, withClassicTranspile) {
   // (`nativeJs` is captured above, before the TS handlers are registered.)
   for (const ext of [".js", ".cjs"]) {
     const origExtension = module_._extensions[ext] || nativeJs;
-    module_._extensions[ext] = (mod, filename) => {
+    const plainJsExtension = (mod, filename) => {
       // (0) The project pointed this extension at a data loader (`{".js":"text"}`),
       // which the ESM path honors. These two extensions are skipped by the
       // registration loop above because THIS wrapper owns them and runs after it,
@@ -1266,6 +1316,8 @@ function installCjsRequireHooks(core, withClassicTranspile) {
       }
       return origExtension.call(module_._extensions, mod, filename); // (3)
     };
+    module_._extensions[ext] = plainJsExtension;
+    nubHandlers.add(plainJsExtension);
   }
 }
 
