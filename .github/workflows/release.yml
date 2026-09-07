@@ -1860,6 +1860,35 @@ jobs:
             (cd npm/nub-types && npm publish --access public)
           fi
 
+      - name: Wait until every published package answers a read
+        # `npm publish` returns before the registry SERVES the package, and the lag is
+        # per-package: on v0.9.0 the root package was readable at 19:21:29 while
+        # @nubjs/nub-linux-x64-musl only landed at 19:22:52. Five jobs start the moment
+        # this one reports success, and npm SKIPS AN UNRESOLVABLE optionalDependency
+        # SILENTLY — so the alpine image built inside that window, installed one package,
+        # and died at `nub --version` with the musl binary simply absent. Re-running it
+        # unchanged went green, which is the whole tell: nothing was wrong with the
+        # artifacts, only with when they became readable. No publish error surfaces this,
+        # so hold the job open until each package actually answers.
+        run: |
+          PKGS="@nubjs/nub @nubjs/types"
+          for p in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64 linux-arm64-musl win32-x64 win32-arm64; do
+            PKGS="$PKGS @nubjs/nub-$p"
+          done
+          for pkg in $PKGS; do
+            for attempt in $(seq 1 30); do
+              if [ "$(npm view "$pkg@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+                echo "✓ $pkg@$VERSION readable"
+                break
+              fi
+              if [ "$attempt" -eq 30 ]; then
+                echo "::error::$pkg@$VERSION still unreadable after 5 minutes. Downstream image builds would install a silently incomplete tree."
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
   stable-immutable-release:
     name: Stage immutable stable release (+ verify assets)
     # Publish the exact versioned release and verify its complete 32-asset set

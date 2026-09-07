@@ -3569,6 +3569,10 @@ fn run_as_node() -> Result<i32> {
     // (temp-dir shim, inside a `nub …` subtree the user opted into) keeps
     // augment-by-default. `--node`/`NODE_COMPAT` force vanilla in either case.
     let compat = compat_flag || nub_core::node::shim::invoked_as_persistent_node_shim();
+    // The hijack resolves a version; it does not add a launch wrapper. The
+    // configured `prefix` belongs to the `nub` entrypoints (see `crate::prefix`),
+    // and this is the one flag `run_file_in_dir` has to tell the two apart.
+    NODE_HIJACK.store(true, Ordering::Relaxed);
     initialize_runtime_config_snapshot(compat, false)?;
     if compat {
         run_file_with_compat(&forwarded, true)
@@ -3576,6 +3580,9 @@ fn run_as_node() -> Result<i32> {
         run_file(&forwarded)
     }
 }
+
+/// Set when this process is the `node` PATH hijack rather than a `nub` verb.
+static NODE_HIJACK: AtomicBool = AtomicBool::new(false);
 
 /// Leading-only `--node` scan for the `node` PATH-hijack. Real `node` reads
 /// options until the ENTRY POINT — the script file, `-`/stdin, an `-e`/`--eval`
@@ -4041,12 +4048,15 @@ fn write_preload_chain(dir: &Path, esm: bool, entries: &[String]) -> Result<Opti
 
 /// A resolver for BARE `nub.jsonc` `preload` entries, with the condition set the
 /// chainer's channel implies (`import` for the `.mjs` chainer, `require` for the
-/// `.cjs` one) — the same conditions Node itself would use for that flag.
+/// `.cjs` one) — the same conditions Node itself would use for that flag. That set
+/// includes [`NUB_CONDITION`], because this resolves a specifier the child Node
+/// would otherwise resolve for itself, with the runtime key already on its argv.
 ///
 fn bare_preload_resolver(esm: bool) -> oxc_resolver::Resolver {
     oxc_resolver::Resolver::new(oxc_resolver::ResolveOptions {
         condition_names: vec![
             "node".to_string(),
+            NUB_CONDITION.to_string(),
             if esm { "import" } else { "require" }.to_string(),
         ],
         extensions: vec![".js".into(), ".json".into(), ".node".into()],
@@ -4169,6 +4179,15 @@ fn ensure_tsconfig_parses(dir: &str, explicit: Option<&str>) -> Result<()> {
     );
 }
 
+/// Nub's runtime key, set as an `exports`/`imports` condition on every run the CLI
+/// augments and honored by the compile bundler, which resolves `exports` ahead of
+/// time and so has to pick the same file.
+///
+/// The key follows the WinterTC runtime-keys convention
+/// (<https://runtime-keys.proposal.wintertc.org/>); the registry entry is proposed
+/// separately and this does not wait on it.
+pub(crate) const NUB_CONDITION: &str = "nub";
+
 pub(crate) fn runtime_node_options(
     runtime: &mut crate::project_config::RuntimeConfig,
     node: &nub_core::node::discovery::ResolvedNode,
@@ -4203,6 +4222,19 @@ pub(crate) fn runtime_node_options_with(
     }
 
     let mut seen_conditions = std::collections::HashSet::new();
+    // Nub's runtime key, in the slot `bun`, `deno` and `workerd` occupy. It rides
+    // every run the CLI augments so a package can point an `exports` branch at what
+    // nub adds — TypeScript source above all — and is absent under `--node`/
+    // `NODE_COMPAT`, which skip this function entirely and so run with Node's own
+    // condition set. Conditions are a SET: this only ever offers a branch a package
+    // opted into, and a package with no `nub` key resolves as it does under plain Node.
+    //
+    // Scoped to the CLI on purpose. The standalone `@nubjs/loader` installs the same
+    // transform hooks but deliberately does NOT add this, because its contract is that
+    // a file resolves identically under it, under tsx, and under plain Node — the brand
+    // stays in the outer invocation and out of the user's import graph.
+    seen_conditions.insert(NUB_CONDITION.to_string());
+    options.push(format!("--conditions={NUB_CONDITION}"));
     for condition in &runtime.conditions {
         if condition.is_empty() || condition.chars().any(char::is_whitespace) {
             bail!("nub.jsonc `conditions` entries must be non-empty and contain no whitespace");
@@ -4593,6 +4625,31 @@ fn run_file_in_dir(args: &[String], compat_mode: bool, cwd: &Path, exec_ua: bool
             crate::env_owner::wrapped_marker(schema_dir),
         );
     }
+    // The configured `prefix` wraps a `nub <file>` run only: a bin launched for
+    // `nubx` / `nub exec` (`exec_ua`) and the `node` hijack are outside its scope,
+    // and compat mode is plain Node — the escape hatch stays a bare spawn, as it
+    // does for the env-owner loader.
+    let prefix = if exec_ua || compat_mode || NODE_HIJACK.load(Ordering::Relaxed) {
+        None
+    } else {
+        crate::prefix::Prefix::resolve(
+            project_root.unwrap_or(cwd),
+            &project
+                .as_ref()
+                .map(|project| {
+                    nub_core::workspace::scripts::bin_dirs(
+                        &project.root,
+                        project.workspace_root.as_deref(),
+                    )
+                })
+                .unwrap_or_default(),
+        )?
+    };
+    let prefix_argv = prefix.as_ref().map(crate::prefix::Prefix::argv);
+    if let Some(prefix) = prefix.as_ref() {
+        let (key, value) = prefix.marker();
+        env_vars.insert(key.to_string(), value);
+    }
 
     // Bin-exec parity with `nub run`: when this spawn is nub LAUNCHING a resolved
     // node bin (a `nubx`/`nub exec` scaffolder — `exec_ua`), set the same role-
@@ -4652,6 +4709,7 @@ fn run_file_in_dir(args: &[String], compat_mode: bool, cwd: &Path, exec_ua: bool
         env_owner: env_owner
             .as_ref()
             .and_then(crate::env_owner::EnvOwner::spawn_target),
+        prefix: prefix_argv.as_deref(),
         node: &node,
         user_args: args,
         compat_mode,
@@ -5871,7 +5929,30 @@ fn build_script_command(
     // former implicit Windows `cmd` default — the sole `windowsVerbatimArguments`
     // consumer — is gone; an explicit `script-shell=cmd` still takes this path
     // with cmd-escaped args (unchanged), it was never the verbatim default.
-    let mut command = StdCommand::new(&shell);
+    // A configured `prefix` wraps the SHELL, so a body that never starts Node
+    // still runs behind it; the marker it carries stops a `nub run` inside the
+    // body from wrapping the same project again. Not in compat mode, which is a
+    // bare spawn on every surface.
+    let prefix = if compat_mode {
+        None
+    } else {
+        crate::prefix::Prefix::resolve(
+            &project.root,
+            &nub_core::workspace::scripts::bin_dirs(
+                &project.root,
+                project.workspace_root.as_deref(),
+            ),
+        )?
+    };
+    let mut command = match prefix.as_ref() {
+        Some(prefix) => {
+            let mut command = prefix.command();
+            command.args(nub_core::node::spawn::cmd_shim_for(Path::new(&shell)));
+            command.arg(&shell);
+            command
+        }
+        None => StdCommand::new(&shell),
+    };
     command.args(&shell_args);
     command.current_dir(&project.root);
 
@@ -7111,25 +7192,61 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
     // supervisor re-execs the child inside it. Values therefore freeze across
     // restarts, which is the trade-off this path already makes for every
     // expansion-dependent var it injects.
-    let mut cmd = match env_owner
+    //
+    // The configured `prefix` goes in front of all of that, the loader included,
+    // exactly as `spawn_node` orders it — and, like the loader, not in compat mode.
+    let prefix = if compat_mode {
+        None
+    } else {
+        crate::prefix::Prefix::resolve(
+            project
+                .as_ref()
+                .map_or(cwd.as_path(), |project| project.root.as_path()),
+            &project
+                .as_ref()
+                .map(|project| {
+                    nub_core::workspace::scripts::bin_dirs(
+                        &project.root,
+                        project.workspace_root.as_deref(),
+                    )
+                })
+                .unwrap_or_default(),
+        )?
+    };
+    let owner_target = env_owner
         .as_ref()
-        .and_then(crate::env_owner::EnvOwner::spawn_target)
-    {
-        Some((loader, schema_dir)) => {
+        .and_then(crate::env_owner::EnvOwner::spawn_target);
+    let mut cmd = match (prefix.as_ref(), owner_target) {
+        (Some(prefix), owner) => {
+            let mut cmd = prefix.command();
+            if let Some((loader, schema_dir)) = owner {
+                cmd.args(nub_core::node::spawn::cmd_shim_for(loader));
+                cmd.arg(loader)
+                    .arg("run")
+                    .arg("--path")
+                    .arg(schema_dir)
+                    .arg("--");
+            }
+            cmd.arg(node.path.as_str());
+            cmd
+        }
+        (None, Some((loader, schema_dir))) => {
             let mut cmd = nub_core::node::spawn::loader_command(loader);
             cmd.arg("run")
                 .arg("--path")
                 .arg(schema_dir)
                 .arg("--")
                 .arg(node.path.as_str());
-            cmd.env(
-                crate::env_owner::WRAPPED_ENV,
-                crate::env_owner::wrapped_marker(schema_dir),
-            );
             cmd
         }
-        None => std::process::Command::new(node.path.as_str()),
+        (None, None) => std::process::Command::new(node.path.as_str()),
     };
+    if let Some((_, schema_dir)) = owner_target {
+        cmd.env(
+            crate::env_owner::WRAPPED_ENV,
+            crate::env_owner::wrapped_marker(schema_dir),
+        );
+    }
     cmd.args(&node_args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())

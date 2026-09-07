@@ -29,7 +29,7 @@ Read the [full docs](https://github.com/actions/setup-node#readme) on github.com
 
 ## How it works
 
-The action installs the `nub` CLI, then provisions the project's pinned Node into Nub's cache during the setup step, before any of your steps run. The pin is resolved from the project's Node-version sources, in this order:
+The action installs the `nub` CLI from the release archive for the runner's platform, verified against the release's sha256 sidecar, into the runner tool cache, then provisions the project's pinned Node into Nub's cache during the setup step, before any of your steps run. If the archive install fails, the action falls back to `npm install -g @nubjs/nub`. The pin is resolved from the project's Node-version sources, in this order:
 
 1. `package.json#/devEngines/runtime`
 2. `.node-version`
@@ -57,6 +57,7 @@ Because the pin lives in the repository, `actions/checkout` must run before this
 | `scope` | | Scope for a scoped registry; falls back to the repository owner for GitHub Packages. |
 | `always-auth` | `false` | Authenticate on every registry request. |
 | `token` | `github.token` | Token for GitHub-API rate-limit relief when resolving Nub's version range. |
+| `shim` | `false` | Run `nub pm shim` after install and put the shim directory first on PATH, so `npm`, `pnpm`, and `yarn` in later steps run the package manager the project pins. |
 
 The setup-node inputs `check-latest`, `architecture`, `mirror`, and `mirror-token` are accepted and ignored. The `version` input is a deprecated alias for `nub-version` and emits a warning.
 
@@ -195,6 +196,17 @@ Write `always-auth=true` into the `.npmrc` to authenticate on every registry req
 ### `token`
 
 Token for GitHub-API rate-limit relief when resolving Nub's version range (and Node downloads on GHES). Defaults to `github.token` on github.com.
+
+### `shim`
+
+Run `nub pm shim` after install and put the shim directory first on PATH. In a project that pins a package manager through `packageManager` or `devEngines.packageManager`, `npm`, `pnpm`, and `yarn` in later steps run that pinned version, provisioned on demand. In an unpinned project they fall through to the runner's own tool. The shims do not route those commands into Nub's own installer; use `nub install` for that.
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    shim: true
+- run: pnpm install --frozen-lockfile   # the version package.json#packageManager pins
+```
 
 ## Outputs
 

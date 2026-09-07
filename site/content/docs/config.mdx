@@ -14,6 +14,7 @@ Put `nub.jsonc` at the project root — the workspace root in a monorepo. Every 
   "nodeOptions": ["--enable-source-maps"], // any flag NODE_OPTIONS accepts
   "v8Flags": ["--stack-size=2000"],        // the full V8 set, via the command line
   "nodeCompat": false,                     // true = disable all Nub augmentation
+  "prefix": "dotenvx run --",              // a wrapper in front of file runs, scripts, and watch
   "envFile": [".env", ".env.local"],       // true = cascade | false = none | "varlock"
 
   // text | jsonc | json5 | toml | yaml | ts | tsx | jsx
@@ -72,7 +73,7 @@ The global file is read leniently, because it applies to every project on your m
 
 ### Relative paths
 
-Four fields take paths: [`preload`](#preload), [`envFile`](#envfile), [`tsconfig`](#tsconfig), and [`nodeExecutable`](#nodeexecutable) in its path form. A relative path resolves against the directory of the file that set it — not your working directory.
+Five fields take paths: [`preload`](#preload), [`envFile`](#envfile), [`tsconfig`](#tsconfig), plus [`nodeExecutable`](#nodeexecutable) and [`prefix`](#prefix) in their path forms. A relative path resolves against the directory of the file that set it — not your working directory.
 
 For a project `nub.jsonc` that is the file's own directory — in a monorepo, wherever the nearest one is, which need not be the package you are running from. For the global file it is your config directory.
 
@@ -249,6 +250,38 @@ A path is also accepted, absolute or relative to the file:
 ```
 
 Either form bypasses the [pin sources](/docs/node#pin-sources), Nub's cache, and any download. The binary's version is still detected, so the [floor and tier selection](/docs/runtime#supported-versions-and-tiers) still apply, and Nub warns when that version contradicts a pin the project also declares. The `NODE_EXECUTABLE` environment variable is the per-shell form of the same setting and outranks this field.
+
+### `prefix`
+
+Put a command in front of everything Nub runs for the project.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "prefix": "dotenvx run --"   // split like a shell; the array form takes exact arguments
+}
+```
+
+The prefix applies to a file run, a `package.json` script, and `nub watch`:
+
+```bash
+nub server.ts        # dotenvx run -- node server.ts
+nub run build        # dotenvx run -- sh -c "<the build script>"
+nub watch server.ts  # dotenvx run -- node --watch server.ts
+```
+
+A script is wrapped as a whole, so a script that starts no Node process still runs behind the prefix. The prefix is set once per project: a `nub run` inside a script, or a wrapper written in Node, does not wrap the same project again. Tools that run someone else's CLI — `nubx` and [`nub dlx`](/docs/nubx#nub-dlx) — do not take it.
+
+The program resolves from the project's `node_modules/.bin`, then `PATH`, so a wrapper installed as a devDependency works with no global install. A path is also accepted, absolute or relative to the file:
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "prefix": ["./tools/wrap", "--quiet"]
+}
+```
+
+The Node process still receives [environment files](/docs/runtime/env) as before; on a file run the wrapper starts with them set too. A wrapper that owns the environment itself pairs the prefix with `"envFile": false`. Compatibility mode (`--node`) runs without the prefix.
 
 ### `envFile`
 

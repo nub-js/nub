@@ -773,6 +773,11 @@ pub struct SpawnConfig<'a> {
     /// augmentation ride through untouched, so transpilation and the preload
     /// chain behave exactly as they do on a direct spawn.
     pub env_owner: Option<(&'a Path, &'a Path)>,
+    /// The configured `prefix` command, program first, already resolved to a
+    /// path. Goes in front of everything else — the env-owner loader included —
+    /// so the whole launch, loader and all, runs behind it. The re-entrancy
+    /// marker for it arrives through `env_vars`.
+    pub prefix: Option<&'a [String]>,
     /// Parsed .env vars to inject into the child environment.
     pub env_vars: &'a std::collections::HashMap<String, String>,
     /// Yarn PnP `.pnp.cjs` path (from `nub_core::pnp::detect`), injected via
@@ -798,28 +803,34 @@ pub struct SpawnResult {
     status: ExitStatus,
 }
 
-/// Spawn Node with Nub's augmentation pipeline.
+/// Build the command that launches a program nub puts in front of Node — the
+/// env-owner loader, or the configured `prefix`.
 ///
-/// Build the command that launches the env-owner loader.
-///
-/// On Windows an npm-installed loader is a `.cmd` batch file, which
+/// On Windows an npm-installed program is a `.cmd` batch file, which
 /// `CreateProcess` cannot launch directly — it has to go through `cmd /C`, the
 /// same route `bin_launcher` and `npm_upgrade_command_invocation` already take
 /// for exactly this reason. Rust's `std::process` does auto-convert, but its own
 /// docs say that behavior "may be removed in the future and so should not be
 /// relied upon", and it returns `InvalidInput` for arguments it cannot escape.
-pub fn loader_command(loader: &Path) -> Command {
-    #[cfg(windows)]
-    if loader
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
-    {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(loader);
+pub fn loader_command(program: &Path) -> Command {
+    let shim = cmd_shim_for(program);
+    if let Some((interpreter, flag)) = shim.split_first() {
+        let mut cmd = Command::new(interpreter);
+        cmd.args(flag).arg(program);
         return cmd;
     }
-    Command::new(loader)
+    Command::new(program)
+}
+
+/// The `cmd /C` a Windows batch shim needs in front of it, as argv to splice
+/// wherever the shim sits in a command line — empty for anything else.
+pub fn cmd_shim_for(program: &Path) -> &'static [&'static str] {
+    let is_batch = cfg!(windows)
+        && program
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if is_batch { &["cmd", "/C"] } else { &[] }
 }
 
 /// In compat mode, spawns Node with only the user's args — no flag
@@ -834,8 +845,27 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // nub stays the parent and the node command is unchanged, so every flag and
     // the whole `NODE_OPTIONS` augmentation chain reach Node exactly as on a
     // direct spawn.
-    let mut cmd = match config.env_owner {
-        Some((loader, schema_dir)) => {
+    //
+    // A configured `prefix` sits in front of the loader in turn, and the
+    // `.cmd`-aware launch (`loader_command`) applies to whichever program is
+    // first: `<prefix…> [cmd /C] <loader> run --path <dir> -- <node> …`.
+    let mut cmd = match (config.prefix, config.env_owner) {
+        (Some(prefix), owner) => {
+            let (program, args) = prefix.split_first().expect("a prefix names a program");
+            let mut cmd = loader_command(Path::new(program));
+            cmd.args(args);
+            if let Some((loader, schema_dir)) = owner {
+                cmd.args(cmd_shim_for(loader));
+                cmd.arg(loader)
+                    .arg("run")
+                    .arg("--path")
+                    .arg(schema_dir)
+                    .arg("--");
+            }
+            cmd.arg(config.node.path.as_str());
+            cmd
+        }
+        (None, Some((loader, schema_dir))) => {
             let mut cmd = loader_command(loader);
             cmd.arg("run")
                 .arg("--path")
@@ -844,7 +874,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
                 .arg(config.node.path.as_str());
             cmd
         }
-        None => Command::new(config.node.path.as_str()),
+        (None, None) => Command::new(config.node.path.as_str()),
     };
     // Process-identity fidelity: set argv0 to "node" so the spawned process
     // reports `process.title` and `process.argv0` as "node" — matching what
@@ -872,7 +902,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // nub launches IS the loader, and Node is its child — so argv0 here would
     // rename the loader, and Node's own identity is the loader's to set.
     #[cfg(unix)]
-    if config.env_owner.is_none() {
+    if config.env_owner.is_none() && config.prefix.is_none() {
         use std::os::unix::process::CommandExt;
         cmd.arg0("node");
     }

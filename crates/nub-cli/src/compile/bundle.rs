@@ -379,7 +379,23 @@ fn bundle_inner(
         },
         resolve: Some(ResolveOptions {
             alias: alias_entries(&opts.alias)?,
-            condition_names: (!opts.conditions.is_empty()).then(|| opts.conditions.clone()),
+            // Nub's runtime key leads the set, so a package resolves to the same
+            // branch here as it does on a `nub <file>` run. `exports` is resolved
+            // at BUILD time in a compiled binary, so a bundler that omitted the
+            // condition would silently ship a different file than the one the same
+            // program loads uninstalled. Additive, not substitutive — the defaults
+            // still apply (see
+            // `a_custom_condition_is_added_to_the_defaults_not_substituted_for_them`).
+            condition_names: Some(
+                std::iter::once(crate::cli::NUB_CONDITION.to_string())
+                    .chain(
+                        opts.conditions
+                            .iter()
+                            .filter(|name| name.as_str() != crate::cli::NUB_CONDITION)
+                            .cloned(),
+                    )
+                    .collect(),
+            ),
             // `module` BEFORE `main`, inverting Rolldown's node-platform default
             // (`["main", "module"]`) to Rollup's order. A legacy dual package
             // with no `exports` map points `main` at a UMD build whose factory
@@ -6213,6 +6229,39 @@ mod tests {
         assert!(
             emits_literal(&default, "import"),
             "without --conditions the import branch must win; got:\n{default}"
+        );
+    }
+
+    /// Nub's runtime key reaches the bundler's resolver with no flag passed, so a
+    /// package's `nub` branch picks the file a `nub <file>` run would load.
+    ///
+    /// `exports` is resolved at BUILD time here, and a resolution that skipped the key
+    /// would fail silently: the compiled binary ships the `default` branch while the
+    /// same program run uncompiled loads the other one. The negative half is what
+    /// catches that, since a bundle that resolved nothing also fails the first
+    /// assertion.
+    #[test]
+    fn the_nub_runtime_key_selects_its_exports_branch_with_no_flag() {
+        const PKG: &str = r#"{
+            "name": "keyed",
+            "exports": { ".": { "nub": "./nub.js", "default": "./default.js" } }
+        }"#;
+        const FILES: &[(&str, &str)] = &[
+            ("nub.js", "export const WHICH = 'runtime-key';\n"),
+            ("default.js", "export const WHICH = 'default-branch';\n"),
+        ];
+        const SRC: &str = "import { WHICH } from 'keyed';\nglobalThis.OUT = WHICH;\n";
+
+        let mut plain = opts();
+        plain.minify = false;
+        let selected = bundle_with_package(SRC, "keyed", PKG, FILES, &plain);
+        assert!(
+            emits_literal(&selected, "runtime-key"),
+            "the bundler must resolve the `nub` branch with no flag passed; got:\n{selected}"
+        );
+        assert!(
+            !emits_literal(&selected, "default-branch"),
+            "and it must not also pull the default branch in; got:\n{selected}"
         );
     }
 
