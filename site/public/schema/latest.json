@@ -20,6 +20,13 @@
       "minLength": 1,
       "description": "The Node binary to run: a path, or a $(command) whose output is the path."
     },
+    "prefix": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "$ref": "#/$defs/stringArray", "minItems": 1 }
+      ],
+      "description": "A command put in front of every file run, script, and watch — a string split like a shell, or an array of arguments."
+    },
     "preload": {
       "$ref": "#/$defs/stringArray",
       "description": "Modules loaded before the entry file."

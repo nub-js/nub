@@ -2894,6 +2894,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "shlex",
  "string_wizard",
  "tempfile",
  "tokio",
