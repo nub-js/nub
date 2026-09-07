@@ -369,7 +369,10 @@ pub fn validate_pkg_content(
 /// directory by integrity prefix. Returns `None` if the input isn't a
 /// well-formed SRI integrity string.
 pub fn integrity_to_hex(integrity: &str) -> Option<String> {
-    let (_, b64) = parse_sri(integrity)?;
+    // The first digest of the strongest algorithm names the entry; the
+    // verifiers accept any of them, but a cache path needs one answer.
+    let (_, digests) = parse_sri(integrity)?;
+    let b64 = digests.first()?;
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     Some(hex::encode(bytes))
