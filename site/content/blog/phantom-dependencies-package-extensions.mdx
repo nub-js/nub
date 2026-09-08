@@ -1,0 +1,121 @@
+---
+title: "Finding phantom dependencies across npm"
+description: Nub's install-time Phantom Detector, a scan of 10,000 high-download npm packages, and a larger package extensions database for other tools to use.
+author: Colin
+date: 2026-09-08T12:00:00Z
+unpublished: true
+---
+
+Nub ships a default-on global virtual store with a built-in Phantom Detector. The store shares installed dependency trees across projects; the detector helps keep packages with undeclared dependencies working in that layout.
+
+I've now run that detector across a corpus of 10,000 high-download npm packages and published the results as [`@nubjs/extensions`](https://www.npmjs.com/package/@nubjs/extensions): **811 compatibility rules covering 791 package names**, including every rule in Yarn's existing database.
+
+```diff
+  import {
+    packageExtensions,
+- } from '@yarnpkg/extensions';
++ } from '@nubjs/extensions';
+```
+
+Same export name. Same data format. A much larger database.
+
+## The global virtual store
+
+A shared download cache is not a global virtual store. Most package managers cache package files globally but still construct an installed tree inside each project, copying or hardlinking those files into place.
+
+Nub can share the installed tree itself. A warm install links packages into the project instead of materializing every file again:
+
+```text
+project-a/node_modules/example
+              │
+              ▼
+ shared-store/example/<graph>/
+              ▲
+              │
+project-b/node_modules/example
+```
+
+The dependency graph matters. Two projects can share an entry when the package and its dependency context match, not merely because both requested the same package version.
+
+There is a compatibility problem hiding in that layout. Node normally follows a package symlink to its real path before resolving the package's imports. Inside a machine-global store, that path no longer passes through the project's `node_modules`.
+
+An undeclared import that happened to work in a flat tree can suddenly fail:
+
+```js
+// This package imports react
+// but never declared it:
+const React = require('react');
+```
+
+That is a **phantom dependency**. Something else installed React, and the package relied on finding it by accident. Moving the package outside the project removes that accident.
+
+This is not a hypothetical obstacle. Bun enabled a global store for its isolated linker, then [made it opt-in again](https://github.com/oven-sh/bun/pull/30473) after realpath and phantom-resolution failures. Aube has [restored the default for Vite/VitePress](https://github.com/aubepkg/aube/releases/tag/v1.33.0) and [Nuxt/Parcel](https://github.com/aubepkg/aube/pull/1312) after excluding those projects. A global store needs more than a faster linker.
+
+## Install-time detection
+
+I built an on-the-fly dependency detector that reads the code being installed. It compares statically identifiable imports with the dependencies declared in that package's manifest.
+
+Doing that during installation is only practical if the analysis is fast. Nub already includes [Oxc](https://oxc.rs), the JavaScript and TypeScript parser behind its transpiler. The detector uses that parser during package extraction:
+
+- Analysis overlaps with the download phase rather than waiting for every package to arrive.
+- Results are cached by package content and scanner version, so unchanged packages do not need another scan.
+- The linker uses those results to move affected dependency subtrees back into the project.
+
+That last step restores ordinary dependency lookup through a project-local hidden hoist tree. It makes packages already present in the installed graph reachable again; it does not guess and download every possible missing dependency. Importers move with the affected package so the application does not load both a shared and a project-local instance of it.
+
+Unrelated packages remain in the shared store. The [global-store post](/blog/unblocking-the-global-virtual-store) covers the layout and ejection mechanism in more detail.
+
+## The limits of a hardcoded list
+
+For automatic manifest repairs, Yarn and pnpm rely on a curated database of **package extensions**. An extension adds information the published manifest omitted:
+
+```yaml
+packageExtensions:
+  "@nrwl/devkit@*":
+    dependencies:
+      tslib: "*"
+```
+
+That is a real entry in the new database. The scanned package imports `tslib` without declaring it as a runtime dependency.
+
+Yarn maintains the shared [`@yarnpkg/extensions`](https://www.npmjs.com/package/@yarnpkg/extensions) database. Its [extension source](https://github.com/yarnpkg/berry/commits/master/packages/yarnpkg-extensions/sources/index.ts) has received only a handful of updates since 2023. pnpm also carries a few additions of its own.
+
+A hardcoded list cannot cover a new or obscure package nobody has added to it. Users can write their own extensions, but that requires someone to hit the failure, diagnose it, and work out the repair. I don't think that should be the user's job.
+
+The install-time detector does not need the package's name to appear in a list. It examines the version being installed, including packages outside any popularity ranking.
+
+## A larger extensions database
+
+The detector can also run outside an install. I used it to scan a 10,000-package corpus selected from the `npm-high-impact` download ranking, then turned the findings into a database other tools can consume.
+
+The September 8 run successfully scanned **9,982 packages**; 18 could not be scanned. The generated rules combine those findings with Yarn's existing catalog:
+
+| Database | Rules | Names |
+| --- | ---: | ---: |
+| Yarn 2.0.7 | 159 | 142 |
+| Nub 1.0.2 | 811 | 791 |
+
+A rule can apply to a particular version range, so two rules can refer to the same package. Those are catalog counts, not a claim that every entry represents a separate runtime failure.
+
+The database combines generated findings with curation:
+
+- **Every Yarn rule is preserved.** The scan adds cases rather than replacing the existing catalog.
+- **Most additions are optional peers.** They cover type references, guarded imports, and framework adapters as well as runtime dependencies, making consumer-supplied packages visible without installing them unconditionally.
+- **Computed imports still need curation.** A call such as `require(name)` may never name its target in the source. Yarn's hand-written rules cover cases the scanner cannot discover.
+
+The [repository](https://github.com/nubjs/package-extensions) includes the corpus, detector revision, scan failures, per-entry evidence, and ready-to-use configuration. The ranking is a pinned snapshot, and scanning a package version does not prove that every historical or future version behaves identically.
+
+## Adoption
+
+Nub [already bundles a snapshot in its resolver](/blog/nub-0-9-0). These precomputed rules repair manifests during resolution, alongside the install-time detector.
+
+For tools importing Yarn's database, the replacement has the same `packageExtensions` export and `Array<[selector, data]>` shape, with CommonJS and ESM entry points and no dependencies:
+
+```js
+const { packageExtensions } =
+  require('@nubjs/extensions');
+```
+
+Installing the package alone does not replace a package manager's bundled database. Package-manager authors can integrate the export; project maintainers can use the supplied Yarn and pnpm configuration files.
+
+I strongly recommend other package managers incorporate it. A missing declaration in somebody else's package should not become a configuration exercise for everyone who installs it.
