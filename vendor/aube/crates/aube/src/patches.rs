@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 /// One resolved patch entry. `key` is the VERBATIM declared
 /// `patchedDependencies` key — exact (`ms@2.1.3`), range (`ms@>=2`),
-/// wildcard (`ms@*`), or bare name (`ms`) — and is the string the
+/// wildcard (`ms@*`), bare name (`ms`), or a source identity
+/// (`pkg@github:owner/repo#sha`) — and is the string the
 /// lockfile's `patchedDependencies:` block records unresolved, matching
 /// pnpm. `path` is the absolute path on disk, `content` is the raw
 /// patch text the linker applies. Mapping a concrete resolved
@@ -77,11 +78,13 @@ pub(crate) fn is_safe_patch_rel(rel: &str) -> bool {
 }
 
 /// Validate a `patchedDependencies` key's shape, rejecting only a
-/// non-`*` selector that isn't a valid semver range (pnpm's
-/// `PATCH_NON_SEMVER_RANGE`). Every other shape — exact, range, `*`,
-/// bare name — is accepted; mapping the key to concrete resolved
-/// versions is [`aube_lockfile::patch_groups`]'s job. Kept a thin
-/// wrapper so the invalid-range error carries the branded code.
+/// non-`*` selector that is neither a valid semver range nor a
+/// `<protocol>:` source identity (pnpm's `PATCH_NON_SEMVER_RANGE`).
+/// Every other shape — exact, range, `*`, bare name, and a bun-style
+/// `name@github:owner/repo#sha` — is accepted; mapping the key to
+/// concrete resolved versions is [`aube_lockfile::patch_groups`]'s job.
+/// Kept a thin wrapper so the invalid-range error carries the branded
+/// code.
 fn validate_patch_key(key: &str) -> Result<()> {
     aube_lockfile::patch_groups::classify_patch_key(key).map_err(|e| {
         miette!(
@@ -97,9 +100,12 @@ fn validate_patch_key(key: &str) -> Result<()> {
 /// keyed by the CONCRETE resolved `name@version` those stages apply
 /// patches by: a `(name@version, content)` content map and a
 /// `(name@version, content_hash)` fold map. The declared keys may be
-/// exact (`ms@2.1.3`), a range (`ms@>=2`), a wildcard (`ms@*`), or a
-/// bare name (`ms`); each graph package resolves to at most one patch
-/// by pnpm's `getPatchInfo` priority (exact > range > all). An
+/// exact (`ms@2.1.3`), a range (`ms@>=2`), a wildcard (`ms@*`), a bare
+/// name (`ms`), or a source identity (`pkg@github:owner/repo#sha`, which
+/// matches through the exact branch because that string is what the
+/// lockfile records as such a package's version); each graph package
+/// resolves to at most one patch by pnpm's `getPatchInfo` priority
+/// (exact > range > all). An
 /// all-exact project resolves each key to its own `name@version`, so
 /// the maps are byte-identical to the pre-resolution behavior.
 ///
@@ -679,15 +685,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_accepts_all_pnpm_key_shapes() {
+    fn validate_accepts_every_supported_key_shape() {
         // The parse-time gate now rejects ONLY a non-`*` invalid range;
-        // exact, range, `*`, and bare-name keys all pass.
+        // exact, range, `*`, and bare-name keys all pass. A bun-style
+        // source identity passes too — the last two entries are the shape
+        // that used to refuse opencode's whole install with
+        // ERR_AUBE_PATCH_NON_SEMVER_RANGE.
         for key in [
             "is-positive@3.1.0",
             "@babel/core@7.0.0",
             "sonda",
             "sonda@*",
             "sonda@>=1",
+            "ghostty-web@github:anomalyco/ghostty-web#83c0a07",
+            "pkg@file:./vendor/pkg",
         ] {
             assert!(validate_patch_key(key).is_ok(), "should accept {key:?}");
         }

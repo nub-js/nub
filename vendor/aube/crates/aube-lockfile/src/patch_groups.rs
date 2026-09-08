@@ -101,6 +101,19 @@ fn split_name_selector(key: &str) -> Option<(&str, &str)> {
 /// semver version → `Exact`; otherwise a valid range → `All` when it
 /// trims to `*`, else `Range`; an invalid non-`*` selector errors; a
 /// bare/empty-selector key → `All`.
+///
+/// One selector shape reaches further than pnpm's grammar: a
+/// `<protocol>:` tail. pnpm rejects it, bun accepts it, and a bun
+/// project in the wild uses it — opencode patches
+/// `ghostty-web@github:anomalyco/ghostty-web#83c0a07`. Bun does not
+/// parse these keys at all: `Package.rs` hashes the whole key and
+/// `patchPackage.rs` looks a package up under `<name>@<resolution>`, so
+/// the key is an exact-match token over the package's resolved identity.
+/// That identity is exactly what this crate already stores — every
+/// non-registry branch of the bun reader's `classify_bun_ident` records
+/// the tail verbatim as [`crate::LockedPackage::version`] — so such a
+/// key classifies as `Exact` and matches through the existing exact
+/// lookup with nothing else to teach the resolver.
 pub fn classify_patch_key(key: &str) -> Result<PatchKeyForm<'_>, InvalidPatchRange> {
     let Some((name, selector)) = split_name_selector(key) else {
         return Ok(PatchKeyForm::All { name: key });
@@ -114,6 +127,16 @@ pub fn classify_patch_key(key: &str) -> Result<PatchKeyForm<'_>, InvalidPatchRan
         });
     }
     if node_semver::Range::parse(selector).is_err() {
+        // Checked only once the range parse has already failed, so no
+        // selector that classifies today changes classification. A
+        // semver range cannot contain a `:`, so the two shapes cannot
+        // overlap either way.
+        if crate::version_protocol(selector).is_some() {
+            return Ok(PatchKeyForm::Exact {
+                name,
+                version: selector,
+            });
+        }
         return Err(InvalidPatchRange {
             range: selector.to_string(),
         });
@@ -428,6 +451,60 @@ mod tests {
         assert_eq!(
             err.message(),
             "not-a-range is not a valid semantic version range."
+        );
+    }
+
+    #[test]
+    fn classify_a_source_protocol_selector_as_an_exact_identity() {
+        // Bun's grammar: the selector is the package's resolved identity,
+        // not a version range. Real case — opencode declares
+        // `ghostty-web@github:anomalyco/ghostty-web#83c0a07`, which
+        // errored with ERR_NUB_PATCH_NON_SEMVER_RANGE and refused the
+        // whole install.
+        assert_eq!(
+            classify_patch_key("ghostty-web@github:anomalyco/ghostty-web#83c0a07").unwrap(),
+            PatchKeyForm::Exact {
+                name: "ghostty-web",
+                version: "github:anomalyco/ghostty-web#83c0a07",
+            }
+        );
+        assert_eq!(
+            classify_patch_key("pkg@file:./vendor/pkg").unwrap(),
+            PatchKeyForm::Exact {
+                name: "pkg",
+                version: "file:./vendor/pkg",
+            }
+        );
+        // The gate is a protocol TOKEN, not the presence of a colon, so a
+        // typo stays an error rather than becoming a key that silently
+        // matches nothing.
+        assert_eq!(
+            classify_patch_key("foo@^^1:2").unwrap_err().message(),
+            "^^1:2 is not a valid semantic version range."
+        );
+    }
+
+    #[test]
+    fn resolve_matches_a_git_resolution_the_way_the_bun_reader_records_it() {
+        // `classify_bun_ident` stores a non-registry tail verbatim as the
+        // package's version, so the existing exact lookup is what matches
+        // the key — nothing in the resolver needed teaching.
+        let groups =
+            PatchGroups::build(["ghostty-web@github:anomalyco/ghostty-web#83c0a07"].into_iter())
+                .unwrap();
+        assert_eq!(
+            groups
+                .resolve("ghostty-web", "github:anomalyco/ghostty-web#83c0a07")
+                .unwrap(),
+            Some("ghostty-web@github:anomalyco/ghostty-web#83c0a07")
+        );
+        // A different commit of the same repository is a different
+        // package, and must not pick up the patch.
+        assert_eq!(
+            groups
+                .resolve("ghostty-web", "github:anomalyco/ghostty-web#deadbee")
+                .unwrap(),
+            None
         );
     }
 
