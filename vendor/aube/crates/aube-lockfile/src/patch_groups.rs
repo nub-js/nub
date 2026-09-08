@@ -114,7 +114,50 @@ fn split_name_selector(key: &str) -> Option<(&str, &str)> {
 /// the tail verbatim as [`crate::LockedPackage::version`] — so such a
 /// key classifies as `Exact` and matches through the existing exact
 /// lookup with nothing else to teach the resolver.
+///
+/// **That shape is bun's, and it does not travel.** A key declared
+/// anywhere but bun's own field — the branded `pnpm.*` object, this
+/// tool's namespace, `pnpm-workspace.yaml` — is pnpm grammar and must
+/// keep failing exactly where pnpm fails, so those sources validate
+/// through [`classify_pnpm_patch_key`] as they are read. This function
+/// is the permissive one: it takes the merged declared set and the keys
+/// a lockfile already recorded, both of which may hold either grammar by
+/// then, and refusing a key a lockfile already contains would reject the
+/// lockfile rather than the declaration.
 pub fn classify_patch_key(key: &str) -> Result<PatchKeyForm<'_>, InvalidPatchRange> {
+    match classify_pnpm_patch_key(key) {
+        Err(invalid) => {
+            // Reached only once pnpm's own grammar has already rejected
+            // the selector, so no key that classifies today changes
+            // classification. A semver range cannot contain a `:`, so the
+            // two shapes cannot overlap either way, and the gate is a
+            // protocol TOKEN rather than the presence of a colon, so
+            // `foo@^^1:2` still errors.
+            let Some((name, selector)) = split_name_selector(key) else {
+                return Err(invalid);
+            };
+            if crate::version_protocol(selector).is_some() {
+                return Ok(PatchKeyForm::Exact {
+                    name,
+                    version: selector,
+                });
+            }
+            Err(invalid)
+        }
+        ok => ok,
+    }
+}
+
+/// Classify one `patchedDependencies` key under **pnpm's grammar only**,
+/// the way `groupPatchedDependencies` does: `dp.parse` splits the key,
+/// an exact semver version is `Exact`, and everything else must satisfy
+/// `validRange` or throw `PATCH_NON_SEMVER_RANGE`.
+///
+/// Kept separate from [`classify_patch_key`] because bun's source-identity
+/// key shape is not a fifth key shape in general — it is bun's, and a
+/// pnpm-origin declaration that carries one has to keep failing with
+/// pnpm's own message.
+pub fn classify_pnpm_patch_key(key: &str) -> Result<PatchKeyForm<'_>, InvalidPatchRange> {
     let Some((name, selector)) = split_name_selector(key) else {
         return Ok(PatchKeyForm::All { name: key });
     };
@@ -127,16 +170,6 @@ pub fn classify_patch_key(key: &str) -> Result<PatchKeyForm<'_>, InvalidPatchRan
         });
     }
     if node_semver::Range::parse(selector).is_err() {
-        // Checked only once the range parse has already failed, so no
-        // selector that classifies today changes classification. A
-        // semver range cannot contain a `:`, so the two shapes cannot
-        // overlap either way.
-        if crate::version_protocol(selector).is_some() {
-            return Ok(PatchKeyForm::Exact {
-                name,
-                version: selector,
-            });
-        }
         return Err(InvalidPatchRange {
             range: selector.to_string(),
         });
@@ -481,6 +514,55 @@ mod tests {
         assert_eq!(
             classify_patch_key("foo@^^1:2").unwrap_err().message(),
             "^^1:2 is not a valid semantic version range."
+        );
+    }
+
+    #[test]
+    fn pnpm_grammar_still_refuses_a_source_identity() {
+        // The shape is bun's and must not travel: pnpm's own
+        // `groupPatchedDependencies` runs `validRange` and throws
+        // `PATCH_NON_SEMVER_RANGE`, so a key read from
+        // `pnpm.patchedDependencies` or `pnpm-workspace.yaml` has to fail
+        // with pnpm's message even though the permissive classifier takes
+        // it.
+        for key in [
+            "is-positive@file:./vendor",
+            "ghostty-web@github:anomalyco/ghostty-web#83c0a07",
+        ] {
+            assert!(classify_patch_key(key).is_ok(), "bun grammar takes {key:?}");
+            assert!(
+                classify_pnpm_patch_key(key).is_err(),
+                "pnpm grammar must refuse {key:?}"
+            );
+        }
+        assert_eq!(
+            classify_pnpm_patch_key("is-positive@file:./vendor")
+                .unwrap_err()
+                .message(),
+            "file:./vendor is not a valid semantic version range."
+        );
+        // Every shape pnpm does have is unchanged by the split.
+        assert_eq!(
+            classify_pnpm_patch_key("foo@1.2.3").unwrap(),
+            PatchKeyForm::Exact {
+                name: "foo",
+                version: "1.2.3"
+            }
+        );
+        assert_eq!(
+            classify_pnpm_patch_key("foo@>=1").unwrap(),
+            PatchKeyForm::Range {
+                name: "foo",
+                range: ">=1"
+            }
+        );
+        assert_eq!(
+            classify_pnpm_patch_key("foo@*").unwrap(),
+            PatchKeyForm::All { name: "foo" }
+        );
+        assert_eq!(
+            classify_pnpm_patch_key("foo").unwrap(),
+            PatchKeyForm::All { name: "foo" }
         );
     }
 

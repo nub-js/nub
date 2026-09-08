@@ -96,6 +96,27 @@ fn validate_patch_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The same gate under **pnpm's grammar only**, for a key that did not
+/// come from bun's field — the branded `pnpm.*` object and this tool's
+/// own namespace (`pnpm_patched_dependencies`), plus the workspace yaml.
+///
+/// `load_declared_patch_paths` merges all of those with bun's into one
+/// map and the origin is gone after that, so the check happens here, as
+/// each is read. Otherwise bun's source-identity key shape would
+/// silently become legal in a pnpm project, which pnpm itself refuses:
+/// `groupPatchedDependencies` runs `validRange` on the selector and
+/// throws `PATCH_NON_SEMVER_RANGE`.
+fn validate_pnpm_patch_key(key: &str) -> Result<()> {
+    aube_lockfile::patch_groups::classify_pnpm_patch_key(key).map_err(|e| {
+        miette!(
+            code = aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE,
+            "{}",
+            e.message()
+        )
+    })?;
+    Ok(())
+}
+
 /// Build the two shapes the linker + GVS-prewarm materializer want,
 /// keyed by the CONCRETE resolved `name@version` those stages apply
 /// patches by: a `(name@version, content)` content map and a
@@ -105,9 +126,9 @@ fn validate_patch_key(key: &str) -> Result<()> {
 /// matches through the exact branch because that string is what the
 /// lockfile records as such a package's version); each graph package
 /// resolves to at most one patch by pnpm's `getPatchInfo` priority
-/// (exact > range > all). An
-/// all-exact project resolves each key to its own `name@version`, so
-/// the maps are byte-identical to the pre-resolution behavior.
+/// (exact > range > all). An all-exact project resolves each key to its
+/// own `name@version`, so the maps are byte-identical to the
+/// pre-resolution behavior.
 ///
 /// Two ranges matching one version → [`aube_codes::errors::ERR_AUBE_PATCH_KEY_CONFLICT`];
 /// an invalid non-`*` range → [`aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE`].
@@ -212,12 +233,19 @@ pub(crate) fn load_declared_patch_paths(cwd: &Path) -> Result<BTreeMap<String, S
             .map_err(miette::Report::new)
             .wrap_err("failed to read package.json")?;
         entries.extend(manifest.bun_patched_dependencies());
-        entries.extend(manifest.pnpm_patched_dependencies());
+        let pnpm_declared = manifest.pnpm_patched_dependencies();
+        for key in pnpm_declared.keys() {
+            validate_pnpm_patch_key(key)?;
+        }
+        entries.extend(pnpm_declared);
     }
 
     let ws_config = aube_manifest::workspace::WorkspaceConfig::load(cwd)
         .map_err(miette::Report::new)
         .wrap_err("failed to read pnpm-workspace.yaml")?;
+    for key in ws_config.patched_dependencies.keys() {
+        validate_pnpm_patch_key(key)?;
+    }
     entries.extend(ws_config.patched_dependencies);
     Ok(entries)
 }
@@ -734,6 +762,41 @@ mod tests {
             patch_with_content("hello\r\n").content_hash(),
             patch_with_content("hello\n").content_hash(),
         );
+    }
+
+    /// Bun's source-identity key shape is bun's alone. A key read from
+    /// `pnpm.patchedDependencies` goes through the same merged map and
+    /// the same permissive classifier, so without a check at the READ
+    /// site a pnpm project would silently gain a key shape pnpm itself
+    /// refuses (`groupPatchedDependencies` runs `validRange` and throws
+    /// `PATCH_NON_SEMVER_RANGE`).
+    #[test]
+    fn a_pnpm_declared_source_identity_is_refused_where_bun_s_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/p.patch"), "").unwrap();
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"pnpm":{"patchedDependencies":{"is-positive@file:./vendor":"patches/p.patch"}}}"#,
+        )
+        .unwrap();
+        let err = load_declared_patch_paths(dir.path())
+            .expect_err("a pnpm-declared source identity must be refused");
+        assert_eq!(
+            err.code().map(|c| c.to_string()).as_deref(),
+            Some(aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE),
+        );
+
+        // The identical key under bun's own field is accepted.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"patchedDependencies":{"is-positive@file:./vendor":"patches/p.patch"}}"#,
+        )
+        .unwrap();
+        let entries =
+            load_declared_patch_paths(dir.path()).expect("bun's field carries bun's grammar");
+        assert!(entries.contains_key("is-positive@file:./vendor"));
     }
 
     /// pnpm's `verifyPatches` contract: a declared key that matches no
