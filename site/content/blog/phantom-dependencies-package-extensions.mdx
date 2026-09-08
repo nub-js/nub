@@ -8,7 +8,7 @@ unpublished: true
 
 Nub ships a default-on global virtual store with a built-in phantom detector. The store shares installed dependency trees across projects; the detector helps keep packages with undeclared dependencies working in that layout.
 
-I've now run that detector across a corpus of 10,000 high-download npm packages and published the results as [`@nubjs/extensions`](https://www.npmjs.com/package/@nubjs/extensions): **811 compatibility rules covering 791 package names**, including every rule in Yarn's existing database.
+I've now run that detector across a corpus of 10,000 high-download npm packages and published the results as [`@nubjs/extensions`](https://www.npmjs.com/package/@nubjs/extensions), with package extensions for **791 packages**. The [source and scan results are on GitHub](https://github.com/nubjs/package-extensions), and the database includes every rule in Yarn's existing catalog.
 
 ```diff
   import {
@@ -90,20 +90,24 @@ The detector can also run outside an install. I used it to scan a 10,000-package
 
 The September 8 run successfully scanned **9,982 packages**; 18 could not be scanned. The generated rules combine those findings with Yarn's existing catalog:
 
-| Database | Rules | Names |
-| --- | ---: | ---: |
-| Yarn 2.0.7 | 159 | 142 |
-| Nub 1.0.2 | 811 | 791 |
+| Database | Packages |
+| --- | ---: |
+| Yarn 2.0.7 | 142 |
+| Nub 1.0.2 | 791 |
 
-A rule can apply to a particular version range, so two rules can refer to the same package. Those are catalog counts, not a claim that every entry represents a separate runtime failure.
+These counts include each package name once, even when the database has separate rules for different version ranges. They include type references and optional integrations, not just runtime failures.
 
 The database combines generated findings with curation:
 
-- **Every Yarn rule is preserved.** The scan adds cases rather than replacing the existing catalog.
+- **Every Yarn rule is preserved as a fixed seed.** The scan adds cases rather than replacing the existing catalog. Hand-written additions can be submitted by pull request and are included even when the detector finds nothing for that package.
 - **Most additions are optional peers.** They cover type references, guarded imports, and framework adapters as well as runtime dependencies, making consumer-supplied packages visible without installing them unconditionally.
 - **Computed imports still need curation.** A call such as `require(name)` may never name its target in the source. Yarn's hand-written rules cover cases the scanner cannot discover.
 
 The [repository](https://github.com/nubjs/package-extensions) includes the corpus, detector revision, scan failures, per-entry evidence, and ready-to-use configuration. The ranking is a pinned snapshot, and scanning a package version does not prove that every historical or future version behaves identically.
+
+The corpus is rescanned on a daily schedule. A separate daily publication job releases an npm update when the extension rules change. Each dataset records its date so consumers can check whether the scheduled jobs have kept up.
+
+The [dephantom package directory](https://dephantom.vercel.app/packages/) lists the packages by recorded download rank, with the version scanned and source references for each finding. It also includes a [maintainer guide](https://dephantom.vercel.app/guide/) covering dependency declarations and optional integrations.
 
 ## Adoption
 
