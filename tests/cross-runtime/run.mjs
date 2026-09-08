@@ -560,11 +560,19 @@ function judge(relPath, raw) {
   }
   const ef = resolveExpectedFailure(config[relPath]);
   const success = raw.exit === 0;
+  // Node's harness announces a skip as a zero-test TAP plan and exits 0, so by
+  // exit code a skip IS a pass — Node's own convention, kept for every runtime.
+  // The verdict records it, because a test the REFERENCE node skips (QUIC on
+  // the official build, a missing-crypto or platform guard) must leave the
+  // node-relative denominator: otherwise every runtime is credited for exiting
+  // 0 on the guard, and the one that implements the feature is charged for
+  // running the test. `nodeRelative` below applies that.
+  const skipped = success && /^1\.\.0 # Skipped/m.test(raw.out);
   if (!ef) {
     // A failure keeps the tail of its output so the record can be triaged
     // without re-running it — scrubbed of machine paths before the cut.
     return success
-      ? { pass: true, timeout: false, exit: 0 }
+      ? { pass: true, timeout: false, exit: 0, ...(skipped ? { skipped: true } : {}) }
       : { pass: false, timeout: raw.timedOut, exit: raw.exit, tail: scrub(raw.out.trim()).slice(-400) };
   }
   // Expected-failure test.
@@ -791,11 +799,17 @@ async function main() {
   // `rawPct` is the other reading — pass / files in the subset, no reference
   // runtime — which is how bun.com/node-test-suite scores (dots passing over
   // dots total). Both are reported; they answer different questions.
+  //
+  // A test the reference node SKIPS is not in the set at all: node did not run
+  // it, so no runtime can be judged against node on it (see `judge`). Raw
+  // scoring keeps it, as the trackers do.
   function nodeRelative(subset) {
-    const nodePassed = subset.filter((f) => results[f].node?.pass);
+    const nodeSkipped = subset.filter((f) => results[f].node?.skipped);
+    const nodePassed = subset.filter((f) => results[f].node?.pass && !results[f].node?.skipped);
     return {
       files: subset.length,
       nodePass: nodePassed.length,
+      nodeSkipped: nodeSkipped.length,
       runtimes: onlyRuntimes.map((rt) => {
         const pass = nodePassed.filter((f) => results[f][rt]?.pass).length;
         const rawPass = subset.filter((f) => results[f][rt]?.pass).length;
