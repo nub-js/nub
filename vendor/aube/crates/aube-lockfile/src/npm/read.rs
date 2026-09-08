@@ -81,11 +81,32 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
     // the target path entry carries the package metadata. Skip the target-path
     // record during the main loop and let the link entry synthesize a local
     // package from it.
+    //
+    // One more shape, which is neither: a `link` whose target is a registry
+    // package inside `node_modules`. npm writes it to point a nested
+    // dependent's peer at the copy above it — puppeteer's lockfile has
+    // `…/browserslist/node_modules/browserslist` linking back to
+    // `…/browserslist` for update-browserslist-db's peer. The target is a
+    // registry package and stays one; the link is only an install path
+    // that resolves to it, so it creates no package of its own.
+    let pointer_link_target = |entry: &super::raw::RawNpmPackage| -> Option<String> {
+        if !entry.link {
+            return None;
+        }
+        let target = entry.resolved.as_deref()?;
+        if !target.split('/').any(|segment| segment == "node_modules") {
+            return None;
+        }
+        let target_entry = raw.packages.get(target)?;
+        (!target_entry.link && target_entry.version.is_some()).then(|| target.to_string())
+    };
     let link_targets: BTreeSet<String> = raw
         .packages
         .values()
+        .filter(|entry| pointer_link_target(entry).is_none())
         .filter_map(|entry| entry.link.then(|| entry.resolved.clone()).flatten())
         .collect();
+    let mut pointer_links: Vec<(String, String)> = Vec::new();
 
     // Map each install_path to the locked dep_path it resolves to. We need
     // this for the nested-resolution walk, including local/workspace links
@@ -124,6 +145,10 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
             .as_ref()
             .filter(|real| real.as_str() != install_name.as_str())
             .cloned();
+        if let Some(target) = pointer_link_target(entry) {
+            pointer_links.push((install_path.clone(), target));
+            continue;
+        }
         let (package_entry, version, dep_path, local_source) = if entry.link {
             let target = entry.resolved.as_ref().ok_or_else(|| {
                 Error::parse(
@@ -297,6 +322,18 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
     // npm.rs's data model doesn't express that, and in practice npm
     // dedupes only when the transitives match anyway.
     type ResolvedDepMap = BTreeMap<String, String>;
+    // A pointer link resolves to whatever its target resolves to, whichever
+    // of the two the map visited first.
+    for (install_path, target) in pointer_links {
+        if let Some(target_info) = install_path_info.get(&target) {
+            let info = InstallPathInfo {
+                name: target_info.name.clone(),
+                dep_path: target_info.dep_path.clone(),
+            };
+            install_path_info.insert(install_path, info);
+        }
+    }
+
     let mut resolved_by_dep_path: BTreeMap<String, (ResolvedDepMap, ResolvedDepMap)> =
         BTreeMap::new();
     for (install_path, entry) in &raw.packages {
@@ -355,6 +392,46 @@ pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<Lockf
                 resolved.insert(dep_name.clone(), tail.clone());
                 if is_optional {
                     resolved_optional.insert(dep_name.clone(), tail);
+                }
+            }
+        }
+        // Peers, by placement. npm records the copy of a peer each dependent
+        // sees — auto-installed and hoisted to the root, or nested beside the
+        // dependent when the root's copy does not satisfy it — and ties it to
+        // no regular dependency edge. The graph carries that placement as a
+        // dependency edge so two downstream passes see it. `filter_graph`'s
+        // reachability walk keeps a peer-only package alive: `react-dom`
+        // reached solely through a transitive package's peer edge was pruned,
+        // and the package died at runtime with `Cannot find package`. And
+        // `apply_peer_contexts` takes the recorded copy when no ancestor
+        // provides a satisfying one, where it used to fall back to the newest
+        // version in the graph or to an ancestor's out-of-range copy
+        // (eslint-plugin-react was handed xo's eslint 10 with npm's nested
+        // eslint 9 sitting in the lockfile). An ancestor that satisfies the
+        // range still wins, as it does for every lockfile shape. The range is
+        // deliberately not added to `declared`: the npm writer emits only
+        // declared names under `dependencies`, so the round trip stays
+        // byte-identical. An optional peer (`peerDependenciesMeta`) is an
+        // optional edge, so a provider that is otherwise only optionally
+        // reachable keeps that classification and platform pruning can still
+        // drop it.
+        for peer_name in package_entry.peer_dependencies.keys() {
+            if resolved.contains_key(peer_name) {
+                continue;
+            }
+            if let Some(target_install_path) =
+                crate::npm::layout::resolve_nested(lookup_path, peer_name, &install_path_info)
+                && let Some(target_info) = install_path_info.get(&target_install_path)
+            {
+                let tail =
+                    crate::npm::dep_path_tail(&target_info.name, &target_info.dep_path).to_string();
+                let optional = package_entry
+                    .peer_dependencies_meta
+                    .get(peer_name)
+                    .is_some_and(|meta| meta.optional);
+                resolved.insert(peer_name.clone(), tail.clone());
+                if optional {
+                    resolved_optional.insert(peer_name.clone(), tail);
                 }
             }
         }

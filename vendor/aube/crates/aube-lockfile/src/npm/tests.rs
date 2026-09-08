@@ -2390,6 +2390,282 @@ fn test_parse_peer_dependencies() {
     );
 }
 
+/// npm records the copy of a peer each dependent sees — hoisted to the
+/// root when it satisfies, nested beside the dependent when the root's
+/// copy does not — and never through a regular dependency edge. The
+/// reader carries that placement as a dependency edge: `react-dom`,
+/// reached only through a transitive package's peer, stays reachable, and
+/// the peer pass takes the nested `eslint` 9 instead of the root's 10.
+#[test]
+fn test_parse_records_peer_placement_as_dependency_edge() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "peer-placement",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "peer-placement",
+                    "version": "1.0.0",
+                    "dependencies": { "tcompare": "^15.0.0", "eslint": "^10.0.0", "plugin": "^1.0.0" }
+                },
+                "node_modules/tcompare": {
+                    "version": "15.0.0",
+                    "dependencies": { "react-element-to-jsx-string": "^15.0.0" }
+                },
+                "node_modules/react-element-to-jsx-string": {
+                    "version": "15.0.0",
+                    "peerDependencies": { "react": "^18.0.0", "react-dom": "^18.0.0", "absent": "*", "extra": "*" },
+                    "peerDependenciesMeta": { "extra": { "optional": true } }
+                },
+                "node_modules/extra": { "version": "1.0.0", "peer": true },
+                "node_modules/react": { "version": "18.3.1", "peer": true },
+                "node_modules/react-dom": {
+                    "version": "18.3.1",
+                    "peer": true,
+                    "peerDependencies": { "react": "^18.3.1" }
+                },
+                "node_modules/eslint": { "version": "10.0.0" },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "eslint": "^9.0.0" }
+                },
+                "node_modules/plugin/node_modules/eslint": { "version": "9.0.0", "peer": true }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let jsx = &graph.packages["react-element-to-jsx-string@15.0.0"];
+    assert_eq!(
+        jsx.dependencies,
+        [
+            ("extra".to_string(), "1.0.0".to_string()),
+            ("react".to_string(), "18.3.1".to_string()),
+            ("react-dom".to_string(), "18.3.1".to_string()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>(),
+        "hoisted peers are recorded by placement; an unplaced one is not invented"
+    );
+    assert_eq!(
+        jsx.optional_dependencies,
+        [("extra".to_string(), "1.0.0".to_string())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        "an optional peer is an optional edge"
+    );
+    assert!(
+        jsx.declared_dependencies.is_empty(),
+        "a placed peer carries no declared range"
+    );
+    assert_eq!(
+        graph.packages["plugin@1.0.0"]
+            .dependencies
+            .get("eslint")
+            .map(String::as_str),
+        Some("9.0.0"),
+        "the nested copy beside the dependent wins over the root's"
+    );
+
+    // The placement is a graph edge, not a declared dependency: the
+    // re-emitted entry lists the peer under `peerDependencies` only.
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let manifest = aube_manifest::PackageJson {
+        name: Some("peer-placement".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [
+            ("tcompare".to_string(), "^15.0.0".to_string()),
+            ("eslint".to_string(), "^10.0.0".to_string()),
+            ("plugin".to_string(), "^1.0.0".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    write(out.path(), &graph, &manifest).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.path()).unwrap()).unwrap();
+    let entry = &written["packages"]["node_modules/react-element-to-jsx-string"];
+    assert!(
+        entry.get("dependencies").is_none() && entry.get("optionalDependencies").is_none(),
+        "a placed peer must not be re-emitted as a dependency; got {entry}"
+    );
+    assert_eq!(entry["peerDependencies"]["react-dom"], "^18.0.0");
+    // npm flags a package every path reaches through a peer edge; a root
+    // dependency and a package below it are not flagged.
+    for key in [
+        "node_modules/react",
+        "node_modules/react-dom",
+        "node_modules/extra",
+    ] {
+        assert_eq!(written["packages"][key]["peer"], true, "{key} is peer-only");
+    }
+    for key in [
+        "node_modules/eslint",
+        "node_modules/tcompare",
+        "node_modules/react-element-to-jsx-string",
+    ] {
+        assert!(
+            written["packages"][key].get("peer").is_none(),
+            "{key} is not peer-only"
+        );
+    }
+    assert_eq!(
+        written["packages"]["node_modules/plugin/node_modules/eslint"]["peer"],
+        true
+    );
+}
+
+/// A lockfile real npm wrote for a project whose only peer (`react`,
+/// under `react-dom` and `react-redux`) npm auto-installed and flagged
+/// `peer: true` must come back byte-identical: the flag is recomputed
+/// from reachability, and the peer edge the reader records stays out of
+/// every `dependencies` section.
+#[test]
+fn test_write_byte_identical_to_native_npm_with_peer_flags() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-native-peer.json");
+    let original = std::fs::read_to_string(&fixture)
+        .unwrap()
+        .replace("\r\n", "\n");
+    let graph = parse(&fixture).unwrap();
+    let manifest = aube_manifest::PackageJson {
+        name: Some("aube-lockfile-peer-flags".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("react-dom".to_string(), "18.3.1".to_string())]
+            .into_iter()
+            .collect(),
+        dev_dependencies: [("react-redux".to_string(), "9.2.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    write(tmp.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(tmp.path()).unwrap();
+    if written != original {
+        panic!(
+            "npm writer drifted from native npm output.\n\n--- expected ---\n{original}\n--- got ---\n{written}"
+        );
+    }
+}
+
+/// The root's own declared peer, and a workspace member's, are entered
+/// on their importers as production direct deps — the shape the resolver
+/// seeds under auto-install-peers — but real npm flags the providers
+/// `peer: true`, because no dependency edge reaches them. Lockfile from
+/// npm 11.19.0 for a root with `peerDependencies: { react }` and a member
+/// with `peerDependencies: { react-dom }`, and nothing else declared: every
+/// package in it carries the flag, and the round trip keeps each one.
+#[test]
+fn test_write_byte_identical_to_native_npm_with_importer_peers() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-native-root-peer.json");
+    let original = std::fs::read_to_string(&fixture)
+        .unwrap()
+        .replace("\r\n", "\n");
+    let graph = parse(&fixture).unwrap();
+    let manifest: aube_manifest::PackageJson = serde_json::from_str(
+        r#"{
+            "name": "root-peer",
+            "version": "1.0.0",
+            "workspaces": ["packages/*"],
+            "peerDependencies": { "react": "18.3.1" }
+        }"#,
+    )
+    .unwrap();
+    // Rewritten in place, as an install rewrites the project's lockfile:
+    // the writer keeps the existing file's root placements.
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("package-lock.json");
+    std::fs::copy(&fixture, &lock).unwrap();
+    write(&lock, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&lock).unwrap();
+    if written != original {
+        panic!(
+            "npm writer drifted from native npm output.\n\n--- expected ---\n{original}\n--- got ---\n{written}"
+        );
+    }
+}
+
+/// npm can record a package linked to itself one level down —
+/// puppeteer's lockfile carries `…/browserslist/node_modules/browserslist`
+/// as a `link` back to `…/browserslist`. The registry package must still
+/// be registered as such, with its dependency resolved to it, rather than
+/// be taken for a local source.
+#[test]
+fn test_parse_self_link_under_a_registry_package() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "self-link",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "self-link",
+                    "version": "1.0.0",
+                    "dependencies": { "a": "^1.0.0" }
+                },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-a",
+                    "dependencies": { "b": "^4.0.0" }
+                },
+                "node_modules/a/node_modules/b": {
+                    "version": "4.28.8",
+                    "resolved": "https://registry.npmjs.org/b/-/b-4.28.8.tgz",
+                    "integrity": "sha512-b"
+                },
+                "node_modules/a/node_modules/b/node_modules/b": {
+                    "resolved": "node_modules/a/node_modules/b",
+                    "link": true
+                },
+                "node_modules/a/node_modules/b/node_modules/c": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/c/-/c-1.0.0.tgz",
+                    "integrity": "sha512-c",
+                    "peerDependencies": { "b": ">=4.0.0" }
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let b = graph.packages.get("b@4.28.8").unwrap_or_else(|| {
+        panic!(
+            "b@4.28.8 missing; packages: {:?}",
+            graph.packages.keys().collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        b.local_source.is_none(),
+        "b is a registry package: {:?}",
+        b.local_source
+    );
+    assert_eq!(b.integrity.as_deref(), Some("sha512-b"));
+    assert_eq!(
+        graph.packages["a@1.0.0"]
+            .dependencies
+            .get("b")
+            .map(String::as_str),
+        Some("4.28.8")
+    );
+    // The link is what a nested dependent's peer resolves through.
+    assert_eq!(
+        graph.packages["c@1.0.0"]
+            .dependencies
+            .get("b")
+            .map(String::as_str),
+        Some("4.28.8")
+    );
+    assert!(
+        !graph.packages.keys().any(|k| k.starts_with("b@link")),
+        "no local package is synthesized for the pointer: {:?}",
+        graph.packages.keys().collect::<Vec<_>>()
+    );
+}
+
 /// Packages without peer fields keep both maps empty — guard
 /// against accidental defaulting to `optional: true` or spurious
 /// keys showing up in the LockedPackage from serde leak paths.
