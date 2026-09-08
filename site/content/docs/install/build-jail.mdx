@@ -42,6 +42,38 @@ Each script receives access to its package directory and the tools needed to bui
 
 The jail reduces exposure to malicious install scripts; it is not isolation for arbitrary untrusted code. On Windows, native-tool compatibility grants can remove filesystem and network isolation while retaining environment filtering and process cleanup.
 
+### Automatic filesystem grants
+
+Nub selects catalog permissions by package name, version, and operating system when it compiles a build script's policy. Some broad catalog grants use directory enumeration to omit known credential locations:
+
+| Catalog grant | Expansion |
+| --- | --- |
+| Read the disk | Enumerate allowed siblings around known credential locations. |
+| Read or write the real user home | Apply the same enumeration within the user's home directory. |
+| Write the disk | Remove filesystem confinement; no credential-location exclusion remains. |
+
+These are internal catalog permissions, not settings in a dependency's `package.json`. The real user home is distinct from the build-specific home assigned to the script.
+
+For example, the home-directory expansion omits `~/.ssh`, descends into `~/.config` to omit `~/.config/gh`, and grants the unaffected siblings:
+
+```text
+~/
+  .ssh/                 omitted
+  .config/
+    gh/                 omitted
+    editor/             allowed subtree
+  projects/             allowed subtree
+  notes.txt             allowed
+```
+
+The exclusion list names credential locations such as `.ssh`, `.gnupg`, `.aws`, `.git-credentials`, `.npmrc`, `.kube`, `.config/gcloud`, `.config/gh`, browser profiles, and macOS Keychains. The compiler also checks immediate home and project entries for `.env*` and npm configuration files. It lists directory children and descends toward known exclusions; it does not inspect file contents or recursively search every directory for secrets.
+
+This expansion happens during policy compilation, not on every file operation. A new top-level sibling may therefore be inaccessible, while a new file inside an already granted subtree is accessible—even if that file contains credentials. Another broad grant can also include a location omitted by this expansion. Filtering environment variables does not prevent reading credentials from an allowed file.
+
+<Callout type="warn">
+Writable-home expansion currently does not reliably exclude credential locations on Linux and Windows: a writable ancestor-directory rule becomes a recursive grant. Do not rely on writable home access to protect files such as `~/.ssh`. Read-only expansion and writable expansion have different enforcement behavior.
+</Callout>
+
 ## Package exceptions
 
 To run one dependency without the jail, set its approval to `"no-jail"` in the root project's `package.json`:
