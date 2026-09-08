@@ -304,7 +304,7 @@ pub struct DirectDep {
     pub specifier: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DepType {
     Production,
     Dev,
