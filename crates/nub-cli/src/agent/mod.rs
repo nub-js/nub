@@ -70,7 +70,7 @@ pub fn run(args: &[String]) -> Result<i32> {
     }
 }
 
-/// `nub agent docs [--page <path> | --list]`.
+/// `nub agent docs [--page <path> | --list | --toc]`.
 ///
 /// No args → usage and the page TOC, without any page's markdown.
 /// `--list` / `--toc` → just the TOC.
@@ -98,7 +98,7 @@ fn run_docs(args: &[String]) -> Result<i32> {
             }
             other => bail!(
                 "nub agent docs: unexpected argument '{other}'. \
-                 Usage: nub agent docs [--page <path> | --list]."
+                 Usage: nub agent docs [--page <path> | --list | --toc]."
             ),
         }
     }
@@ -114,7 +114,7 @@ fn run_docs(args: &[String]) -> Result<i32> {
 
     println!(
         "nub agent docs — browse the bundled docs offline\n\n\
-         Usage: nub agent docs [--page <path> | --list]\n\n\
+         Usage: nub agent docs [--page <path> | --list | --toc]\n\n\
          Options:\n\
          \x20 --page <path>  Print one page's full markdown\n\
          \x20 --list, --toc  Print only the table of contents\n\
@@ -186,7 +186,7 @@ fn print_usage() {
          \x20 docs     show docs usage and a table of contents\n\
          \x20          (offline fallback for https://nubjs.com/docs)\n\
          \x20          --page <path>  print one page's full markdown (e.g. /docs/runtime/jsx)\n\
-         \x20          --list         print just the page TOC\n\
+         \x20          --list, --toc  print just the page TOC\n\
          \x20 skill    print nub's evergreen agent skill to stdout (install it yourself)"
     );
 }
@@ -403,8 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn docs_no_args_mirrors_toc_then_index() {
-        // No args is the mirror: TOC at top + the /docs index content + fetch note.
+    fn docs_help_and_list_variants_succeed() {
         assert_eq!(run_docs(&[]).unwrap(), 0);
         // `--list`/`--toc` is the TOC-only variant.
         assert_eq!(run_docs(&["--list".into()]).unwrap(), 0);
