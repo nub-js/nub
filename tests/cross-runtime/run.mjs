@@ -39,6 +39,7 @@
 // own failures. nub runs in DEFAULT (augmented) mode — never --node.
 
 import fs from "node:fs";
+import { classifySkip } from "./skip.mjs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
@@ -560,14 +561,14 @@ function judge(relPath, raw) {
   }
   const ef = resolveExpectedFailure(config[relPath]);
   const success = raw.exit === 0;
-  // Node's harness announces a skip as a zero-test TAP plan and exits 0, so by
-  // exit code a skip IS a pass — Node's own convention, kept for every runtime.
-  // The verdict records it, because a test the REFERENCE node skips (QUIC on
-  // the official build, a missing-crypto or platform guard) must leave the
-  // node-relative denominator: otherwise every runtime is credited for exiting
-  // 0 on the guard, and the one that implements the feature is charged for
-  // running the test. `nodeRelative` below applies that.
-  const skipped = success && /^1\.\.0 # Skipped/m.test(raw.out);
+  // A whole-file skip exits 0, so it IS a pass by exit code. The verdict
+  // records it, because a test the REFERENCE node skips (QUIC on the official
+  // build, a missing-crypto or platform guard) must leave the node-relative
+  // denominator: otherwise every runtime is credited for exiting 0 on the
+  // guard, and the one that implements the feature is charged for running the
+  // test. `nodeRelative` below applies that. A subcase skip (see skip.mjs)
+  // is a file that ran, and stays.
+  const skipped = success && classifySkip(raw.out, fs.readFileSync(path.join(TEST_ROOT, relPath), "utf8")) === "file";
   if (!ef) {
     // A failure keeps the tail of its output so the record can be triaged
     // without re-running it — scrubbed of machine paths before the cut.

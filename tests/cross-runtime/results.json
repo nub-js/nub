@@ -1,6 +1,6 @@
 {
   "meta": {
-    "generatedAt": "2026-09-08T22:48:46.442Z",
+    "generatedAt": "2026-09-08T23:10:45.208Z",
     "platform": "darwin",
     "corpus": "<corpus>",
     "corpusNodeVersion": "26.7.0",
@@ -142,12 +142,12 @@
     },
     "bunUniverse": {
       "files": 4760,
-      "nodePass": 4384,
-      "nodeSkipped": 352,
+      "nodePass": 4385,
+      "nodeSkipped": 351,
       "runtimes": [
         {
           "runtime": "node",
-          "pass": 4384,
+          "pass": 4385,
           "pct": 100,
           "rawPass": 4736,
           "rawPct": 99.5
@@ -155,13 +155,13 @@
         {
           "runtime": "bun",
           "pass": 3081,
-          "pct": 70.28,
+          "pct": 70.26,
           "rawPass": 3406,
           "rawPct": 71.55
         },
         {
           "runtime": "nub",
-          "pass": 4299,
+          "pass": 4300,
           "pct": 98.06,
           "rawPass": 4649,
           "rawPct": 97.67
@@ -169,14 +169,14 @@
         {
           "runtime": "deno",
           "pass": 3062,
-          "pct": 69.84,
+          "pct": 69.83,
           "rawPass": 3403,
           "rawPct": 71.49
         },
         {
           "runtime": "node25",
           "pass": 3890,
-          "pct": 88.73,
+          "pct": 88.71,
           "rawPass": 4242,
           "rawPct": 89.12
         }
@@ -184,12 +184,12 @@
     },
     "fullCorpus": {
       "files": 5664,
-      "nodePass": 5252,
-      "nodeSkipped": 364,
+      "nodePass": 5253,
+      "nodeSkipped": 363,
       "runtimes": [
         {
           "runtime": "node",
-          "pass": 5252,
+          "pass": 5253,
           "pct": 100,
           "rawPass": 5616,
           "rawPct": 99.15
@@ -197,13 +197,13 @@
         {
           "runtime": "bun",
           "pass": 3356,
-          "pct": 63.9,
+          "pct": 63.89,
           "rawPass": 3694,
           "rawPct": 65.22
         },
         {
           "runtime": "nub",
-          "pass": 5108,
+          "pass": 5109,
           "pct": 97.26,
           "rawPass": 5472,
           "rawPct": 96.61
@@ -211,14 +211,14 @@
         {
           "runtime": "deno",
           "pass": 3475,
-          "pct": 66.17,
+          "pct": 66.15,
           "rawPass": 3833,
           "rawPct": 67.67
         },
         {
           "runtime": "node25",
           "pass": 4689,
-          "pct": 89.28,
+          "pct": 89.26,
           "rawPass": 5054,
           "rawPct": 89.23
         }
@@ -226,12 +226,12 @@
     },
     "fullCorpusNoEngine": {
       "files": 4946,
-      "nodePass": 4563,
-      "nodeSkipped": 341,
+      "nodePass": 4564,
+      "nodeSkipped": 340,
       "runtimes": [
         {
           "runtime": "node",
-          "pass": 4563,
+          "pass": 4564,
           "pct": 100,
           "rawPass": 4904,
           "rawPct": 99.15
@@ -239,13 +239,13 @@
         {
           "runtime": "bun",
           "pass": 3192,
-          "pct": 69.95,
+          "pct": 69.94,
           "rawPass": 3513,
           "rawPct": 71.03
         },
         {
           "runtime": "nub",
-          "pass": 4436,
+          "pass": 4437,
           "pct": 97.22,
           "rawPass": 4777,
           "rawPct": 96.58
@@ -253,14 +253,14 @@
         {
           "runtime": "deno",
           "pass": 3186,
-          "pct": 69.82,
+          "pct": 69.81,
           "rawPass": 3524,
           "rawPct": 71.25
         },
         {
           "runtime": "node25",
           "pass": 4075,
-          "pct": 89.31,
+          "pct": 89.29,
           "rawPass": 4417,
           "rawPct": 89.3
         }
@@ -268,12 +268,12 @@
     },
     "bunUniverseNoEngine": {
       "files": 4111,
-      "nodePass": 3761,
-      "nodeSkipped": 330,
+      "nodePass": 3762,
+      "nodeSkipped": 329,
       "runtimes": [
         {
           "runtime": "node",
-          "pass": 3761,
+          "pass": 3762,
           "pct": 100,
           "rawPass": 4091,
           "rawPct": 99.51
@@ -281,13 +281,13 @@
         {
           "runtime": "bun",
           "pass": 2928,
-          "pct": 77.85,
+          "pct": 77.83,
           "rawPass": 3237,
           "rawPct": 78.74
         },
         {
           "runtime": "nub",
-          "pass": 3690,
+          "pass": 3691,
           "pct": 98.11,
           "rawPass": 4018,
           "rawPct": 97.74
@@ -295,14 +295,14 @@
         {
           "runtime": "deno",
           "pass": 2794,
-          "pct": 74.29,
+          "pct": 74.27,
           "rawPass": 3116,
           "rawPct": 75.8
         },
         {
           "runtime": "node25",
           "pass": 3334,
-          "pct": 88.65,
+          "pct": 88.62,
           "rawPass": 3664,
           "rawPct": 89.13
         }
@@ -352,12 +352,12 @@
     },
     "excludedOnly": {
       "files": 448,
-      "nodePass": 426,
-      "nodeSkipped": 7,
+      "nodePass": 427,
+      "nodeSkipped": 6,
       "runtimes": [
         {
           "runtime": "node",
-          "pass": 426,
+          "pass": 427,
           "pct": 100,
           "rawPass": 433,
           "rawPct": 96.65
@@ -365,28 +365,28 @@
         {
           "runtime": "bun",
           "pass": 113,
-          "pct": 26.53,
+          "pct": 26.46,
           "rawPass": 122,
           "rawPct": 27.23
         },
         {
           "runtime": "nub",
-          "pass": 374,
-          "pct": 87.79,
+          "pass": 375,
+          "pct": 87.82,
           "rawPass": 380,
           "rawPct": 84.82
         },
         {
           "runtime": "deno",
           "pass": 51,
-          "pct": 11.97,
+          "pct": 11.94,
           "rawPass": 53,
           "rawPct": 11.83
         },
         {
           "runtime": "node25",
           "pass": 368,
-          "pct": 86.38,
+          "pct": 86.18,
           "rawPass": 374,
           "rawPct": 83.48
         }
@@ -731,12 +731,12 @@
       },
       "parallel": {
         "files": 4641,
-        "nodePass": 4268,
-        "nodeSkipped": 350,
+        "nodePass": 4269,
+        "nodeSkipped": 349,
         "runtimes": [
           {
             "runtime": "node",
-            "pass": 4268,
+            "pass": 4269,
             "pct": 100,
             "rawPass": 4618,
             "rawPct": 99.5
@@ -744,13 +744,13 @@
           {
             "runtime": "bun",
             "pass": 3015,
-            "pct": 70.64,
+            "pct": 70.63,
             "rawPass": 3338,
             "rawPct": 71.92
           },
           {
             "runtime": "nub",
-            "pass": 4183,
+            "pass": 4184,
             "pct": 98.01,
             "rawPass": 4531,
             "rawPct": 97.63
@@ -758,14 +758,14 @@
           {
             "runtime": "deno",
             "pass": 3004,
-            "pct": 70.38,
+            "pct": 70.37,
             "rawPass": 3344,
             "rawPct": 72.05
           },
           {
             "runtime": "node25",
             "pass": 3780,
-            "pct": 88.57,
+            "pct": 88.55,
             "rawPass": 4130,
             "rawPct": 88.99
           }
@@ -41046,8 +41046,7 @@
       "node": {
         "pass": true,
         "timeout": false,
-        "exit": 0,
-        "skipped": true
+        "exit": 0
       },
       "nub": {
         "pass": true,

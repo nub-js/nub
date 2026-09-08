@@ -23,7 +23,7 @@ This harness runs Node's own test suite — the whole `test/` tree of a Node rel
 
 The nub binary is a release build of `main` at `e78a6701dd` plus the `NODE_OPTIONS` coverage-exclude change committed beside this results file. This table and the results table below are generated from `results.json` by [`readme-table.mjs`](./readme-table.mjs).
 
-macOS arm64, 2026-08-22. The retry pass flipped 7 node, 1 nub, 4 bun, 2 deno and 0 node25 verdicts, which bounds the load effect. Bun's verdicts were re-measured 2026-08-30 with the `bun test` accommodation and `BUN_TEST_DRAIN_EVENT_LOOP=1` (see `buildPlainCommand` in `run.mjs`), one full bun pass over the same v26.7.0 checkout: 99 files flipped to pass and none flipped to fail. Node's verdicts were re-measured 2026-09-08, one full node pass over the same checkout, so that every verdict carries the `skipped` flag: 364 of Node's passes are its own skips (245 of them `quic/`), and they now leave every node-relative denominator.
+macOS arm64, 2026-08-22. The retry pass flipped 7 node, 1 nub, 4 bun, 2 deno and 0 node25 verdicts, which bounds the load effect. Bun's verdicts were re-measured 2026-08-30 with the `bun test` accommodation and `BUN_TEST_DRAIN_EVENT_LOOP=1` (see `buildPlainCommand` in `run.mjs`), one full bun pass over the same v26.7.0 checkout: 99 files flipped to pass and none flipped to fail. Node's verdicts were re-measured 2026-09-08, one full node pass over the same checkout, so that every verdict carries the `skipped` flag: 363 of Node's passes are its own skips (245 of them `quic/`; a `printSkipMessage()` for one subcase, after which the file runs on, does not count — see `skip.mjs`), and they now leave every node-relative denominator.
 
 ## Reproduce it yourself
 
@@ -81,10 +81,10 @@ Node-relative pass rate (raw in parentheses). The rows are generated from `resul
 | Lens | files / node passes | nub | deno 2.9.5 | bun 1.4.0 | node 25.9.0 |
 |------|---------------------|-----|------------|-----------|-------------|
 | `denoExclusions` | 5,078 / 4,690 | **98.36%** (97.87) | 72.43% (73.89) | 68.53% (69.75) | 89.40% (89.62) |
-| `bunUniverse` | 4,760 / 4,384 | **98.06%** (97.67) | 69.84% (71.49) | 70.28% (71.55) | 88.73% (89.12) |
-| `fullCorpus` | 5,664 / 5,252 | **97.26%** (96.61) | 66.17% (67.67) | 63.90% (65.22) | 89.28% (89.23) |
-| `fullCorpusNoEngine` | 4,946 / 4,563 | **97.22%** (96.58) | 69.82% (71.25) | 69.95% (71.03) | 89.31% (89.30) |
-| `bunUniverseNoEngine` | 4,111 / 3,761 | **98.11%** (97.74) | 74.29% (75.80) | 77.85% (78.74) | 88.65% (89.13) |
+| `bunUniverse` | 4,760 / 4,385 | **98.06%** (97.67) | 69.83% (71.49) | 70.26% (71.55) | 88.71% (89.12) |
+| `fullCorpus` | 5,664 / 5,253 | **97.26%** (96.61) | 66.15% (67.67) | 63.89% (65.22) | 89.26% (89.23) |
+| `fullCorpusNoEngine` | 4,946 / 4,564 | **97.22%** (96.58) | 69.81% (71.25) | 69.94% (71.03) | 89.29% (89.30) |
+| `bunUniverseNoEngine` | 4,111 / 3,762 | **98.11%** (97.74) | 74.27% (75.80) | 77.83% (78.74) | 88.62% (89.13) |
 | `engineSpecificOnly` | 718 / 689 | **97.53%** (96.80) | 41.94% (43.04) | 23.80% (25.21) | 89.11% (88.72) |
 <!-- /results-table -->
 
