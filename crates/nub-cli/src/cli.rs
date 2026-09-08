@@ -3399,6 +3399,7 @@ fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
                 node_linker,
                 registry,
                 dir,
+                allow_all_builds: false,
                 filter: crate::pm_engine::WorkspaceFilterFlags {
                     filter,
                     filter_prod,
@@ -3434,6 +3435,7 @@ fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
                 no_optional,
                 registry,
                 dir,
+                allow_all_builds: false,
                 filter: crate::pm_engine::WorkspaceFilterFlags {
                     filter,
                     filter_prod,
@@ -9876,7 +9878,9 @@ fn run_pm(args: &[String]) -> Result<i32> {
              \x20 pin [<version>]    lock this project to an exact nub version (default: the running nub)\n\
              \x20 update             re-resolve within the pinned range and bump the pin (alias: up)\n\
              \x20 cache [clear]      list cached package managers (or clear the cache)\n\
-             \x20 shim               link npm/pnpm/yarn shims onto PATH (re-run after `nub upgrade`)\n\
+             \x20 shim               link npm/pnpm/yarn shims onto PATH (re-run after `nub upgrade`);\n\
+             \x20                    --route-installs runs `npm ci` / `npm install` on nub's engine\n\
+             \x20                    (--no-route-installs turns that back off)\n\
              \x20 unshim             remove the shims and their PATH block"
         );
         return Ok(0);
@@ -10091,7 +10095,7 @@ fn run_pm(args: &[String]) -> Result<i32> {
         // `nub node pin <version>`.
         "pin" => run_pm_pin(args.get(1).map(String::as_str), &cwd),
         // Install / remove the PM shims (spec: `package-manager-shims` (no such document)).
-        "shim" => run_pm_shim_install(),
+        "shim" => run_pm_shim_install(&args[1..]),
         "unshim" => run_pm_unshim(),
         // `switch` (the old cross-PM, declaration-only verb) was replaced by
         // `use` (2026-06-10, identity-policy ratification) — name the successor
@@ -10700,8 +10704,22 @@ fn list_pm_cache(pm_cache: &Path) -> Vec<String> {
 /// in `~/.nub/shims`, write the marked PATH block into the shell profile
 /// (install.sh's mechanism), and verify reachability. Idempotent — re-running
 /// re-links, which is also how shims are refreshed after `nub upgrade`.
-fn run_pm_shim_install() -> Result<i32> {
+fn run_pm_shim_install(args: &[String]) -> Result<i32> {
     use nub_core::pm::shim::{self, ProfileOutcome, ShimAction};
+
+    // `--route-installs` / `--no-route-installs` set or clear the marker; a
+    // re-run without either leaves the current choice alone, so re-linking
+    // after `nub upgrade` never silently switches routing off.
+    let mut route_installs: Option<bool> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--route-installs" => route_installs = Some(true),
+            "--no-route-installs" => route_installs = Some(false),
+            other => bail!(
+                "nub pm shim: unexpected argument {other:?} (accepted: --route-installs, --no-route-installs)"
+            ),
+        }
+    }
 
     // Canonicalized, so a symlinked `nub` on PATH links the real bytes (the
     // same posture as every other `current_nub_binary` call site).
@@ -10721,6 +10739,9 @@ fn run_pm_shim_install() -> Result<i32> {
     }
 
     let report = shim::install_shims(&nub_binary)?;
+    if let Some(on) = route_installs {
+        shim::set_route_installs(&dir, on)?;
+    }
 
     let count = |action: ShimAction| report.iter().filter(|s| s.action == action).count();
     let (created, relinked, current) = (
@@ -10749,6 +10770,11 @@ fn run_pm_shim_install() -> Result<i32> {
         dir.display(),
         parts.join(", ")
     );
+    if shim::route_installs_enabled(&dir) {
+        println!(
+            "  npm ci and npm install run on nub's engine (--no-route-installs turns this off)"
+        );
+    }
     if report.iter().any(|s| s.copied) {
         println!(
             "  note: {} is on a different filesystem than the nub binary — \
@@ -11065,6 +11091,15 @@ enum ShimPlan {
     },
     /// The strict agreement check refused: print `message` on stderr, exit 1.
     Refuse { message: String },
+    /// `npm ci` / `npm install` under `nub pm shim --route-installs`: run the
+    /// install on nub's engine, in this process (`nub ci` / `nub install
+    /// --no-frozen-lockfile` with npm's flags translated, every lifecycle
+    /// script allowed as npm allows them). `ignore_scripts` is npm's
+    /// effective value: the command line, else its config.
+    EngineInstall {
+        route: nub_core::pm::shim::NpmEngineInstall,
+        ignore_scripts: bool,
+    },
 }
 
 /// The corepack-style "which PM am I running" notice for the shim-dispatch
@@ -11101,6 +11136,54 @@ fn run_pm_shim(invoked: nub_core::pm::shim::ShimName, args: &[String]) -> Result
             Ok(1)
         }
         ShimPlan::Exec { program, args, env } => exec_program(&program, &args, &env),
+        ShimPlan::EngineInstall {
+            route,
+            ignore_scripts,
+        } => run_shim_engine_install(route, ignore_scripts),
+    }
+}
+
+/// The routed install: the corepack-style notice names what runs in place of
+/// npm, then the engine runs in-process exactly as `nub ci` / `nub install`
+/// would from this cwd.
+fn run_shim_engine_install(
+    route: nub_core::pm::shim::NpmEngineInstall,
+    ignore_scripts: bool,
+) -> Result<i32> {
+    use nub_core::pm::shim::NpmInstallVerb;
+    // npm hands every lifecycle script `NODE_ENV=production` exactly when
+    // dev dependencies are effectively omitted (`buildOmitList` in npm's
+    // config definitions). Per child through the engine's overlay, never the
+    // process environment (A19).
+    if route.prod {
+        crate::pm_engine::set_lifecycle_env(vec![("NODE_ENV".into(), "production".into())]);
+    }
+    let (from, to) = match route.verb {
+        NpmInstallVerb::Ci => ("npm ci", "nub ci"),
+        NpmInstallVerb::Install => ("npm install", "nub install"),
+    };
+    let line = format!("{from} → {to} (via nub shim)");
+    if crate::pm_engine::scope_warning_uses_dim() {
+        eprintln!("\x1b[2m{line}\x1b[0m");
+    } else {
+        eprintln!("{line}");
+    }
+    match route.verb {
+        NpmInstallVerb::Ci => crate::pm_engine::run_ci(crate::pm_engine::CiFlags {
+            prod: route.prod,
+            ignore_scripts,
+            no_optional: route.no_optional,
+            allow_all_builds: true,
+            ..Default::default()
+        }),
+        NpmInstallVerb::Install => crate::pm_engine::run_install(crate::pm_engine::InstallFlags {
+            no_frozen_lockfile: true,
+            prod: route.prod,
+            ignore_scripts,
+            no_optional: route.no_optional,
+            allow_all_builds: true,
+            ..Default::default()
+        }),
     }
 }
 
@@ -11113,9 +11196,22 @@ fn shim_plan(
     args: &[String],
     cwd: &Path,
 ) -> Result<ShimPlan> {
+    let route_installs =
+        nub_core::pm::shim::route_installs_enabled(&nub_core::pm::shim::shim_dir()?);
+    shim_plan_with(invoked, args, cwd, route_installs)
+}
+
+/// [`shim_plan`] with the `--route-installs` opt-in passed in, so the routing
+/// branch is unit-testable without a real shim dir.
+fn shim_plan_with(
+    invoked: nub_core::pm::shim::ShimName,
+    args: &[String],
+    cwd: &Path,
+    route_installs: bool,
+) -> Result<ShimPlan> {
     use nub_core::pm::Pm;
     use nub_core::pm::resolve::{self, PmTarget};
-    use nub_core::pm::shim::{self, Nesting, ShimDecision};
+    use nub_core::pm::shim::{self, Nesting, ShimDecision, ShimName};
 
     let target = resolve::resolve_target(cwd);
     let pin_state = shim_pin_state(cwd, target.as_ref());
@@ -11134,13 +11230,46 @@ fn shim_plan(
     // cross-PM project-pin refusal does not apply — `decide` lets it fall through.
     let global = shim::is_global_invocation(invoked, args);
 
-    match shim::decide(
+    let decision = shim::decide(
         invoked,
         &pin_state,
         args.first().map(String::as_str),
         nesting,
         global,
-    ) {
+    );
+
+    // `nub pm shim --route-installs`: a top-level `npm ci` / bare `npm
+    // install` in a project whose lockfile is npm's runs on nub's engine. Only
+    // where npm itself would have run (the matrix did not refuse), only at top
+    // level (a lifecycle script's nested `npm install` keeps the real npm —
+    // the engine is already running one layer up), never for a global op, and
+    // only for an argv the engine honors verbatim ([`shim::npm_install_route`]).
+    // Without an npm lockfile there is nothing frozen to install from, so the
+    // real npm keeps that case too.
+    if route_installs
+        && invoked == ShimName::Npm
+        && nesting == Nesting::TopLevel
+        && !global
+        && matches!(
+            decision,
+            ShimDecision::RunPinned { pm: Pm::Npm, .. } | ShimDecision::FallThrough { .. }
+        )
+        && let Some(route) = shim::npm_install_route(args, node_env_is_production())
+    {
+        let root = shim_lockfile_root(cwd);
+        if root.join("package-lock.json").is_file() || root.join("npm-shrinkwrap.json").is_file() {
+            // The command line outranks npm's config, as it does for npm.
+            let ignore_scripts = route
+                .ignore_scripts
+                .unwrap_or_else(|| shim::npm_ignore_scripts_configured(&root));
+            return Ok(ShimPlan::EngineInstall {
+                route,
+                ignore_scripts,
+            });
+        }
+    }
+
+    match decision {
         ShimDecision::Refuse {
             pinned_pm,
             provenance,
@@ -11236,6 +11365,11 @@ fn shim_plan(
             exec_under_project_node(cwd, bin, args)
         }
     }
+}
+
+/// npm reads `NODE_ENV=production` as `--omit=dev`; the routed install does too.
+fn node_env_is_production() -> bool {
+    env::var("NODE_ENV").is_ok_and(|v| v == "production")
 }
 
 /// Derive the decision core's [`PinState`] from the resolved [`PmTarget`].
@@ -14310,6 +14444,91 @@ mod tests {
             ),
             other => panic!("pnpm in a yarnPath project must refuse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shim_plan_routes_npm_installs_only_when_opted_in_with_an_npm_lockfile() {
+        use nub_core::pm::shim::{NpmInstallVerb, ShimName};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"p","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let ci = vec!["ci".to_string()];
+        // No npm lockfile: nothing frozen to install from, so npm keeps it.
+        assert!(
+            !matches!(
+                shim_plan_with(ShimName::Npm, &ci, &dir, true).unwrap(),
+                ShimPlan::EngineInstall { .. }
+            ),
+            "without package-lock.json the real npm runs"
+        );
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{}}"#,
+        )
+        .unwrap();
+        match shim_plan_with(ShimName::Npm, &ci, &dir, true).unwrap() {
+            ShimPlan::EngineInstall {
+                route,
+                ignore_scripts,
+            } => {
+                assert_eq!(route.verb, NpmInstallVerb::Ci);
+                assert!(!ignore_scripts, "no config and no flag: scripts run");
+            }
+            other => {
+                panic!("an opted-in npm ci with an npm lockfile runs on the engine, got {other:?}")
+            }
+        }
+        assert!(
+            !matches!(
+                shim_plan_with(ShimName::Npm, &ci, &dir, false).unwrap(),
+                ShimPlan::EngineInstall { .. }
+            ),
+            "without the opt-in the real npm runs"
+        );
+        // npm's config decides when the command line is silent, and the
+        // command line wins when it is not.
+        std::fs::write(dir.join(".npmrc"), "ignore-scripts=true\n").unwrap();
+        assert!(matches!(
+            shim_plan_with(ShimName::Npm, &ci, &dir, true).unwrap(),
+            ShimPlan::EngineInstall {
+                ignore_scripts: true,
+                ..
+            }
+        ));
+        let explicit = vec!["ci".to_string(), "--ignore-scripts=false".to_string()];
+        assert!(matches!(
+            shim_plan_with(ShimName::Npm, &explicit, &dir, true).unwrap(),
+            ShimPlan::EngineInstall {
+                ignore_scripts: false,
+                ..
+            }
+        ));
+        std::fs::remove_file(dir.join(".npmrc")).unwrap();
+        // A pinned npm still routes the install; the pin governs npm's other verbs.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"p","version":"1.0.0","packageManager":"npm@11.0.0"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            shim_plan_with(ShimName::Npm, &ci, &dir, true).unwrap(),
+            ShimPlan::EngineInstall { .. }
+        ));
+        // A project pinned to another PM refuses as before — routing never
+        // overrides the matrix.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"p","version":"1.0.0","packageManager":"pnpm@9.0.0"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            shim_plan_with(ShimName::Npm, &ci, &dir, true).unwrap(),
+            ShimPlan::Refuse { .. }
+        ));
     }
 
     #[test]
