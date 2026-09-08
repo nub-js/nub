@@ -1,12 +1,12 @@
 ---
 title: "De-phantoming the npm ecosystem"
-description: Nub's install-time Phantom Detector, a scan of 10,000 high-download npm packages, and a larger package extensions database for other tools to use.
+description: Nub's install-time phantom detector, a scan of 10,000 high-download npm packages, and a larger package extensions database for other tools to use.
 author: Colin
 date: 2026-09-08T12:00:00Z
 unpublished: true
 ---
 
-Nub ships a default-on global virtual store with a built-in Phantom Detector. The store shares installed dependency trees across projects; the detector helps keep packages with undeclared dependencies working in that layout.
+Nub ships a default-on global virtual store with a built-in phantom detector. The store shares installed dependency trees across projects; the detector helps keep packages with undeclared dependencies working in that layout.
 
 I've now run that detector across a corpus of 10,000 high-download npm packages and published the results as [`@nubjs/extensions`](https://www.npmjs.com/package/@nubjs/extensions): **811 compatibility rules covering 791 package names**, including every rule in Yarn's existing database.
 
@@ -17,7 +17,7 @@ I've now run that detector across a corpus of 10,000 high-download npm packages 
 + } from '@nubjs/extensions';
 ```
 
-Same export name. Same data format. A much larger database.
+The package uses the same export name and data format as Yarn's database.
 
 ## The global virtual store
 
@@ -35,11 +35,11 @@ project-a/node_modules/example
 project-b/node_modules/example
 ```
 
-The dependency graph matters. Two projects can share an entry when the package and its dependency context match, not merely because both requested the same package version.
+Two projects can share an entry when the package and its dependency context match. Matching the package version alone is not sufficient.
 
-There is a compatibility problem hiding in that layout. Node normally follows a package symlink to its real path before resolving the package's imports. Inside a machine-global store, that path no longer passes through the project's `node_modules`.
+Node normally follows a package symlink to its real path before resolving the package's imports. Inside a machine-global store, that path no longer passes through the project's `node_modules`.
 
-An undeclared import that happened to work in a flat tree can suddenly fail:
+An undeclared import that resolved in a flat tree can fail in the global store:
 
 ```js
 // This package imports react
@@ -47,9 +47,9 @@ An undeclared import that happened to work in a flat tree can suddenly fail:
 const React = require('react');
 ```
 
-That is a **phantom dependency**. Something else installed React, and the package relied on finding it by accident. Moving the package outside the project removes that accident.
+This undeclared import is a **phantom dependency**. It can resolve when another dependency installs React in an ancestor's `node_modules`, but fail when the importing package moves to the global store.
 
-This is not a hypothetical obstacle. Bun enabled a global store for its isolated linker, then [made it opt-in again](https://github.com/oven-sh/bun/pull/30473) after realpath and phantom-resolution failures. Aube has [restored the default for Vite/VitePress](https://github.com/aubepkg/aube/releases/tag/v1.33.0) and [Nuxt/Parcel](https://github.com/aubepkg/aube/pull/1312) after excluding those projects. A global store needs more than a faster linker.
+Bun enabled a global store for its isolated linker, then [made it opt-in again](https://github.com/oven-sh/bun/pull/30473) after realpath and phantom-resolution failures. Aube has [restored the default for Vite/VitePress](https://github.com/aubepkg/aube/releases/tag/v1.33.0) and [Nuxt/Parcel](https://github.com/aubepkg/aube/pull/1312) after excluding those projects.
 
 ## Install-time detection
 
@@ -76,7 +76,7 @@ packageExtensions:
       tslib: "*"
 ```
 
-That is a real entry in the new database. The scanned package imports `tslib` without declaring it as a runtime dependency.
+This entry comes from the new database. The scanned package imports `tslib` without declaring it as a runtime dependency.
 
 Yarn maintains the shared [`@yarnpkg/extensions`](https://www.npmjs.com/package/@yarnpkg/extensions) database. Its [extension source](https://github.com/yarnpkg/berry/commits/master/packages/yarnpkg-extensions/sources/index.ts) has received only a handful of updates since 2023. pnpm also carries a few additions of its own.
 
@@ -118,4 +118,4 @@ const { packageExtensions } =
 
 Installing the package alone does not replace a package manager's bundled database. Package-manager authors can integrate the export; project maintainers can use the supplied Yarn and pnpm configuration files.
 
-I strongly recommend other package managers incorporate it. A missing declaration in somebody else's package should not become a configuration exercise for everyone who installs it.
+I strongly recommend other package managers incorporate it so users receive these repairs without configuring extensions themselves.
