@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCHEMA_VERSION: u32 = 2;
-pub(crate) const BACKEND_VERSION: &str = "appcontainer-acl-v3";
+pub(crate) const BACKEND_VERSION: &str = "appcontainer-acl-v4";
 pub(crate) const MAX_IDLE_ENTRIES: usize = 64;
 pub(crate) const MAX_OWNED_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_IDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -22,6 +22,8 @@ pub(crate) const MAX_IDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) struct PolicyIdentity {
     pub(crate) hash: String,
     canonical: String,
+    policy_hash: Option<String>,
+    objects: BTreeMap<String, Option<String>>,
 }
 
 impl PolicyIdentity {
@@ -61,7 +63,12 @@ impl PolicyIdentity {
         })
         .to_string();
         let hash = hex(&Sha256::digest(canonical.as_bytes()));
-        Ok(Self { hash, canonical })
+        Ok(Self {
+            hash,
+            canonical,
+            policy_hash: None,
+            objects: BTreeMap::new(),
+        })
     }
 
     pub(crate) fn with_network(
@@ -89,6 +96,25 @@ impl PolicyIdentity {
         });
         self.hash = hex(&Sha256::digest(self.canonical.as_bytes()));
         self
+    }
+
+    /// Retained leases stay keyed by policy; only a new acquisition resolves a new
+    /// resource incarnation. File contents and timestamps do not affect identity.
+    pub(crate) fn with_objects(
+        mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> io::Result<Self> {
+        for path in paths {
+            let path = canonical_path_or_lexical(&path)?;
+            self.objects
+                .insert(path.clone(), object_id(Path::new(&path))?);
+        }
+        self.policy_hash = Some(self.hash);
+        self.canonical.push('\n');
+        self.canonical
+            .push_str(&serde_json::to_string(&self.objects).map_err(io::Error::other)?);
+        self.hash = hex(&Sha256::digest(self.canonical.as_bytes()));
+        Ok(self)
     }
 }
 
@@ -128,6 +154,8 @@ pub(crate) enum EntryState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Entry {
     pub(crate) identity: String,
+    #[serde(default)]
+    pub(crate) policy_identity: Option<String>,
     pub(crate) canonical_policy: String,
     pub(crate) profile_name: String,
     pub(crate) state: EntryState,
@@ -249,6 +277,7 @@ pub(crate) struct Acquired {
     lease: Lease,
     root: PathBuf,
     closed: bool,
+    admitted_objects: BTreeMap<String, Option<String>>,
 }
 
 impl Acquired {
@@ -282,11 +311,20 @@ impl Acquired {
     }
 
     pub(crate) fn record_mutation(&mut self, mutation: AclMutation) -> io::Result<()> {
+        let observed_id = object_id(Path::new(&mutation.path))?;
+        self.record_mutation_id(mutation, observed_id)
+    }
+
+    /// The launcher holds this object open across journaling and its ACL write.
+    pub(crate) fn record_mutation_id(
+        &mut self,
+        mutation: AclMutation,
+        observed_id: Option<String>,
+    ) -> io::Result<()> {
         let mutation = AclMutation {
             path: canonical_path_or_lexical(Path::new(&mutation.path))?,
             ..mutation
         };
-        let observed_id = object_id(Path::new(&mutation.path))?;
         let _lock = MutationLock::acquire(&self.root)?;
         let mut file = load(&self.root)?;
         let changed = {
@@ -294,20 +332,39 @@ impl Acquired {
                 .entries
                 .get_mut(&self.entry.identity)
                 .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
-            if !entry.mutations.contains(&mutation) {
-                if let Some(id) = observed_id {
-                    entry.object_ids.insert(mutation.path.clone(), id);
-                }
-                entry.mutations.push(mutation);
-                true
-            } else {
-                false
+            if let Some(expected) = entry.object_ids.get(&mutation.path)
+                && observed_id.as_ref() != Some(expected)
+            {
+                return Err(io::Error::other("sandbox ACL object changed during setup"));
             }
+            let mut changed = false;
+            if let Some(id) = observed_id
+                && let std::collections::btree_map::Entry::Vacant(slot) =
+                    entry.object_ids.entry(mutation.path.clone())
+            {
+                slot.insert(id);
+                changed = true;
+            }
+            if !entry.mutations.contains(&mutation) {
+                entry.mutations.push(mutation);
+                changed = true;
+            }
+            changed
         };
         if changed {
             save(&self.root, &file)?;
         }
         self.entry = file.entries[&self.entry.identity].clone();
+        Ok(())
+    }
+
+    pub(crate) fn validate_admitted_object(&self, path: &Path, id: &str) -> io::Result<()> {
+        let path = canonical_path_or_lexical(path)?;
+        if self.admitted_objects.get(&path).and_then(Option::as_deref) != Some(id) {
+            return Err(io::Error::other(format!(
+                "sandbox ACL object {path} changed after resource admission"
+            )));
+        }
         Ok(())
     }
 
@@ -355,15 +412,29 @@ impl Acquired {
             .entries
             .get_mut(&self.entry.identity)
             .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+        for (path, expected) in &self.admitted_objects {
+            if object_id(Path::new(path))?.as_ref() != expected.as_ref() {
+                return Err(io::Error::other("sandbox ACL object changed during setup"));
+            }
+        }
         for path in entry
             .mutations
             .iter()
             .map(|mutation| &mutation.path)
             .chain(&entry.private_paths)
         {
-            validate_object(entry, Path::new(path))?;
-            if let Some(id) = object_id(Path::new(path))? {
-                entry.object_ids.insert(path.clone(), id);
+            let observed = object_id(Path::new(path))?;
+            match entry.object_ids.entry(path.clone()) {
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if observed.as_ref() != Some(slot.get()) {
+                        return Err(io::Error::other("sandbox ACL object changed during setup"));
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    if let Some(id) = observed {
+                        slot.insert(id);
+                    }
+                }
             }
         }
         save(&self.root, &file)?;
@@ -394,6 +465,14 @@ impl Acquired {
 /// spawning; a missing/replaced object is recovery work, never a reason to grant a
 /// SID onto a newly discovered path.
 pub(crate) fn validate_entry(entry: &Entry) -> io::Result<()> {
+    for (path, expected) in &entry.object_ids {
+        if object_id(Path::new(path))?.as_ref() != Some(expected) {
+            return Err(io::Error::other(format!(
+                "sandbox resource {} requires recovery: ACL object {path} was replaced or removed",
+                entry.profile_name
+            )));
+        }
+    }
     for path in &entry.private_paths {
         validate_private_path(entry, Path::new(path))?;
     }
@@ -447,14 +526,12 @@ pub(crate) fn validate_object(entry: &Entry, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn object_id(path: &Path) -> io::Result<Option<String>> {
+pub(crate) fn object_id(path: &Path) -> io::Result<Option<String>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
         let file = match std::fs::OpenOptions::new()
             .access_mode(0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
@@ -464,14 +541,7 @@ fn object_id(path: &Path) -> io::Result<Option<String>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Some(format!(
-            "{}:{}:{}",
-            info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
-        )))
+        object_handle_id(file.as_raw_handle()).map(Some)
     }
     #[cfg(unix)]
     {
@@ -482,6 +552,23 @@ fn object_id(path: &Path) -> io::Result<Option<String>> {
             Err(error) => Err(error),
         }
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn object_handle_id(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(format!(
+        "{}:{}:{}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+    ))
 }
 
 impl Drop for Acquired {
@@ -548,6 +635,7 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
             }
             let entry = Entry {
                 identity: identity.hash.clone(),
+                policy_identity: identity.policy_hash.clone(),
                 profile_name: identity.profile_name(),
                 canonical_policy: identity.canonical,
                 state: EntryState::Preparing,
@@ -559,7 +647,11 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
                 leases: BTreeSet::from([lease.name.clone()]),
                 recovery_error: None,
                 window_objects: Vec::new(),
-                object_ids: BTreeMap::new(),
+                object_ids: identity
+                    .objects
+                    .iter()
+                    .filter_map(|(path, id)| id.as_ref().map(|id| (path.clone(), id.clone())))
+                    .collect(),
             };
             file.entries.insert(entry.identity.clone(), entry.clone());
             (entry, true)
@@ -572,6 +664,7 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
         lease,
         root,
         closed: false,
+        admitted_objects: identity.objects,
     })
 }
 
@@ -1154,6 +1247,7 @@ mod tests {
             "x".to_string(),
             Entry {
                 identity: "x".to_string(),
+                policy_identity: None,
                 canonical_policy: "p".to_string(),
                 profile_name: "n".to_string(),
                 state: EntryState::Ready,
@@ -1232,6 +1326,54 @@ mod tests {
     }
 
     #[test]
+    fn object_incarnations_share_a_policy_but_not_a_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = id(dir.path());
+        let path = dir.path().join("read");
+        let first = policy.clone().with_objects([path.clone()]).unwrap();
+        let same = policy.clone().with_objects([path.clone()]).unwrap();
+        assert_eq!(first, same);
+        std::fs::rename(&path, dir.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let replacement = policy.clone().with_objects([path]).unwrap();
+        assert_ne!(first.hash, replacement.hash);
+        assert_eq!(first.policy_hash, Some(policy.hash));
+        assert_eq!(first.policy_hash, replacement.policy_hash);
+    }
+
+    #[test]
+    fn acquisition_cannot_relabel_an_admitted_object_during_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = id(dir.path());
+        let path = dir.path().join("read");
+        let identity = policy.with_objects([path.clone()]).unwrap();
+        let mut resource = acquire_at(dir.path().join("registry"), identity).unwrap();
+        std::fs::rename(&path, dir.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            resource
+                .record_mutation(AclMutation {
+                    path: path.display().to_string(),
+                    kind: AclKind::Subtree,
+                    access: 1,
+                })
+                .is_err()
+        );
+        assert!(resource.ready().is_err());
+    }
+
+    #[test]
+    fn legacy_registry_entries_remain_readable_without_a_policy_key() {
+        let entry = idle_entry(0, 1);
+        let mut json = serde_json::to_value(&entry).unwrap();
+        json.as_object_mut().unwrap().remove("policy_identity");
+        let decoded: Entry = serde_json::from_value(json).unwrap();
+        assert!(decoded.policy_identity.is_none());
+        assert_eq!(decoded.identity, entry.identity);
+        assert_eq!(decoded.object_ids, entry.object_ids);
+    }
+
+    #[test]
     fn preparation_records_existing_acl_identity_before_ready() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("registry");
@@ -1307,6 +1449,7 @@ mod tests {
     fn idle_entry(index: usize, now: u64) -> Entry {
         Entry {
             identity: index.to_string(),
+            policy_identity: None,
             canonical_policy: String::new(),
             profile_name: format!("fixture-{index}"),
             state: EntryState::Idle,

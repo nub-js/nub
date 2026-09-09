@@ -59,7 +59,29 @@ async function installRust() {
   mkdirSync(toolEnv.RUSTUP_HOME, { recursive: true });
   mkdirSync(toolEnv.CARGO_HOME, { recursive: true });
   output(hostRustup, ['toolchain', 'install', pins.cargo, '--profile', 'minimal', '--no-self-update'], { env: { ...process.env, ...toolEnv } });
-  return { cargo: find('cargo'), rustup: hostRustup, toolEnv };
+  const runtimeRoots = [join(toolEnv.RUSTUP_HOME, 'toolchains')];
+  if (windows) {
+    const vswhere = join(process.env['ProgramFiles(x86)'], 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+    const installation = output(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']);
+    if (!installation) throw new Error('MSVC toolchain missing from the native runner');
+    const setup = join(installation, 'Common7', 'Tools', 'VsDevCmd.bat');
+    const environment = output(process.env.COMSPEC, ['/d', '/s', '/c', `""${setup}" -arch=x64 -host_arch=x64 >nul && set"`], { windowsVerbatimArguments: true });
+    const vars = new Map(environment.split(/\r?\n/).filter(line => line.includes('=')).map(line => {
+      const at = line.indexOf('=');
+      return [line.slice(0, at).toUpperCase(), line.slice(at + 1)];
+    }));
+    // Git Bash's link.exe is not the MSVC linker. Carry the developer prompt's
+    // explicit executable/library closure into both confined and plain controls.
+    for (const key of ['PATH', 'LIB', 'LIBPATH', 'INCLUDE']) {
+      if (!vars.get(key)) throw new Error(`MSVC setup omitted ${key}`);
+      toolEnv[key] = vars.get(key);
+    }
+    for (const key of ['VCTOOLSINSTALLDIR', 'WINDOWSSDKDIR']) {
+      if (!vars.get(key)) throw new Error(`MSVC setup omitted ${key}`);
+      runtimeRoots.push(vars.get(key));
+    }
+  }
+  return { cargo: find('cargo'), rustup: hostRustup, toolEnv, runtimeRoots };
 }
 async function installGo() {
   const extension = windows ? 'zip' : 'tar.gz';
@@ -116,7 +138,7 @@ const runtimeRoots = [process.env.JAVA_HOME, process.env.DOTNET_ROOT].filter(Boo
 if (runtimeRoots.length !== 2) throw new Error('JAVA_HOME and DOTNET_ROOT must be set by workflow setup actions');
 const runtimeEnv = { JAVA_HOME: process.env.JAVA_HOME, DOTNET_ROOT: process.env.DOTNET_ROOT };
 const matrix = [
-  entry('cargo', rust.cargo, ['--version'], rust.toolEnv.CARGO_HOME, { prefix: [`+${pins.cargo}`], runtimeRoots: [join(root, 'rustup', 'toolchains')], toolEnv: rust.toolEnv }),
+  entry('cargo', rust.cargo, ['--version'], rust.toolEnv.CARGO_HOME, { prefix: [`+${pins.cargo}`], runtimeRoots: rust.runtimeRoots, toolEnv: rust.toolEnv }),
   entry('rustup', rust.rustup, ['--version'], rust.toolEnv.RUSTUP_HOME, { runtimeRoots: [rust.toolEnv.RUSTUP_HOME], toolEnv: rust.toolEnv }),
   entry('go', go.program, ['version'], go.root, { runtimeRoots: [go.root] }),
   entry('gradle', jvm.gradle.program, ['--version'], jvm.gradle.root, { runtimeRoots, toolEnv: runtimeEnv }),

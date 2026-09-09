@@ -67,6 +67,10 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
         "WINDIR",
         "COMSPEC",
         "PATHEXT",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+        "ALLUSERSPROFILE",
     ] {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.into(), value);
@@ -76,6 +80,8 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
     for (key, path) in [
         ("HOME", home.clone()),
         ("USERPROFILE", home.clone()),
+        ("APPDATA", home.join("AppData/Roaming")),
+        ("LOCALAPPDATA", home.join("AppData/Local")),
         ("XDG_CACHE_HOME", home.join("cache")),
         ("XDG_CONFIG_HOME", home.join("config")),
         ("XDG_DATA_HOME", home.join("data")),

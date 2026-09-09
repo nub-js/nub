@@ -29,6 +29,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[cfg(unix)]
+mod unix_tmp;
+#[cfg(unix)]
+use unix_tmp::PrivateTemp;
+#[cfg(not(unix))]
+type PrivateTemp = tempfile::TempDir;
+
 /// How an embedder launches nub as the Windows CO-PACKAGE EGRESS-PROXY HELPER — the argv the
 /// AppContainer backend uses as the image + command line for a per-host net launch's helper
 /// process (typically `[current_exe(), "<hidden-flag>"]`). The backend appends the per-run
@@ -428,7 +435,7 @@ pub struct Prepared {
     pub(crate) launch: Option<windows::WindowsLaunch>,
     /// Compatibility owner for a one-shot private tmp directory. Reusable sessions retain
     /// their stable managed tmp root in [`SessionResources`] instead.
-    pub(crate) _private_tmp: Option<tempfile::TempDir>,
+    pub(crate) _private_tmp: Option<PrivateTemp>,
     /// Pipe stdout/stderr at spawn so the host can drain them through an output redactor.
     /// Copied from [`CommandSpec`] in [`apply`], applied in
     /// [`Prepared::spawn_with_signal_target`]. Both `false` (the default) = inherit,
@@ -531,7 +538,7 @@ pub struct PreparedChild {
     #[cfg(unix)]
     signal_target: Option<i32>,
     _proxy: Option<EgressProxy>,
-    _private_tmp: Option<tempfile::TempDir>,
+    _private_tmp: Option<PrivateTemp>,
     _session: Option<Arc<SessionResources>>,
 }
 
@@ -553,7 +560,7 @@ pub struct Sandbox {
 pub(crate) struct SessionResources {
     policy: SandboxPolicy,
     proxy: Option<EgressProxy>,
-    private_tmp: Option<tempfile::TempDir>,
+    private_tmp: Option<PrivateTemp>,
     #[cfg(windows)]
     windows_leases: std::sync::Mutex<std::collections::BTreeMap<String, windows::WindowsLease>>,
 }
@@ -611,7 +618,9 @@ impl Sandbox {
 pub fn cleanup() -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     return windows::cleanup_resources();
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
+    return unix_tmp::cleanup();
+    #[cfg(not(any(unix, target_os = "windows")))]
     Ok(())
 }
 
@@ -1724,19 +1733,19 @@ fn os_str_contains_nul(value: &std::ffi::OsStr) -> bool {
 /// the session lease, so every command submitted through that session sees the same private
 /// location. Creation failure is a hard error: the engine never silently falls back to shared
 /// tmp while claiming a private one.
-fn make_private_tmp(policy: &SandboxPolicy) -> Result<Option<tempfile::TempDir>, Degradation> {
+fn make_private_tmp(policy: &SandboxPolicy) -> Result<Option<PrivateTemp>, Degradation> {
     // Windows acquires the stable profile-owned slot with its persistent native lease.
     if cfg!(windows) || policy.fs.tmp != crate::policy::TmpMode::Private {
         return Ok(None);
     }
-    tempfile::Builder::new()
-        .prefix("nub-tmp-")
-        .tempdir()
-        .map(Some)
-        .map_err(|error| Degradation {
-            lost: vec!["tmp-private".to_string()],
-            reason: Some(format!("creating required private sandbox tmp: {error}")),
-        })
+    #[cfg(unix)]
+    let created = PrivateTemp::new();
+    #[cfg(not(unix))]
+    let created = tempfile::Builder::new().prefix("nub-tmp-").tempdir();
+    created.map(Some).map_err(|error| Degradation {
+        lost: vec!["tmp-private".to_string()],
+        reason: Some(format!("creating required private sandbox tmp: {error}")),
+    })
 }
 
 /// Point a child's temp-dir env at `dir` (all three conventions: POSIX `TMPDIR`, the

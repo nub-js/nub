@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 const FIXTURE: &str = "backend::windows::native_child_tests::windows_native_child_fixture";
 const MODE: &str = "__NUB_WINDOWS_NATIVE_FIXTURE";
 
-fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
+pub(super) fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
     let program = std::env::current_exe().unwrap();
     let mut env: BTreeMap<String, String> = std::env::vars()
         .filter(|(key, _)| {
@@ -115,6 +115,12 @@ fn windows_native_child_fixture() {
             assert!(std::env::var_os("USERPROFILE").is_none());
             assert!(std::env::var_os("PATH").is_none());
             println!("scrubbed-env-ok");
+        }
+        "read-package" => {
+            println!(
+                "package:{}",
+                std::fs::read_to_string(root.join("package.json")).unwrap()
+            );
         }
         "cached-env" => {
             println!(

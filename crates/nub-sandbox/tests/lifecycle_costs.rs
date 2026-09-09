@@ -14,6 +14,52 @@ fn cost_child() {
     println!("SANDBOX_COST_CHILD_OK");
 }
 
+#[test]
+fn cost_owner() {
+    let Some(root) = std::env::var_os("SANDBOX_COST_OWNER_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let tree = std::env::var_os("SANDBOX_COST_OWNER_TREE");
+    let start = Instant::now();
+    let session = Sandbox::acquire(&policy(root, tree.as_deref().map(Path::new))).unwrap();
+    run(&session, root);
+    println!("SANDBOX_COST_OWNER_MS {}", elapsed(start));
+    if std::env::var_os("SANDBOX_COST_OWNER_CRASH").is_some() {
+        // Bypass resource destructors after successful native setup and execution.
+        std::process::exit(91);
+    }
+    session.close();
+}
+
+fn independent_owner(root: &Path, tree: Option<&Path>, crash: bool) -> f64 {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "cost_owner", "--nocapture"])
+        .env("SANDBOX_COST_OWNER_ROOT", root)
+        .env_remove("SANDBOX_COST_OWNER_TREE")
+        .env_remove("SANDBOX_COST_OWNER_CRASH");
+    if let Some(tree) = tree {
+        command.env("SANDBOX_COST_OWNER_TREE", tree);
+    }
+    if crash {
+        command.env("SANDBOX_COST_OWNER_CRASH", "1");
+    }
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if crash { 91 } else { 0 }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("SANDBOX_COST_OWNER_MS "))
+        .expect("owner emitted a timing after its confined command succeeded")
+        .parse()
+        .unwrap()
+}
+
 fn policy(root: &Path, tool_tree: Option<&Path>) -> SandboxPolicy {
     let mut environment = BTreeMap::new();
     for name in [
@@ -181,8 +227,27 @@ fn native_session_costs_and_unique_policy_churn() {
             run(&session, &root);
             record(scenario, "reused-command", sample, elapsed(start));
         }
+        for sample in 0..12 {
+            let start = Instant::now();
+            let native_ms = independent_owner(&root, tool_tree, false);
+            record(scenario, "cross-process-acquire-command", sample, native_ms);
+            record(scenario, "cross-process-total", sample, elapsed(start));
+        }
         session.close();
+        for sample in 0..12 {
+            let start = Instant::now();
+            let native_ms = independent_owner(&root, tool_tree, false);
+            record(scenario, "idle-reopen-acquire-command", sample, native_ms);
+            record(scenario, "idle-reopen-total", sample, elapsed(start));
+        }
         nub_sandbox::cleanup().unwrap();
+        #[cfg(windows)]
+        for sample in 0..3 {
+            independent_owner(&root, tool_tree, true);
+            let start = Instant::now();
+            nub_sandbox::cleanup().unwrap();
+            record(scenario, "abandoned-owner-recovery", sample, elapsed(start));
+        }
     }
     // Exceed the persistent idle-count limit with genuinely different grant roots.
     // These are caller-owned outputs: cleanup must never remove them.

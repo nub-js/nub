@@ -13,6 +13,12 @@ fn native_child() {
     };
     let root = PathBuf::from(std::env::var("SANDBOX_FIXTURE_ROOT").unwrap());
     match case.as_str() {
+        #[cfg(unix)]
+        "tmp-owner" => {
+            let session = sandbox(&root, "tmp");
+            run(&session, &root, "tmp");
+            std::process::exit(91);
+        }
         #[cfg(target_os = "linux")]
         "lifetime" => {
             for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
@@ -86,6 +92,12 @@ fn native_child() {
         }
         "tmp" => {
             let tmp = std::env::temp_dir();
+            #[cfg(unix)]
+            {
+                let lease = tmp.parent().unwrap().join("lease");
+                assert!(std::fs::read(&lease).is_err());
+                assert!(std::fs::write(&lease, b"forged").is_err());
+            }
             let marker = tmp.join("session-marker");
             if marker.exists() {
                 assert_eq!(std::fs::read(&marker).unwrap(), b"shared");
@@ -256,6 +268,30 @@ fn managed_temp_is_shared_by_commands_until_session_close() {
         !tmp.exists(),
         "closed Unix session retained its managed temp"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_recovers_temp_after_a_native_command_owner_crashes() {
+    let root = fixture();
+    for path in ["project", "readable", "cache"] {
+        std::fs::create_dir_all(root.path().join(path)).unwrap();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_child", "--nocapture"])
+        .env(CASE, "tmp-owner")
+        .env("SANDBOX_FIXTURE_ROOT", root.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(91));
+    let tmp = PathBuf::from(std::fs::read_to_string(root.path().join("project/tmp-path")).unwrap());
+    // Another parallel test may already have run opportunistic recovery.
+    nub_sandbox::cleanup().unwrap();
+    assert!(
+        !tmp.exists(),
+        "cleanup retained the crashed owner's private data"
+    );
+    assert!(root.path().join("project/tmp-path").exists());
 }
 
 #[cfg(target_os = "macos")]

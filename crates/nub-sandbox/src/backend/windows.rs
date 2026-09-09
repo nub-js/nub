@@ -10,8 +10,9 @@
 //! other path fails closed with no per-file deny-ACE. The deny-ACE denylist is
 //! ABANDONED — it is defeated whenever a secret sits under a dir carrying an
 //! inherited `ALL APPLICATION PACKAGES` read grant (the AAP grant satisfies the
-//! lowbox check before the file deny is reached). We grant a policy-specific
-//! AppContainer SID and never grant AAP, so no inherited AAP can widen the allow-set.
+//! lowbox check before the file deny is reached). Caller paths receive a policy-specific
+//! AppContainer SID. Explicitly publishable Nub-owned public caches are the exception:
+//! their persistent AAP read grants are not session-owned and are not revoked on close.
 //!
 //! AXES:
 //!   - fs read-confine: inheritable allow-ACE (AC SID, read+execute) on each allowed
@@ -1279,8 +1280,8 @@ pub(super) mod launch {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-        NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, TRUSTEE_IS_SID,
+        TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -1624,19 +1625,48 @@ pub(super) mod launch {
         walked.is_ok() && allowed & needed == needed
     }
 
-    /// Install one leaf allow-ace, reporting whether an ace was actually written.
-    ///
-    /// The return value is the ONLY thing the teardown list is driven from, which is what keeps
-    /// grant and revoke symmetric BY CONSTRUCTION: a skipped path is never recorded, so the
-    /// teardown cannot strip an ace this launch did not create. Two independent conditionals
-    /// would make that a coincidence instead of a property — and stripping
-    /// `ALL APPLICATION PACKAGES` off `%ProgramFiles%\nodejs` would be a lasting change to the
-    /// user's own machine.
-    fn grant_leaf_ace(path: &Path, sid: PSID, access: u32) -> io::Result<bool> {
-        if already_granted_to_appcontainers(path, access) {
-            return Ok(false);
+    /// Journal a profile-SID grant before writing it through the same object handle.
+    /// Existing public AAP grants are neither journaled nor revoked as profile grants.
+    fn grant_recorded_ace(
+        resource: &mut super::windows_registry::Acquired,
+        path: &Path,
+        sid: PSID,
+        grant: (super::windows_registry::AclKind, u32),
+        admitted: bool,
+        optional: bool,
+    ) -> io::Result<()> {
+        use super::windows_registry::{AclKind, AclMutation, object_handle_id};
+        let (kind, access) = grant;
+        if kind != AclKind::Object && already_granted_to_appcontainers(path, access) {
+            return Ok(());
         }
-        set_ace(path, sid, access, GRANT_ACCESS, true).map(|()| true)
+        let file = match open_acl_file(path) {
+            Ok(file) => file,
+            Err(_) if optional => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let id = object_handle_id(file.as_raw_handle())?;
+        if admitted {
+            resource.validate_admitted_object(path, &id)?;
+        }
+        resource.record_mutation_id(
+            AclMutation {
+                path: path.to_string_lossy().into_owned(),
+                kind,
+                access,
+            },
+            Some(id),
+        )?;
+        // The same open object is journaled and mutated even if its name changes.
+        let result = set_ace_on_handle(
+            file.as_raw_handle(),
+            sid,
+            access,
+            GRANT_ACCESS,
+            kind != AclKind::Object,
+            kind != AclKind::Object,
+        );
+        if optional { Ok(()) } else { result }
     }
 
     /// See [`super::windows_object_traverse_ace`].
@@ -1751,39 +1781,39 @@ pub(super) mod launch {
     /// propagate through their profile or temp dir. This repair is only ever allowed to add and
     /// remove one traverse ace.
     fn set_ace_on_object(path: &Path, sid: PSID, access: u32, mode: i32) -> io::Result<()> {
-        use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+        let file = open_acl_file(path)?;
+        set_ace_on_handle(file.as_raw_handle(), sid, access, mode, false, false)
+    }
+
+    fn open_acl_file(path: &Path) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        std::fs::OpenOptions::new()
+            .access_mode(0x0002_0000 | 0x0004_0000) // READ_CONTROL | WRITE_DAC
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    fn set_ace_on_handle(
+        handle: HANDLE,
+        sid: PSID,
+        access: u32,
+        mode: i32,
+        inherit: bool,
+        propagate: bool,
+    ) -> io::Result<()> {
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo};
         use windows_sys::Win32::Security::{
             InitializeSecurityDescriptor, SE_DACL_AUTO_INHERITED, SECURITY_DESCRIPTOR,
             SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
         };
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING,
-        };
-        const READ_CONTROL: u32 = 0x0002_0000;
-        const WRITE_DAC: u32 = 0x0004_0000;
         const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
         const CARRIED_CONTROL: u16 = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
 
         let _lock = super::windows_registry::OperationLock::acquire("acl")?;
-        let wpath = to_wide_path(path);
-        // SAFETY: `wpath` is a NUL-terminated wide path; `HandleGuard` closes the handle.
-        let handle = unsafe {
-            CreateFileW(
-                wpath.as_ptr(),
-                READ_CONTROL | WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let _handle = HandleGuard(handle);
-
         let mut old_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let rc = unsafe {
@@ -1802,6 +1832,20 @@ pub(super) mod launch {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
         let _sd = LocalFreeGuard(sd);
+        // A NULL DACL is already unrestricted; replacing it with only our grant
+        // would change other principals' access and cannot be undone by SID removal.
+        if old_dacl.is_null() {
+            return Ok(());
+        }
+        if mode == REVOKE_ACCESS {
+            let mut found = false;
+            for_each_ace_of_sid(old_dacl, sid, Path::new("<opened-object>"), |_, _, _| {
+                found = true;
+            })?;
+            if !found {
+                return Ok(());
+            }
+        }
 
         let mut control = 0u16;
         let mut revision = 0u32;
@@ -1812,7 +1856,11 @@ pub(super) mod launch {
         let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
         ea.grfAccessPermissions = access;
         ea.grfAccessMode = mode;
-        ea.grfInheritance = NO_INHERITANCE;
+        ea.grfInheritance = if inherit {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            NO_INHERITANCE
+        };
         ea.Trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -1828,6 +1876,25 @@ pub(super) mod launch {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
         let _new = LocalFreeGuard(new_dacl.cast());
+
+        if propagate {
+            let rc = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            return if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(rc as i32))
+            };
+        }
 
         let mut fresh: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
         let psd: PSECURITY_DESCRIPTOR = std::ptr::from_mut(&mut fresh).cast();
@@ -2081,6 +2148,19 @@ pub(super) mod launch {
             }
             let _operation = super::windows_registry::OperationLock::acquire("resources")?;
             recover_idle_resources(false, true)?;
+            let ancestors = if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_some() {
+                Vec::new()
+            } else {
+                ancestor_chain(&self, None)
+            };
+            let identity = identity.with_objects(
+                self.read_grants
+                    .iter()
+                    .chain(&self.write_grants)
+                    .chain(&self.read_node_grants)
+                    .chain(&ancestors)
+                    .cloned(),
+            )?;
             let mut resource = super::windows_registry::acquire(identity)?;
             if !resource.fresh {
                 super::windows_registry::validate_entry(&resource.entry)?;
@@ -2107,10 +2187,16 @@ pub(super) mod launch {
                     std::fs::create_dir_all(path)?;
                     #[cfg(test)]
                     test_crash_transition("private-root-created", &name, &profile_folder);
-                    grant_leaf_ace(
+                    grant_recorded_ace(
+                        &mut resource,
                         path,
                         ac_sid,
-                        GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                        (
+                            super::windows_registry::AclKind::PrivateProfile,
+                            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                        ),
+                        false,
+                        false,
                     )?;
                 }
             }
@@ -2137,10 +2223,16 @@ pub(super) mod launch {
                             access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
                         })?;
                         std::fs::create_dir_all(&path)?;
-                        grant_leaf_ace(
+                        grant_recorded_ace(
+                            &mut resource,
                             &path,
                             ac_sid,
-                            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                            (
+                                super::windows_registry::AclKind::PrivateProfile,
+                                GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                            ),
+                            false,
+                            false,
                         )?;
                     }
                 }
@@ -2166,34 +2258,42 @@ pub(super) mod launch {
                     if !dir.exists() && !required {
                         continue;
                     }
-                    resource.record_mutation(super::windows_registry::AclMutation {
-                        path: dir.to_string_lossy().into_owned(),
-                        kind: super::windows_registry::AclKind::Subtree,
-                        access,
-                    })?;
-                    if let Err(error) = grant_leaf_ace(dir, ac_sid, access)
-                        && (required || fail_closed)
-                    {
-                        return Err(error);
-                    }
+                    grant_recorded_ace(
+                        &mut resource,
+                        dir,
+                        ac_sid,
+                        (super::windows_registry::AclKind::Subtree, access),
+                        true,
+                        !(required || fail_closed),
+                    )?;
                 }
-                let ancestors = if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_some()
-                {
-                    Vec::new()
-                } else {
-                    ancestor_chain(&self, private.as_deref())
-                };
                 for dir in self.read_node_grants.iter().chain(&ancestors) {
                     if !dir.exists() {
                         continue;
                     }
-                    resource.record_mutation(super::windows_registry::AclMutation {
-                        path: dir.to_string_lossy().into_owned(),
-                        kind: super::windows_registry::AclKind::Object,
-                        access: TRAVERSE_MASK,
-                    })?;
                     // Missing optional read/traverse rights can only over-confine.
-                    let _ = set_ace_on_object(dir, ac_sid, TRAVERSE_MASK, GRANT_ACCESS);
+                    grant_recorded_ace(
+                        &mut resource,
+                        dir,
+                        ac_sid,
+                        (super::windows_registry::AclKind::Object, TRAVERSE_MASK),
+                        true,
+                        true,
+                    )?;
+                }
+                if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_none() {
+                    for dir in ancestor_chain(&self, private.as_deref()) {
+                        if !ancestors.contains(&dir) && dir.exists() {
+                            grant_recorded_ace(
+                                &mut resource,
+                                &dir,
+                                ac_sid,
+                                (super::windows_registry::AclKind::Object, TRAVERSE_MASK),
+                                false,
+                                true,
+                            )?;
+                        }
+                    }
                 }
                 #[cfg(test)]
                 test_crash_transition("acl-installed-before-ready", &name, &profile_folder);
@@ -2235,9 +2335,10 @@ pub(super) mod launch {
         }
 
         pub(crate) fn identity(&self) -> Option<&str> {
-            self.state
-                .as_ref()
-                .map(|state| state._lease.entry.identity.as_str())
+            self.state.as_ref().map(|state| {
+                let entry = &state._lease.entry;
+                entry.policy_identity.as_deref().unwrap_or(&entry.identity)
+            })
         }
 
         pub(crate) fn lease(&self) -> Option<WindowsLease> {
@@ -3354,8 +3455,25 @@ pub(super) mod launch {
         if grant {
             set_ace(path, sid.0, 0x0012_0089, GRANT_ACCESS, false)
         } else {
-            revoke_ace(path, sid.0)
+            set_ace(path, sid.0, 0, REVOKE_ACCESS, false)
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_profile_ace_on_handle(
+        profile: &str,
+        file: &std::fs::File,
+        grant: bool,
+    ) -> io::Result<()> {
+        let sid = SidGuard(derive_appcontainer(profile)?);
+        set_ace_on_handle(
+            file.as_raw_handle(),
+            sid.0,
+            0x0012_0089,
+            if grant { GRANT_ACCESS } else { REVOKE_ACCESS },
+            false,
+            true,
+        )
     }
 
     fn recover_idle_resources(all: bool, reserve_slot: bool) -> io::Result<()> {
@@ -3368,23 +3486,7 @@ pub(super) mod launch {
                     crate::backend::windows_ace::revoke_persistent(object, sid)?;
                 }
                 for mutation in &entry.mutations {
-                    let path = PathBuf::from(&mutation.path);
-                    if !path.try_exists()? {
-                        continue;
-                    }
-                    super::windows_registry::validate_object(&entry, &path)?;
-                    if !path_has_sid(&path, sid)? {
-                        continue;
-                    }
-                    match mutation.kind {
-                        super::windows_registry::AclKind::Subtree
-                        | super::windows_registry::AclKind::PrivateProfile => {
-                            revoke_ace(&path, sid)?;
-                        }
-                        super::windows_registry::AclKind::Object => {
-                            set_ace_on_object(&path, sid, mutation.access, REVOKE_ACCESS)?;
-                        }
-                    }
+                    revoke_recorded_ace(&entry, mutation, sid)?;
                 }
                 for path in &entry.private_paths {
                     if Path::new(path).exists() {
@@ -3418,6 +3520,187 @@ pub(super) mod launch {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Reopen the journaled object even when the caller moved or replaced its name.
+    /// A missing ID is conclusive only when the filesystem supports this lookup;
+    /// access denied (including delete-pending) and unsupported lookups are errors.
+    pub(super) fn open_recorded_acl_file(
+        path: &Path,
+        expected: &str,
+    ) -> io::Result<Option<std::fs::File>> {
+        use super::windows_registry::{object_handle_id, object_id};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType,
+            GetVolumeInformationByHandleW, OpenFileById,
+        };
+
+        if object_id(path)?.as_deref() == Some(expected) {
+            let file = open_acl_file(path)?;
+            if object_handle_id(file.as_raw_handle())? == expected {
+                return Ok(Some(file));
+            }
+        }
+        let parts = expected
+            .split(':')
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
+        let [volume, high, low] = parts.as_slice() else {
+            return Err(io::Error::other("unsupported sandbox ACL object identity"));
+        };
+        let descriptor = FILE_ID_DESCRIPTOR {
+            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: FileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 {
+                FileId: ((u64::from(*high) << 32) | u64::from(*low)) as i64,
+            },
+        };
+        // Any accessible file on the volume is a sufficient hint. Opening a
+        // volume device (which could require elevation) is neither needed nor used.
+        for ancestor in path.ancestors().skip(1) {
+            let hint = match std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(ancestor)
+            {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let hint_id = object_handle_id(hint.as_raw_handle())?;
+            if hint_id
+                .split(':')
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                != Some(*volume)
+            {
+                continue;
+            }
+            let mut filesystem = [0u16; 32];
+            let mut flags = 0;
+            if unsafe {
+                GetVolumeInformationByHandleW(
+                    hint.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut flags,
+                    filesystem.as_mut_ptr(),
+                    filesystem.len() as u32,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let len = filesystem
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(filesystem.len());
+            // Existing journals carry 64-bit IDs, which are not unique on ReFS.
+            // Do not treat an unsupported or ambiguous lookup as a deleted object.
+            const SUPPORTS_OPEN_BY_FILE_ID: u32 = 0x0100_0000;
+            if flags & SUPPORTS_OPEN_BY_FILE_ID == 0
+                || !String::from_utf16_lossy(&filesystem[..len]).eq_ignore_ascii_case("NTFS")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "sandbox recorded-object recovery requires NTFS file IDs",
+                ));
+            }
+            let raw = unsafe {
+                OpenFileById(
+                    hint.as_raw_handle(),
+                    &descriptor,
+                    0x0002_0000 | 0x0004_0000,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                let error = io::Error::last_os_error();
+                return if matches!(error.raw_os_error(), Some(2 | 3)) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            // SAFETY: OpenFileById returned an owned file handle.
+            let file = unsafe { std::fs::File::from_raw_handle(raw) };
+            if object_handle_id(file.as_raw_handle())? != expected {
+                return Err(io::Error::other(
+                    "sandbox ACL object lookup returned a different identity",
+                ));
+            }
+            return Ok(Some(file));
+        }
+        Err(io::Error::other(
+            "sandbox ACL object volume is unavailable for recovery",
+        ))
+    }
+
+    fn revoke_recorded_ace(
+        entry: &super::windows_registry::Entry,
+        mutation: &super::windows_registry::AclMutation,
+        sid: PSID,
+    ) -> io::Result<()> {
+        use super::windows_registry::{AclKind, object_handle_id};
+        if !entry.leases.is_empty() {
+            return Err(io::Error::other(
+                "refusing to revoke a live sandbox resource",
+            ));
+        }
+        let path = Path::new(&mutation.path);
+        let expected = entry.object_ids.get(&mutation.path);
+        if mutation.kind == AclKind::PrivateProfile {
+            let file = match open_acl_file(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if let Some(expected) = expected
+                && &object_handle_id(file.as_raw_handle())? != expected
+            {
+                return Err(io::Error::other("sandbox private ACL object was replaced"));
+            }
+            return set_ace_on_handle(file.as_raw_handle(), sid, 0, REVOKE_ACCESS, false, true);
+        }
+        let expected = expected.ok_or_else(|| {
+            io::Error::other("sandbox ACL mutation has no recorded object identity")
+        })?;
+        let original = open_recorded_acl_file(path, expected)?;
+        if let Some(file) = &original {
+            set_ace_on_handle(
+                file.as_raw_handle(),
+                sid,
+                0,
+                REVOKE_ACCESS,
+                false,
+                mutation.kind == AclKind::Subtree,
+            )?;
+        }
+        // Atomic replacement can copy a DACL. Removal names only the retired SID,
+        // never the new resource's SID, and confers no authority to delete the file.
+        match open_acl_file(path) {
+            Ok(file) => {
+                if object_handle_id(file.as_raw_handle())? != *expected {
+                    set_ace_on_handle(
+                        file.as_raw_handle(),
+                        sid,
+                        0,
+                        REVOKE_ACCESS,
+                        false,
+                        mutation.kind == AclKind::Subtree,
+                    )?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn create_appcontainer(name: &str) -> io::Result<PSID> {
@@ -3726,13 +4009,7 @@ pub(super) mod launch {
         }
     }
 
-    /// Remove every ACE for `sid` on `path` (teardown). REVOKE_ACCESS ignores the
-    /// access mask + inheritance and matches purely on the trustee, so a unique per-run
-    /// SID's ACEs go cleanly wherever we placed them.
-    fn revoke_ace(path: &Path, sid: PSID) -> io::Result<()> {
-        set_ace(path, sid, 0, REVOKE_ACCESS, false)
-    }
-
+    #[cfg(test)]
     fn path_has_sid(path: &Path, sid: PSID) -> io::Result<bool> {
         let wide = to_wide_path(path);
         let mut acl = std::ptr::null_mut();
@@ -3753,6 +4030,9 @@ pub(super) mod launch {
             return Err(io::Error::from_raw_os_error(result as i32));
         }
         let _descriptor = LocalFreeGuard(descriptor);
+        if acl.is_null() {
+            return Ok(false);
+        }
         let mut found = false;
         for_each_ace_of_sid(acl, sid, path, |_, _, _| found = true)?;
         Ok(found)
@@ -3789,70 +4069,8 @@ pub(super) mod launch {
     /// trustee and ignores inheritance). Additive — reads the existing DACL and merges,
     /// never clobbering other ACEs.
     fn set_ace(path: &Path, sid: PSID, access: u32, mode: i32, inherit: bool) -> io::Result<()> {
-        // Serialize the DACL RMW across concurrent launches (see ACL_LOCK). Poison-
-        // tolerant: a prior panicked holder left no invariant broken here.
-        let _lock = super::windows_registry::OperationLock::acquire("acl")?;
-        let wpath = to_wide_path(path);
-        let mut old_dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // Read the existing DACL so the grant is additive (never clobber existing ACEs).
-        let rc = unsafe {
-            GetNamedSecurityInfoW(
-                wpath.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut old_dacl,
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        let sd_guard = LocalFreeGuard(sd);
-
-        let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
-        ea.grfAccessPermissions = access;
-        ea.grfAccessMode = mode;
-        ea.grfInheritance = if inherit {
-            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
-        } else {
-            NO_INHERITANCE
-        };
-        ea.Trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_USER,
-            ptstrName: sid.cast(),
-        };
-
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        let rc = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        let new_guard = LocalFreeGuard(new_dacl.cast());
-
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
-                wpath.as_ptr() as *mut u16,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                new_dacl,
-                std::ptr::null_mut(),
-            )
-        };
-        drop(new_guard);
-        drop(sd_guard);
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        Ok(())
+        let file = open_acl_file(path)?;
+        set_ace_on_handle(file.as_raw_handle(), sid, access, mode, inherit, true)
     }
 
     struct LocalFreeGuard(*mut std::ffi::c_void);
@@ -4586,3 +4804,7 @@ mod native_child_tests;
 #[cfg(all(test, windows))]
 #[path = "windows_cleanup_tests.rs"]
 mod windows_cleanup_tests;
+
+#[cfg(all(test, windows))]
+#[path = "windows_replacement_tests.rs"]
+mod replacement_tests;

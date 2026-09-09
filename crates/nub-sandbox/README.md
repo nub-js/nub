@@ -82,8 +82,28 @@ Operational limits:
 
 - Linux Landlock and Windows ACL grants need existing objects. Missing speculative set members are skipped, not created. Initialize the cache root before acquiring a sandbox, or place it under an already writable directory. macOS path rules can admit later creation.
 - An exact writable file is not a writable parent directory. Git's default global-config update creates an adjacent `.gitconfig.lock` and renames it; granting the existing `.gitconfig` alone is insufficient on inode-based backends. A dedicated, writable Git config directory supports that protocol without granting all of home.
+- Removing or replacing a grant root may require write access to its parent. This affects commands such as `cargo clean` and cache deletion. Put disposable output below a writable directory, or explicitly grant its parent; the engine does not synthesize sibling exceptions.
 - Linked Git worktrees and relocated common directories may sit outside the project. Supply `GIT_DIR`/`GIT_COMMON_DIR` or explicit grants for those locations.
 - Filesystem access does not provide network access, an interpreter's installation files, macOS Keychain access or Windows Credential Manager access. Embedders supply those capabilities separately.
+
+## Network and environment permissions
+
+Network filtering is independent of filesystem access:
+
+```json
+{
+  "fs": {"./": "rw", "$tooldirs": "rw", "$tmp": "rw"},
+  "net": ["registry.npmjs.org", "*.example.com", "!admin.example.com"],
+  "vars": {"PATH": true, "HOME": true, "CI?": true},
+  "secrets": {"API_TOKEN?": true}
+}
+```
+
+Network entries accept host patterns and CIDRs. Unlike filesystem grants, network rules retain ordered allow/deny matching. A host grant is not an HTTP-method restriction and does not prevent uploads to that host. The boolean `false` denies egress; `true` disables Nub's network filtering. Windows AppContainer capabilities still constrain networking even without a Nub host filter.
+
+The environment example inherits named values from the supplied snapshot. A trailing `?` makes a missing value optional. Secret values are sensitive data supplied to the child, not values hidden from it; an allowed child can use them. Unlisted environment values are not implicitly inherited by this explicit policy.
+
+Filtering the environment does not hide files granted through `fs`. The default Linux policy also withholds other processes' `/proc` entries, which can break tools that inspect their own process metadata. Granting all of `/proc` would broaden access to other processes and is not an automatic compatibility fix.
 
 ## Resource and command ownership
 
@@ -113,5 +133,9 @@ Each prepared/running command retains its resource lease. Closing the session re
 Landlock is a Linux Security Module. Seccomp means secure computing; its BPF (Berkeley Packet Filter) programs filter system calls. An ACL is an Access Control List; an ACE is one entry in it. Windows identifies an AppContainer with a SID, or Security Identifier. A Job Object controls process lifetime independently of file permissions.
 
 Windows automatically reuses equivalent resolved resource policies, including runtime grants and backend version. Different external paths produce different identities; managed temp is an identity-owned slot rather than a fresh hash input. Active leases are never evicted. The idle cache is bounded by 64 entries, 24 hours and 1 GiB of owned private data; caller project outputs and shared tool caches are not deletion targets. Explicit cleanup reports failures and retains their ownership records for recovery.
+
+On Unix, managed temp storage lives in a private per-user directory under the OS temp root. A file-lock lease distinguishes a live session from an abandoned one. Acquisition and explicit cleanup recover abandoned owned directories; normal close removes them immediately. Cleanup checks the recorded directory identity and does not follow payload symlinks. Legacy temporary directories without ownership records are not deletion targets.
+
+The Windows build jail also publishes read access to Nub-owned public package caches. Those cache permissions are intentional shared storage metadata, not a particular session's grants; sandbox cleanup does not revoke them.
 
 The API requires no elevation or setup command. Windows' full-disk build-jail compatibility path is deliberately unconfined and reports that loss; it still uses an owned Job. On Unix, owner-loss cleanup uses a private guardian process group. Linux additionally blocks group/session escape syscalls. macOS does not have a verified equivalent restriction: a process that deliberately leaves the group can survive owner loss, although it remains confined. Do not treat ordinary descendant tests as proof against deliberate detachment.
