@@ -58,6 +58,14 @@ The writable directory admits the lock/rename protocol without granting all of h
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.
 
+### Windows subprocess controls
+
+The [focused subprocess run](https://github.com/nubjs/nub/actions/runs/34369854867) separates executable access from stream setup. It tests Rust 1.98.1, Python 3.12.10 and the diagnostic executable with seven descriptor configurations, each confined and unconfined. All unconfined cases pass. The confined cases retain a denied-file canary.
+
+On Server 2022, the same executables launch with inherited streams, piped stdin or regular-file streams. Opening `NUL` for stdin or stdout fails with OS error 5. Default Rust `Command::output()` fails, while changing only its stdin to an existing empty file succeeds. All seven configurations pass on Windows 11 arm64.
+
+This identifies a subprocess-setup failure without claiming the complete Cargo, uv or Composer workloads pass. The parent sandbox launcher can supply an existing handle; it cannot make an unmodified descendant's later `NUL` open succeed. The [diagnostic fixture](tests/windows_subprocess_diagnostics.rs) preserves the individual results rather than treating unsupported configurations as working.
+
 ## Nub build-jail coverage
 
 The build-jail frontend supplies a provisioned Node runtime and its own stdio support; it is not the same configuration as these raw engine tests. The [paired full-application run](https://github.com/nubjs/nub/actions/runs/34344382169) passes 16 framework fixtures per OS on Linux, macOS and Windows, both at `ee71d441c3` and at the exact preceding branch baseline. Each fixture includes an unconfined control, denied read/write/environment canaries and a frozen reinstall. Those results do not turn the raw-runtime failures above into passes.
