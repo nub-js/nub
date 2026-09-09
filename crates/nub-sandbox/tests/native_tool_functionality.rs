@@ -607,6 +607,7 @@ fn run_nuget_self_proc(tooldirs: bool) {
     policy.fs.self_proc.extend([
         nub_sandbox::policy::SelfProcFile::Maps,
         nub_sandbox::policy::SelfProcFile::Stat,
+        nub_sandbox::policy::SelfProcFile::Cmdline,
     ]);
     // Named .NET mutexes use this shared path even with a private TMPDIR.
     // This fixture explicitly accepts that coordination scope; the catalog does not.

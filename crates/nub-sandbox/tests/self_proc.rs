@@ -21,11 +21,16 @@ fn context(root: &Path) -> CompileCtx {
 #[test]
 fn metadata_grants_are_explicit_resolved_capabilities() {
     let root = tempfile::tempdir().unwrap();
-    let value = json!({"fs": {"/proc/self/maps": "r", "/proc/self/stat": "r"}, "net": false});
+    let value = json!({"fs": {"/proc/self/maps": "r", "/proc/self/stat": "r", "/proc/self/cmdline": "r"}, "net": false});
     let policy = compile(&value, &context(root.path())).unwrap();
     assert_eq!(
         policy.fs.self_proc,
-        [SelfProcFile::Maps, SelfProcFile::Stat].into()
+        [
+            SelfProcFile::Maps,
+            SelfProcFile::Stat,
+            SelfProcFile::Cmdline
+        ]
+        .into()
     );
     assert!(
         policy.fs.rules.entries.is_empty(),
@@ -49,6 +54,7 @@ fn writable_metadata_is_rejected_including_reused_grants() {
     for value in [
         json!({"fs": {"/proc/self/maps": "rw"}}),
         json!({"fs": {"/proc/self/stat": true}}),
+        json!({"fs": {"/proc/self/cmdline": "rw"}}),
         json!({"fs": ["/proc/self/maps"]}),
         json!({"shared": {"/proc/self/stat": "rw"}, "fs": {"...:#/shared": true}}),
     ] {
@@ -126,7 +132,7 @@ mod linux {
 
     fn check_metadata() {
         let selected = std::env::var("SELF_PROC_CASE").unwrap();
-        for name in ["maps", "stat"] {
+        for name in ["maps", "stat", "cmdline"] {
             let read = std::fs::read_to_string(format!("/proc/self/{name}"));
             if selected.split(',').any(|file| file == name) {
                 let text = read.unwrap();
@@ -135,11 +141,17 @@ mod linux {
                         text.split_whitespace().next().unwrap(),
                         std::process::id().to_string()
                     );
-                } else {
+                } else if name == "maps" {
                     assert!(
                         text.contains("self_proc"),
                         "maps describes this executable: {text}"
                     );
+                } else {
+                    assert_eq!(
+                        text.split('\0').next().unwrap(),
+                        std::env::args().next().unwrap()
+                    );
+                    assert!(text.contains("linux::metadata_child"));
                 }
             } else {
                 assert_eq!(
@@ -162,10 +174,10 @@ mod linux {
         for path in [
             root.join("secret"),
             "/proc/self/environ".into(),
-            "/proc/self/cmdline".into(),
             "/proc/thread-self/stat".into(),
             format!("/proc/{owner}/maps").into(),
             format!("/proc/{owner}/environ").into(),
+            format!("/proc/{owner}/cmdline").into(),
             format!("/proc/{}/stat", std::process::id()).into(),
         ] {
             assert_eq!(
@@ -199,7 +211,13 @@ mod linux {
 
     #[test]
     fn retained_metadata_is_per_command_thread_and_descendant() {
-        for files in [&[][..], &["maps"][..], &["stat"][..], &["maps", "stat"][..]] {
+        for files in [
+            &[][..],
+            &["maps"][..],
+            &["stat"][..],
+            &["cmdline"][..],
+            &["maps", "stat", "cmdline"][..],
+        ] {
             let (root, sandbox) = fixture(files);
             for _ in 0..3 {
                 let output = sandbox

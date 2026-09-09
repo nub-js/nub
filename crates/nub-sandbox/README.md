@@ -55,7 +55,7 @@ It includes SSH keys, package-manager credentials and other readable home files.
 
 ### Explicit Linux process metadata
 
-Some runtimes inspect their own memory map or process statistics. Linux policies can request either file explicitly:
+Some runtimes inspect their own memory map, process statistics or command line. Linux policies can request these files explicitly:
 
 ```json
 {
@@ -64,15 +64,16 @@ Some runtimes inspect their own memory map or process statistics. Linux policies
     "$tooldirs": "rw",
     "$tmp": "rw",
     "/proc/self/maps": "r",
-    "/proc/self/stat": "r"
+    "/proc/self/stat": "r",
+    "/proc/self/cmdline": "r"
   },
   "net": false
 }
 ```
 
-These two paths refer to the requesting process, including child processes and threads, rather than the process compiling the policy. They grant read access only. Neither is included in the convenience sets or the default policy. Other procfs paths, including environment files and numeric-PID aliases, remain excluded.
+These paths refer to the requesting process, including child processes and threads, rather than the process compiling the policy. They grant read access only. None is included in the convenience sets or the default policy. Command-line access exposes that process's own arguments, not its owner's arguments. Other procfs paths, including environment files and numeric-PID aliases, remain excluded.
 
-This option requires Linux 5.14 or newer with seccomp user notifications and atomic file-descriptor injection. Unsupported hosts refuse acquisition. macOS and Windows reject these Linux-specific permissions. Policies without either grant do not add read-open notifications; opt-in policies route read opens through the supervisor before ordinary paths continue under Landlock.
+This option requires Linux 5.14 or newer with seccomp user notifications and atomic file-descriptor injection. Unsupported hosts refuse acquisition. macOS and Windows reject these Linux-specific permissions. Policies without these grants do not add read-open notifications; opt-in policies route read opens through the supervisor before ordinary paths continue under Landlock.
 
 ## Tool directories
 

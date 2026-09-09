@@ -78,6 +78,7 @@ pub struct FsPolicy {
 pub enum SelfProcFile {
     Maps,
     Stat,
+    Cmdline,
 }
 
 impl SelfProcFile {
@@ -85,6 +86,7 @@ impl SelfProcFile {
         match path {
             "/proc/self/maps" => Some(Self::Maps),
             "/proc/self/stat" => Some(Self::Stat),
+            "/proc/self/cmdline" => Some(Self::Cmdline),
             _ => None,
         }
     }
@@ -94,6 +96,7 @@ impl SelfProcFile {
         match self {
             Self::Maps => "maps",
             Self::Stat => "stat",
+            Self::Cmdline => "cmdline",
         }
     }
 }

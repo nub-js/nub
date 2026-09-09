@@ -75,7 +75,7 @@ This establishes that the tested Gradle workflow works with the narrower capabil
 
 ### OS restrictions
 
-- **Linux procfs:** ordinary grants under `/proc` are rejected. The two explicit read-only [self-metadata permissions](README.md#explicit-linux-process-metadata) provide the requesting process's maps or statistics without granting another process's files. Neither is enabled by default.
+- **Linux procfs:** ordinary grants under `/proc` are rejected. Explicit read-only [self-metadata permissions](README.md#explicit-linux-process-metadata) provide the requesting process's maps, statistics or command line without granting another process's files. None is enabled by default.
 - **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.

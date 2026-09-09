@@ -54,13 +54,16 @@ fn open_path(
     pointer: u64,
     flags: Option<u64>,
 ) -> bool {
-    let mut path = [0u8; 16];
+    let mut path = [0u8; 20];
     let read = unsafe { read_child_mem(req.pid, pointer, &mut path) };
-    let file = match (read, &path) {
-        (16, b"/proc/self/maps\0") => Some(SelfProcFile::Maps),
-        (16, b"/proc/self/stat\0") => Some(SelfProcFile::Stat),
-        _ => None,
-    };
+    let read = usize::try_from(read).unwrap_or(0).min(path.len());
+    let file = [
+        (b"/proc/self/maps\0".as_slice(), SelfProcFile::Maps),
+        (b"/proc/self/stat\0".as_slice(), SelfProcFile::Stat),
+        (b"/proc/self/cmdline\0".as_slice(), SelfProcFile::Cmdline),
+    ]
+    .into_iter()
+    .find_map(|(name, file)| path[..read].starts_with(name).then_some(file));
     let Some(file) = file else {
         // CONTINUE cannot grant a racing replacement path: Landlock remains the
         // authority for every ordinary open, including all other procfs paths.

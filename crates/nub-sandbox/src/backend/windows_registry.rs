@@ -1062,7 +1062,14 @@ fn load(root: &Path) -> io::Result<RegistryFile> {
 fn save(root: &Path, file: &RegistryFile) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
     let bytes = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
-    let tmp = root.join(format!("registry-{}.tmp", now_nanos()));
+    // Every writer holds the journal lock. Reuse one staging slot so a crash
+    // before replacement cannot accumulate untracked files across invocations.
+    let tmp = root.join("registry.tmp");
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     use std::io::Write as _;
     let mut journal = std::fs::OpenOptions::new()
         .write(true)
@@ -1264,6 +1271,27 @@ pub(crate) fn test_entry(profile: &str) -> io::Result<Option<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_replacement_recovers_an_interrupted_staging_write() {
+        let root = tempfile::tempdir().unwrap();
+        let file = RegistryFile {
+            schema: SCHEMA_VERSION,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            std::fs::write(root.path().join("registry.tmp"), b"interrupted").unwrap();
+            let _lock = MutationLock::acquire(root.path()).unwrap();
+            save(root.path(), &file).unwrap();
+            assert!(load(root.path()).unwrap().entries.is_empty());
+            assert!(!root.path().join("registry.tmp").exists());
+        }
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            2,
+            "only journal and lock remain"
+        );
+    }
 
     #[cfg(windows)]
     #[test]
