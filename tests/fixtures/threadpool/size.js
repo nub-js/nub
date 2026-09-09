@@ -19,7 +19,7 @@ const out = {
   uv: process.versions.uv,
 };
 if (process.platform === "linux") {
-  fs.stat("/", () => {});
+  fs.access("/", () => {});
   const nices = [];
   let demoted = 0;
   for (const d of fs.readdirSync("/proc/self/task").map(Number).filter(Boolean).sort((a, b) => a - b)) {

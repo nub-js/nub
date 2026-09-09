@@ -1722,7 +1722,7 @@ function installVersionMarker() {
 //     would under plain Node. The markers themselves stay, which is how a nested
 //     `nub` knows to size its child again. libuv reads the variable LAZILY, at the
 //     first pool use, and a `process.env` delete reaches the C environment, so the
-//     pool is created (one `fs.stat`) before the variable goes; otherwise libuv
+//     pool is created (one `fs.access`) before the variable goes; otherwise libuv
 //     would find nothing and build Node's four. A pool of four is Node's default,
 //     so the variable goes at once and nothing is demoted.
 //  2. The threads beyond Node's four run at a lower priority on Linux, so they only
@@ -1730,8 +1730,9 @@ function installVersionMarker() {
 //     10). Measured on 16 vCPU beside twelve busy processes: the neighbours keep
 //     98.6% of their CPU instead of 92.5%, the server still gains 20% over four
 //     threads, and an idle box loses nothing. libuv creates every worker
-//     synchronously inside the first pool submit, so one `fs.stat` call makes them
-//     all exist; the new thread ids (or the `libuv-worker` name, libuv 1.50+) name
+//     synchronously inside the first pool submit, so one `fs.access` call makes
+//     them all exist (`access` never takes the io_uring path that lets stat, read
+//     and open skip the pool); the new thread ids (or the `libuv-worker` name) name
 //     them, and `os.setPriority(tid)` targets one thread on Linux. The thread ids
 //     are exact only across the call that builds the pool: the fast tier's
 //     `--require` preload runs before any pool use and builds it here, but the
@@ -1766,7 +1767,7 @@ function installThreadpoolPolicy() {
     let workers = linux ? process[THREADPOOL_WORKERS] : undefined;
     if (workers === undefined) {
       const before = linux ? new Set(tids()) : null;
-      fs.stat("/", () => {});
+      fs.access("/", () => {});
       const isWorker = (t) => {
         if (!before.has(t)) return true;
         try {
