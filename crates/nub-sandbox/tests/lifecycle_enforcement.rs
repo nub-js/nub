@@ -85,13 +85,21 @@ fn native_child() {
             assert!(std::env::var_os("SANDBOX_PARENT_SECRET").is_none());
         }
         "tooldirs" => {
+            assert_eq!(
+                PathBuf::from(std::env::var("UV_CACHE_DIR").unwrap()),
+                root.join("resolved-cache")
+            );
             for path in tool_roots(&root) {
                 let output = path.join("created");
                 std::fs::write(&output, b"tool-state").unwrap();
                 assert_eq!(std::fs::read(&output).unwrap(), b"tool-state");
                 std::fs::remove_file(&output).unwrap();
             }
-            for path in ["omitted/.ssh/key", "relocated-cache/unrelated/canary"] {
+            for path in [
+                "omitted/.ssh/key",
+                "relocated-cache/unrelated/canary",
+                "previous-cache/canary",
+            ] {
                 assert!(std::fs::read(root.join(path)).is_err());
                 assert!(std::fs::write(root.join(path), b"forbidden").is_err());
             }
@@ -189,11 +197,20 @@ fn sandbox(root: &std::path::Path, case: &str) -> Sandbox {
             ("NPM_CONFIG_GLOBAL_VIRTUAL_STORE_DIR", "relocated-store"),
             ("LOCALAPPDATA", "local-app-data"),
             ("APPDATA", "roaming-app-data"),
+            ("UV_CACHE_DIR", "previous-cache"),
         ] {
             ctx.ambient_env
                 .insert(key.into(), root.join(suffix).to_string_lossy().into());
         }
-        json!({"fs": ["./", "$tooldirs", "$tmp"], "net": false})
+        struct CachePath(PathBuf);
+        impl nub_sandbox::CommandRunner for CachePath {
+            fn run(&self, command: &str) -> Result<String, String> {
+                assert_eq!(command, "tool-cache-location");
+                Ok(self.0.to_string_lossy().into_owned())
+            }
+        }
+        ctx.runner = Box::new(CachePath(root.join("resolved-cache")));
+        json!({"fs": ["./", "$tooldirs", "$tmp"], "net": false, "vars": {"UV_CACHE_DIR": "$(tool-cache-location)"}})
     } else {
         json!({"fs": {(root.join("project").to_string_lossy()): "rw", (root.join("readable").to_string_lossy()): "r", "$tmp": "rw"}, "net": false})
     };
@@ -233,6 +250,7 @@ fn tool_roots(root: &std::path::Path) -> Vec<PathBuf> {
         "relocated-config/nub",
         "relocated-config/go",
         "relocated-store",
+        "resolved-cache",
     ];
     #[cfg(windows)]
     let roots = roots
@@ -247,10 +265,19 @@ fn tooldirs_grants_nub_storage_without_granting_its_parents() {
     for path in tool_roots(root.path()) {
         std::fs::create_dir_all(path).unwrap();
     }
-    for path in ["project", "omitted/.ssh", "relocated-cache/unrelated"] {
+    for path in [
+        "project",
+        "omitted/.ssh",
+        "relocated-cache/unrelated",
+        "previous-cache",
+    ] {
         std::fs::create_dir_all(root.path().join(path)).unwrap();
     }
-    for path in ["omitted/.ssh/key", "relocated-cache/unrelated/canary"] {
+    for path in [
+        "omitted/.ssh/key",
+        "relocated-cache/unrelated/canary",
+        "previous-cache/canary",
+    ] {
         std::fs::write(root.path().join(path), b"not-granted").unwrap();
     }
     let sandbox = sandbox(root.path(), "tooldirs");

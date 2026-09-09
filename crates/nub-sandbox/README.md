@@ -57,6 +57,8 @@ It includes SSH keys, package-manager credentials and other readable home files.
 
 The set includes package caches, stores, global installations and user-level tool state. Its members cover Nub, npm, pnpm, Yarn, Bun, pip, uv, Cargo/rustup, Go, Gradle, Maven, NuGet, Composer and Git. The [member table and environment mapping](src/compiler/builtin_sets.rs) are the implementation reference.
 
+The [versioned compatibility matrix](COMPATIBILITY.md) records tested commands and backend restrictions. A directory member is not a promise that every command works under every backend.
+
 Examples of conventional roots:
 
 | Tool | Linux | macOS | Windows |
@@ -75,7 +77,18 @@ Examples of conventional roots:
 | Composer | `~/.cache/composer`, `~/.composer`, `~/.config/composer` | `~/.composer`, `~/Library/Caches/composer`, `~/Library/Application Support/Composer` | `~/AppData/Local/Composer`, `~/AppData/Roaming/Composer` |
 | Git | `~/.config/git`, `~/.cache/git`, `~/.git-credential-cache`; files `~/.gitconfig`, `~/.gitconfig.lock`, `~/.git-credentials` | Same | Same |
 
-Documented environment locations are expanded from the compilation snapshot, including `NPM_CONFIG_CACHE`, `PNPM_HOME`, `YARN_CACHE_FOLDER`, `BUN_INSTALL`, `UV_CACHE_DIR`, `CARGO_HOME`, `GOPATH`, `GRADLE_USER_HOME`, `NUGET_PACKAGES` and `COMPOSER_HOME`. The set also includes tool-specific children of supplied XDG and Windows app-data roots. It does not execute tools, inspect PATH, parse their configuration files or scan the disk.
+Documented environment locations are expanded from the compilation snapshot, including `NPM_CONFIG_CACHE`, `PNPM_HOME`, `YARN_CACHE_FOLDER`, `BUN_INSTALL`, `UV_CACHE_DIR`, `CARGO_HOME`, `GOPATH`, `GRADLE_USER_HOME`, `NUGET_PACKAGES` and `COMPOSER_HOME`. Resolved policy environment values override that snapshot; an approved `vars` command substitution runs once, and its result determines both the child's value and its tool-directory grant. Windows environment names are case-insensitive. Granting a directory does not automatically inherit its environment variable.
+
+The set also includes tool-specific children of supplied XDG and Windows app-data roots. Expansion itself does not execute tools, inspect PATH, parse their configuration files or scan the disk.
+
+```json
+{
+  "fs": ["./", "$tooldirs", "$tmp"],
+  "vars": { "UV_CACHE_DIR": "$(cache-location)" }
+}
+```
+
+This approved-scope example explicitly invokes `cache-location`. Its output becomes the child's `UV_CACHE_DIR` and a read/write grant. Dependency-controlled configuration cannot request environment command substitution. A filesystem-root result is rejected rather than granting the whole disk.
 
 These values add grants alongside the conventional roots. They do not change the access mode selected for `$tooldirs`, and expanding a variable does not itself pass that variable to the command.
 

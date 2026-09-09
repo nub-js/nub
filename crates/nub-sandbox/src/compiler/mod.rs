@@ -427,10 +427,6 @@ fn compile_object(
         clobber::detect_env(items, "secrets", warnings);
     }
 
-    let fs = match obj.get("fs") {
-        Some(v) => fold::fold_fs(v, ctx, "fs")?,
-        None => floor_fs(),
-    };
     let mut net = match obj.get("net") {
         Some(v) => fold::fold_net(v, ctx, "net")?,
         None => floor_net(),
@@ -454,6 +450,10 @@ fn compile_object(
     // Derive the proxy posture + inspection tier (pure function of enforce/allow/brokers).
     finalize_net_inspection(&mut net);
     withhold_brokered_env(&net, &mut env, ctx);
+    let fs = match obj.get("fs") {
+        Some(v) => fold::fold_fs(v, ctx, &env, "fs")?,
+        None => floor_fs(),
+    };
     Ok(SandboxPolicy {
         fs,
         net,

@@ -18,6 +18,7 @@ use crate::policy::{
 };
 use globset::{GlobBuilder, GlobMatcher};
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 /// Naked `...` / `!...` inheritance was REMOVED in v2 (a policy is a complete
@@ -46,6 +47,26 @@ const DOWNLOADS_OBJECT_MSG: &str = "`$downloads` is a built-in host set — use 
 
 // ── fs ───────────────────────────────────────────────────────────────────────
 
+struct FsFoldCtx<'a> {
+    compile: &'a CompileCtx,
+    env: &'a EnvPolicy,
+    tool_env: OnceCell<BTreeMap<String, String>>,
+}
+
+impl FsFoldCtx<'_> {
+    fn tool_env(&self) -> &BTreeMap<String, String> {
+        self.tool_env.get_or_init(|| {
+            // Supplied locations remain available without inheriting their variables.
+            // Resolved child values override them without rerunning substitutions.
+            let mut env = self.compile.ambient_env.clone();
+            for (key, value) in &self.env.constructed {
+                defaults::insert_env(&mut env, key.clone(), value.clone());
+            }
+            env
+        })
+    }
+}
+
 /// Fold the `fs` axis value into an [`FsPolicy`]. Array entries and object keys
 /// are subtree-expanded (a bare path grants the node + `/**`); a glob-bearing
 /// pattern is emitted verbatim. Access: array grants are ReadWrite (the concise
@@ -53,7 +74,17 @@ const DOWNLOADS_OBJECT_MSG: &str = "`$downloads` is a built-in host set — use 
 /// `...:#/pointer` array entry splices another list's raw entries at its position, and
 /// (uniformly) a `...:#/pointer` OBJECT KEY splices another object's entries (see
 /// [`reuse`]); there is no implicit inheritance (naked `...` was removed).
-pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, CompileError> {
+pub fn fold_fs(
+    value: &Value,
+    ctx: &CompileCtx,
+    env: &EnvPolicy,
+    path: &str,
+) -> Result<FsPolicy, CompileError> {
+    let ctx = &FsFoldCtx {
+        compile: ctx,
+        env,
+        tool_env: OnceCell::new(),
+    };
     let mut set = FsRuleSet {
         entries: Vec::new(),
         default_effect: Effect::Deny,
@@ -180,7 +211,7 @@ fn classify_tooldirs_key(k: &str) -> ToolsKey {
 /// `Ok(false)` for a normal entry the caller then folds itself.
 fn fold_tooldirs_array_entry(
     entry: &str,
-    ctx: &CompileCtx,
+    ctx: &FsFoldCtx<'_>,
     path: &str,
     out: &mut Vec<FsRule>,
 ) -> Result<bool, CompileError> {
@@ -197,8 +228,8 @@ fn fold_tooldirs_array_entry(
             }
             out.extend(
                 builtin_sets::tooldirs_fs_rules_with_env(
-                    &ctx.homes,
-                    &ctx.ambient_env,
+                    &ctx.compile.homes,
+                    ctx.tool_env(),
                     Effect::Allow,
                     FsAccess::ReadWrite,
                 )
@@ -215,7 +246,7 @@ fn fold_tooldirs_array_entry(
 fn fold_tooldirs_object_entry(
     key: &str,
     val: &Value,
-    ctx: &CompileCtx,
+    ctx: &FsFoldCtx<'_>,
     path: &str,
     out: &mut Vec<FsRule>,
 ) -> Result<bool, CompileError> {
@@ -229,8 +260,13 @@ fn fold_tooldirs_object_entry(
         return Err(CompileError::shape(path, USER_FS_DENY_MSG));
     }
     out.extend(
-        builtin_sets::tooldirs_fs_rules_with_env(&ctx.homes, &ctx.ambient_env, effect, access)
-            .map_err(|message| CompileError::shape(path, &message))?,
+        builtin_sets::tooldirs_fs_rules_with_env(
+            &ctx.compile.homes,
+            ctx.tool_env(),
+            effect,
+            access,
+        )
+        .map_err(|message| CompileError::shape(path, &message))?,
     );
     Ok(true)
 }
@@ -242,7 +278,7 @@ fn fold_tooldirs_object_entry(
 /// A spliced `$tmp` sets the outer mode. `stack` is the reuse resolution stack for cycle detection.
 fn fold_fs_array_item(
     s: &str,
-    ctx: &CompileCtx,
+    ctx: &FsFoldCtx<'_>,
     path: &str,
     out: &mut Vec<FsRule>,
     tmp: &mut TmpMode,
@@ -251,7 +287,7 @@ fn fold_fs_array_item(
     match reuse::parse_reuse_token(s) {
         reuse::ReuseToken::Negated => return Err(CompileError::shape(path, NEGATED_REUSE_MSG)),
         reuse::ReuseToken::Pointer(ptr) => {
-            let arr = reuse::resolve_reuse_array(ctx, ptr, path, stack)?;
+            let arr = reuse::resolve_reuse_array(ctx.compile, ptr, path, stack)?;
             stack.push(ptr.to_string());
             for (j, item) in arr.iter().enumerate() {
                 // A reused entry's diagnostics point at the SOURCE list, not the splice
@@ -272,7 +308,7 @@ fn fold_fs_array_item(
     if fold_tooldirs_array_entry(s, ctx, path, out)? {
         return Ok(());
     }
-    fold_fs_array_entry(s, ctx, path, out)
+    fold_fs_array_entry(s, ctx.compile, path, out)
 }
 
 fn fold_fs_array_entry(
@@ -304,7 +340,7 @@ fn fold_fs_array_entry(
 fn fold_fs_object_item(
     key: &str,
     val: &Value,
-    ctx: &CompileCtx,
+    ctx: &FsFoldCtx<'_>,
     path: &str,
     out: &mut Vec<FsRule>,
     tmp: &mut TmpMode,
@@ -314,7 +350,7 @@ fn fold_fs_object_item(
         reuse::ReuseToken::Negated => return Err(CompileError::shape(path, NEGATED_REUSE_MSG)),
         reuse::ReuseToken::Pointer(ptr) => {
             reject_spread_value(val, path)?;
-            let obj = reuse::resolve_reuse_object(ctx, ptr, path, stack)?;
+            let obj = reuse::resolve_reuse_object(ctx.compile, ptr, path, stack)?;
             stack.push(ptr.to_string());
             for (k, v) in obj {
                 // A spliced entry's diagnostics point at the SOURCE object, not the
@@ -334,7 +370,7 @@ fn fold_fs_object_item(
     if fold_tooldirs_object_entry(key, val, ctx, path, out)? {
         return Ok(());
     }
-    fold_fs_object_entry(key, val, ctx, path, out)
+    fold_fs_object_entry(key, val, ctx.compile, path, out)
 }
 
 fn fold_fs_object_entry(

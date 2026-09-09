@@ -1,0 +1,62 @@
+# Tool compatibility
+
+The filesystem convenience set does not make every runtime compatible with every OS sandbox. This matrix records complete tested operation sequences, not a guarantee for every command a tool supports.
+
+## Test conditions
+
+The [native run at `0960f8a1b8`](https://github.com/nubjs/nub/actions/runs/34348165396) compares unconfined, explicit-path and tool-directory policies. The confined cases call the Rust engine directly with this filesystem policy:
+
+```json
+{"fs":["./","$tooldirs","$tmp"]}
+```
+
+The fixtures also grant the tested interpreter's installation files and supply its environment and network requirements. Cache roots exist before acquisition. Neither the entire home directory nor the entire filesystem is granted. The exact fixtures are [JavaScript package managers](tests/tool_functionality.rs), [Python](tests/python_tool_functionality.rs), [native toolchains](tests/native_tool_functionality.rs) and [Git](tests/git_tool_functionality.rs).
+
+## Versioned results
+
+“Pass” means both confined variants completed the sequence and the unconfined control passed. Windows native toolchains were tested on Server 2022 x86-64; the JavaScript, Python and Git suites also ran on Windows 11 arm64.
+
+| Tool version | Linux x86-64 | macOS arm64 | Windows | Tested sequence or limit |
+| --- | --- | --- | --- | --- |
+| npm 11.6.2 | Pass | Pass | Pass | Install, reinstall, installed-bin execution, user-global operations and cache maintenance, with existing cache roots. |
+| pnpm 9.15.9 / 10.18.3 / 11.26.0 | Pass | Pass | Blocked | Windows raw-runtime named-pipe access prevents completion. |
+| Yarn 1.22.22 | Blocked | Pass | Blocked | Linux process-memory inspection needs per-process procfs access; Windows IPC prevents completion. |
+| Yarn 2.4.2 / 3.8.7 / 4.17.0 | Pass | Pass | Pass | Install, reinstall and execution through the configured store. |
+| Bun 1.3.2 | Blocked | Blocked | Blocked | Installed-bin execution reports `CouldntReadCurrentDirectory`; a readable project does not grant arbitrary ancestors. |
+| Bun 1.4.0 | Blocked | Blocked | Blocked | Linux reports a JSON stack-depth error; macOS cache deletion needs a writable parent. Windows does not complete the confined sequence. |
+| pip 26.2.1 / uv 0.12.11 | Pass | Pass | Blocked | Windows private-directory ACLs and uv interpreter/trampoline access prevent completion. Unix uv also passes with its default cache location. |
+| Cargo 1.91.1 | Pass with project target | Pass | Blocked | Build and clean pass with the default project-local target on Unix. Deleting a separately granted target root requires its parent's write permission. Windows compiler subprocess access is denied. |
+| rustup 1.29.0 | Pass | Pass | Pass | Installed toolchain and home queries; this does not certify installation of every toolchain. |
+| Go 1.25.1 | Pass | Pass | Blocked | User config write/read, build, install and cache cleanup. Server passes config write/read but compilation fails opening `NUL`. |
+| Gradle 8.14 | Pass | Pass | Blocked | Offline task, repeated task and daemon cleanup. Windows lock coordination reports networking degradation, which the test rejects. |
+| Maven 3.9.11 | Pass | Pass | Pass | Offline validation and clean; both commands execute the user startup file. |
+| .NET SDK 10.0.100 / NuGet | Blocked | Blocked | Pass | Restore, build and cache cleanup. Linux CoreCLR initialization fails; macOS requires shared `/tmp` coordination outside private temp. |
+| Composer 2.8.12 | Pass | Pass | Blocked | Cold/warm install without plugins or scripts, then cache cleanup. Windows confined subprocess access is denied. |
+
+The JavaScript fixtures use Node 22.18.0. Bun 1.3.2 uses x64 emulation on Windows arm64. These are recorded versions, not minimum supported versions. Distinct pnpm and Yarn versions exercise their different storage layouts; adding a directory member does not imply that an older or newer runtime was tested.
+
+## Git
+
+The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. Windows sequences remain incomplete because of device and subprocess access restrictions.
+
+Git creates an adjacent lock file and renames it when updating global configuration. A grant on an existing file cannot substitute for parent-directory write access on Linux and Windows. For example, with `GIT_CONFIG_GLOBAL=/work/git-config/config` supplied by the embedder:
+
+```json
+{
+  "fs": {"./":"rw", "$tooldirs":"rw", "/work/git-config":"rw", "$tmp":"rw"},
+  "vars": {"PATH":true, "GIT_CONFIG_GLOBAL":true}
+}
+```
+
+The writable directory admits the lock/rename protocol without granting all of home. The same principle applies to deleting a cache or build-output root. Configuration-file-only relocations still require explicit paths.
+
+## Backend restrictions
+
+- **Linux procfs:** ordinary policy compilation cannot grant every descendant its own dynamically created `/proc/<pid>` files. A whole-procfs grant would also expose other processes and is not an automatic fallback. The exact causes of the Bun 1.4 and CoreCLR initialization failures remain unresolved in this run.
+- **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
+- **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
+- **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.
+
+## Nub build-jail coverage
+
+The build-jail frontend supplies a provisioned Node runtime and its own stdio support; it is not the same configuration as these raw engine tests. The [paired full-application run](https://github.com/nubjs/nub/actions/runs/34344382169) passes 16 framework fixtures per OS on Linux, macOS and Windows, both at `ee71d441c3` and at the exact preceding branch baseline. Each fixture includes an unconfined control, denied read/write/environment canaries and a frozen reinstall. Those results do not turn the raw-runtime failures above into passes.

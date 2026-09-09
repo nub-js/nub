@@ -3,6 +3,21 @@ use nub_sandbox::{CompileCtx, Homes, ScopeCapabilities, compile};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct ToolPathRunner {
+    path: String,
+    calls: Arc<AtomicUsize>,
+}
+
+impl nub_sandbox::CommandRunner for ToolPathRunner {
+    fn run(&self, command: &str) -> Result<String, String> {
+        assert_eq!(command, "tool-cache-location");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.path.clone())
+    }
+}
 
 fn ctx(env: &[(&str, &str)]) -> CompileCtx {
     CompileCtx::new(
@@ -89,6 +104,103 @@ fn tooldirs_adds_nonempty_documented_environment_relocations() {
         }));
     }
     assert!(!rules.iter().any(|rule| rule.contains("YARN_CACHE_FOLDER")));
+    assert!(!policy.env.constructed.contains_key("PNPM_HOME"));
+}
+
+#[test]
+fn tooldirs_uses_resolved_child_environment_once_including_reused_lists() {
+    for fs in [
+        json!(["$tooldirs"]),
+        json!({"$tooldirs": "rw"}),
+        json!(["...:#/shared/array"]),
+        json!({"...:#/shared/object": true}),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = ctx(&[("UV_CACHE_DIR", "/previous/cache")]).with_document(json!({
+            "shared": {"array": ["$tooldirs"], "object": {"$tooldirs": "rw"}}
+        }));
+        ctx.runner = Box::new(ToolPathRunner {
+            path: "/resolved/cache".into(),
+            calls: calls.clone(),
+        });
+        let policy = compile(
+            &json!({"fs": fs, "vars": {"UV_CACHE_DIR": "$(tool-cache-location)"}}),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(policy.env.constructed["UV_CACHE_DIR"], "/resolved/cache");
+        let rules: Vec<_> = policy
+            .fs
+            .rules
+            .entries
+            .iter()
+            .map(|r| r.matcher.as_str())
+            .collect();
+        assert!(
+            rules.iter().any(|p| p.contains("/resolved/cache")),
+            "{rules:?}"
+        );
+        assert!(!rules.iter().any(|p| p.contains("/previous/cache")));
+        assert!(!rules.contains(&"/resolved/**"));
+    }
+}
+
+#[test]
+fn tooldirs_keeps_substitution_scope_and_root_validation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = ctx(&[]);
+    ctx.runner = Box::new(ToolPathRunner {
+        path: "/".into(),
+        calls: calls.clone(),
+    });
+    let value = json!({"fs": ["$tooldirs"], "vars": {"UV_CACHE_DIR": "$(tool-cache-location)"}});
+    ctx.caps = ScopeCapabilities::dependency();
+    assert!(matches!(
+        compile(&value, &ctx),
+        Err(nub_sandbox::CompileError::UntrustedSubstitution { .. })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    ctx.caps = ScopeCapabilities::approved();
+    let error = compile(&value, &ctx).unwrap_err().to_string();
+    assert!(error.contains("filesystem root"), "{error}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn tooldirs_honors_case_insensitive_windows_environment_overrides() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = ctx(&[
+        ("UV_CACHE_DIR", "C:/previous/cache"),
+        ("LocalAppData", "C:/redirected/local"),
+    ]);
+    ctx.runner = Box::new(ToolPathRunner {
+        path: "C:/resolved/cache".into(),
+        calls,
+    });
+    let policy = compile(
+        &json!({"fs": ["$tooldirs"], "vars": {"uv_cache_dir": "$(tool-cache-location)"}}),
+        &ctx,
+    )
+    .unwrap();
+    let rules: Vec<_> = policy
+        .fs
+        .rules
+        .entries
+        .iter()
+        .map(|r| r.matcher.as_str())
+        .collect();
+    assert!(
+        rules.iter().any(|p| p.contains("C:/resolved/cache")),
+        "{rules:?}"
+    );
+    assert!(
+        rules
+            .iter()
+            .any(|p| p.contains("C:/redirected/local/npm-cache"))
+    );
+    assert!(!rules.iter().any(|p| p.contains("C:/previous/cache")));
 }
 
 #[test]

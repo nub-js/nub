@@ -513,6 +513,12 @@ fn env_subpaths(
 }
 
 fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
+    // Windows tool processes receive a case-insensitive environment block.
+    #[cfg(windows)]
+    let env = &env
+        .iter()
+        .map(|(key, value)| (key.to_ascii_uppercase(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut paths = BTreeSet::new();
     for name in [
         // Existing embedder cache override and neutral PM storage settings.
