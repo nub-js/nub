@@ -68,11 +68,27 @@ fn augmented_sizes_pool_to_cores() {
     // variable at first use, so a preload that hid it too early would leave four.
     if cfg!(target_os = "linux") {
         assert_eq!(
-            v["workers"].as_u64(),
-            Some(size as u64),
-            "libuv must build the installed pool: {v}"
+            v["demoted"].as_u64(),
+            Some(size.saturating_sub(4) as u64),
+            "every worker beyond four runs at nice 10: {v}"
         );
+        if names_workers(&v) {
+            assert_eq!(
+                v["workers"].as_u64(),
+                Some(size as u64),
+                "libuv must build the installed pool: {v}"
+            );
+        }
     }
+}
+
+/// libuv names its workers from 1.50 (Node 22.22+, 24+); before that the fixture
+/// can only count the demoted threads.
+fn names_workers(v: &serde_json::Value) -> bool {
+    let mut parts = v["uv"].as_str().unwrap_or("0.0").split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor) >= (1, 50)
 }
 
 /// `nub run` goes through the shared script-runner environment rather than the
@@ -385,13 +401,10 @@ fn user_value_still_inherits() {
 /// launcher hands it: the value, its augmented marker, and a compat capture saying
 /// the variable was absent before nub.
 #[cfg(target_os = "linux")]
-#[test]
-fn extra_workers_run_at_low_priority() {
+fn demotion_under_plain_node(entry: &[&std::ffi::OsStr]) -> serde_json::Value {
     let f = fixture();
-    let preload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/preload.cjs");
     let output = Command::new("node")
-        .arg("--require")
-        .arg(&preload)
+        .args(entry)
         .arg(&f)
         .current_dir(f.parent().unwrap())
         .env("UV_THREADPOOL_SIZE", "8")
@@ -415,21 +428,60 @@ fn extra_workers_run_at_low_priority() {
         "nub's value must be stripped from process.env: {v}"
     );
     assert_eq!(
-        v["workers"].as_u64(),
-        Some(8),
-        "libuv must build the sized pool: {v}"
+        v["demoted"].as_u64(),
+        Some(4),
+        "workers 5..8 must run at nice 10: {v}"
     );
-    let nices: Vec<i64> = v["nices"]
-        .as_array()
+    if names_workers(&v) {
+        assert_eq!(
+            v["workers"].as_u64(),
+            Some(8),
+            "libuv must build the sized pool: {v}"
+        );
+        let nices: Vec<i64> = v["nices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_i64().unwrap())
+            .collect();
+        assert_eq!(nices, vec![0, 0, 0, 0, 10, 10, 10, 10], "{v}");
+    }
+    v
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../runtime")
+        .join(name)
+        .canonicalize()
         .unwrap()
-        .iter()
-        .map(|n| n.as_i64().unwrap())
-        .collect();
-    assert_eq!(
-        nices,
-        vec![0, 0, 0, 0, 10, 10, 10, 10],
-        "workers 5..8 must run at nice 10"
-    );
+}
+
+/// The fast tier: the `--require` preload runs before any pool use, so its own
+/// thread-id snapshot precedes the pool.
+#[cfg(target_os = "linux")]
+#[test]
+fn extra_workers_run_at_low_priority() {
+    let preload = runtime_file("preload.cjs");
+    demotion_under_plain_node(&["--require".as_ref(), preload.as_os_str()]);
+}
+
+/// The compat tier: Node's ESM loader reads the `--import` preload through the
+/// pool, so the pool exists before that preload runs and, before libuv 1.50, its
+/// workers carry no name. The launcher's `--require` sidecar takes the snapshot
+/// first; without it nothing is demoted on the Node versions CI runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn extra_workers_run_at_low_priority_on_the_compat_tier() {
+    let sidecar = runtime_file("threadpool-snapshot.cjs");
+    let preload = format!("file://{}", runtime_file("preload.mjs").display());
+    demotion_under_plain_node(&[
+        "--require".as_ref(),
+        sidecar.as_os_str(),
+        "--import".as_ref(),
+        preload.as_ref(),
+    ]);
 }
 
 /// A user's value is never demoted: nub did not size that pool, so it does not
@@ -439,15 +491,8 @@ fn extra_workers_run_at_low_priority() {
 fn a_user_sized_pool_is_not_demoted() {
     let v = run(&[], &[("UV_THREADPOOL_SIZE", "6")]);
     assert_eq!(v["env"].as_str(), Some("6"));
-    assert_eq!(v["workers"].as_u64(), Some(6));
-    assert_eq!(
-        v["nices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|n| n.as_i64() != Some(0))
-            .count(),
-        0,
-        "{v}"
-    );
+    assert_eq!(v["demoted"].as_u64(), Some(0), "{v}");
+    if names_workers(&v) {
+        assert_eq!(v["workers"].as_u64(), Some(6), "{v}");
+    }
 }

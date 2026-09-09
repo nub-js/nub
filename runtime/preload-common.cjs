@@ -1723,8 +1723,8 @@ function installVersionMarker() {
 //     `nub` knows to size its child again. libuv reads the variable LAZILY, at the
 //     first pool use, and a `process.env` delete reaches the C environment, so the
 //     pool is created (one `fs.stat`) before the variable goes; otherwise libuv
-//     would find nothing and build Node's four. A pool of four needs neither: it is
-//     Node's default, so inheriting it is harmless and nothing is demoted.
+//     would find nothing and build Node's four. A pool of four is Node's default,
+//     so the variable goes at once and nothing is demoted.
 //  2. The threads beyond Node's four run at a lower priority on Linux, so they only
 //     take cycles nothing else on the box wants (Chromium's best-effort tier, nice
 //     10). Measured on 16 vCPU beside twelve busy processes: the neighbours keep
@@ -1732,19 +1732,29 @@ function installVersionMarker() {
 //     threads, and an idle box loses nothing. libuv creates every worker
 //     synchronously inside the first pool submit, so one `fs.stat` call makes them
 //     all exist; the new thread ids (or the `libuv-worker` name, libuv 1.50+) name
-//     them, and `os.setPriority(tid)` targets one thread on Linux.
+//     them, and `os.setPriority(tid)` targets one thread on Linux. The thread ids
+//     only work from a snapshot taken BEFORE the pool: the fast tier's `--require`
+//     preload runs before any pool use, but the compat tier's `--import` preload is
+//     itself read through the pool, so the launcher `--require`s
+//     threadpool-snapshot.cjs ahead of it to take the snapshot there.
 const THREADPOOL_ENV = "UV_THREADPOOL_SIZE";
 const THREADPOOL_MARK_ENV = "__NUB_AUGMENTED_UV_THREADPOOL_SIZE";
 const COMPAT_PRESENT_ENV = "__NUB_COMPAT_PRESENT";
 const THREADPOOL_PRESENT_BIT = 1 << 5;
 const THREADPOOL_NODE_DEFAULT = 4;
 const THREADPOOL_EXTRA_NICE = 10;
+const THREADPOOL_SNAPSHOT = Symbol.for("nub.threadpool.snapshot");
 
 function installThreadpoolPolicy() {
   const size = process.env[THREADPOOL_ENV];
   if (size === undefined || size !== process.env[THREADPOOL_MARK_ENV]) return;
   if ((Number(process.env[COMPAT_PRESENT_ENV]) || 0) & THREADPOOL_PRESENT_BIT) return;
-  if (!(Number(size) > THREADPOOL_NODE_DEFAULT)) return;
+  if (!(Number(size) > THREADPOOL_NODE_DEFAULT)) {
+    // Node's own size: nothing to demote, and libuv builds the same four whether
+    // it still finds the variable or not, so it goes at once.
+    delete process.env[THREADPOOL_ENV];
+    return;
+  }
   try {
     // The `--require` preload re-runs inside every loader worker; the pool is
     // process-wide, so only the main thread touches it.
@@ -1752,7 +1762,7 @@ function installThreadpoolPolicy() {
     const fs = require("node:fs");
     const linux = process.platform === "linux";
     const tids = () => fs.readdirSync("/proc/self/task").map(Number).filter(Boolean);
-    const before = linux ? new Set(tids()) : null;
+    const before = linux ? (process[THREADPOOL_SNAPSHOT] ?? new Set(tids())) : null;
     fs.stat("/", () => {});
     delete process.env[THREADPOOL_ENV];
     if (!linux) return;

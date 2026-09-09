@@ -3994,6 +3994,7 @@ fn prepare_preload_chain(
             } else {
                 path.to_string_lossy().into_owned()
             },
+            sidecar: None,
         }),
     )
 }
@@ -7075,8 +7076,12 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
     // observable preload order — and BEFORE the project-config preloads, so
     // those load with nub's hooks already active. Both `NODE_OPTIONS` assemblies
     // below place the token accordingly, matching the non-watch spawn order.
+    // Every token the injection carries (the compat tier's threadpool sidecar rides
+    // ahead of the preload), joined as one part; the parts are space-joined below.
     let nub_preload_token = preload_path.as_deref().map(|preload| {
-        nub_core::node::spawn::preload_injection(preload, &node.version).node_options_token()
+        nub_core::node::spawn::preload_injection(preload, &node.version)
+            .node_options_tokens()
+            .join(" ")
     });
 
     let mut node_args = vec!["--watch".to_string(), "--watch-preserve-output".to_string()];
@@ -7324,6 +7329,7 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
         let token = nub_core::node::spawn::PreloadInjection {
             flag: "--require",
             value: cleanup_preload.to_string(),
+            sidecar: None,
         }
         .node_options_token();
 

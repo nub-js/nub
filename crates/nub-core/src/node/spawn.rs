@@ -1255,7 +1255,15 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             ));
         }
         if let Some(ref inj) = injection {
-            node_opts_parts.push(inj.node_options_token());
+            // At most one `--require` and one `--import` survive a consumer that
+            // re-parses NODE_OPTIONS by flag name (Next.js, vercel/next.js#96582),
+            // and PnP's `--require` outranks the sidecar's: beside PnP the compat
+            // tier forgoes the sidecar rather than risk PnP's token.
+            if config.pnp.is_some() {
+                node_opts_parts.push(inj.node_options_token());
+            } else {
+                node_opts_parts.extend(inj.node_options_tokens());
+            }
         }
         // Project-config `nodeOptions` entries are quoted like every other value nub
         // writes here. The CLI-side validator rejects whitespace and NUL but NOT a
@@ -2216,8 +2224,12 @@ pub fn compute_augmentation_env(
             "--require={}",
             node_options_token(&pnp.display().to_string())
         ));
+        // Same rule as the direct-spawn site: PnP's `--require` outranks the
+        // threadpool sidecar's, so beside PnP the compat tier forgoes the sidecar.
+        node_opts_parts.push(injection.node_options_token());
+    } else {
+        node_opts_parts.extend(injection.node_options_tokens());
     }
-    node_opts_parts.push(injection.node_options_token());
     // Quoted for the same reason as the direct-spawn site: the CLI validator lets a
     // double quote through, and an unmatched one aborts Node's NODE_OPTIONS parse.
     node_opts_parts.extend(
@@ -3291,6 +3303,13 @@ pub struct PreloadInjection {
     pub flag: &'static str,
     /// The injected value: a raw path for `--require`, a `file://` URL for `--import`.
     pub value: String,
+    /// A `--require` sidecar that runs before the preload: the compat tier on Linux
+    /// carries `runtime/threadpool-snapshot.cjs`, because the `--import` preload is
+    /// read through the very threadpool the policy needs to see being built (see
+    /// that file). Its own NODE_OPTIONS token, ahead of the preload's, and never part
+    /// of the re-entrancy key: a consumer that re-parses NODE_OPTIONS by flag name
+    /// may drop it, which costs the demotion and nothing else.
+    pub sidecar: Option<String>,
 }
 
 impl PreloadInjection {
@@ -3306,6 +3325,16 @@ impl PreloadInjection {
     /// still round-trips.
     pub fn node_options_token(&self) -> String {
         format!("{}={}", self.flag, node_options_token(&self.value))
+    }
+
+    /// Every token nub writes for this injection: the sidecar's `--require`, when
+    /// there is one, then [`Self::node_options_token`].
+    pub fn node_options_tokens(&self) -> Vec<String> {
+        self.sidecar
+            .iter()
+            .map(|path| format!("--require={}", node_options_token(path)))
+            .chain(std::iter::once(self.node_options_token()))
+            .collect()
     }
 }
 
@@ -3367,7 +3396,7 @@ fn is_nub_preload_entry(value: &str) -> bool {
         return false;
     };
     match file {
-        "preload.mjs" | "preload.cjs" => {
+        "preload.mjs" | "preload.cjs" | THREADPOOL_SNAPSHOT_SIDECAR => {
             is_nub_runtime_dir(parent.rsplit('/').next().unwrap_or_default())
         }
         // The chainer nub synthesizes into `<preload root>/node_modules/.nub/`.
@@ -3528,6 +3557,7 @@ fn preload_injection_for(
     preload_mjs: &str,
     version: &super::version::NodeVersion,
     windows: bool,
+    linux: bool,
 ) -> PreloadInjection {
     if version.supports_augmentation() {
         // Sibling .cjs in the same runtime dir. `--require` resolves a plain path
@@ -3540,21 +3570,38 @@ fn preload_injection_for(
         PreloadInjection {
             flag: "--require",
             value: cjs,
+            sidecar: None,
         }
     } else {
+        // The threadpool policy's thread-id snapshot has to precede the pool, which
+        // the ESM loader builds while reading this very preload; a `--require` runs
+        // first (`PreloadInjection::sidecar`). Only where the policy demotes: Linux.
+        let sidecar = linux
+            .then(|| preload_mjs.strip_suffix("preload.mjs"))
+            .flatten()
+            .map(|dir| format!("{dir}{THREADPOOL_SNAPSHOT_SIDECAR}"));
         PreloadInjection {
             flag: "--import",
             value: to_file_url(preload_mjs, windows),
+            sidecar,
         }
     }
 }
+
+/// The compat tier's `--require` sidecar, a sibling of the preload (see the file).
+const THREADPOOL_SNAPSHOT_SIDECAR: &str = "threadpool-snapshot.cjs";
 
 /// Public wrapper over [`preload_injection_for`] for the current platform.
 pub fn preload_injection(
     preload_mjs: &str,
     version: &super::version::NodeVersion,
 ) -> PreloadInjection {
-    preload_injection_for(preload_mjs, version, cfg!(windows))
+    preload_injection_for(
+        preload_mjs,
+        version,
+        cfg!(windows),
+        cfg!(target_os = "linux"),
+    )
 }
 
 /// SUPERSEDED — no longer on the spawn path. `nub.jsonc` `preload` entries are now
@@ -3646,6 +3693,7 @@ fn user_preload_injection_for(
         return PreloadInjection {
             flag: "--require",
             value: spec.to_string(),
+            sidecar: None,
         };
     }
     PreloadInjection {
@@ -3659,6 +3707,7 @@ fn user_preload_injection_for(
         } else {
             spec.to_string()
         },
+        sidecar: None,
     }
 }
 
@@ -4053,6 +4102,16 @@ mod tests {
         assert!(
             rest.contains("runtime/preload.cjs") && rest.contains("preload-chain.mjs"),
             "nub's own tokens must be forwarded verbatim: {rest}"
+        );
+        // The compat tier's threadpool sidecar is nub's own too.
+        let (rest, req, imp) = split_inherited_preloads(
+            "--require=/nub/runtime/threadpool-snapshot.cjs --import=file:///nub/runtime/preload.mjs --require /a.cjs",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert!(imp.is_empty());
+        assert!(
+            rest.contains("threadpool-snapshot.cjs") && rest.contains("runtime/preload.mjs"),
+            "the sidecar must be forwarded verbatim: {rest}"
         );
 
         // A value with a space survives the round-trip through the tokenizer.
@@ -6271,7 +6330,7 @@ mod tests {
         // Fast tier (>= 22.15): `--require` the sibling CJS preload by raw PATH
         // (require does not accept a file:// URL). This is the channel that keeps
         // Node's synchronous CJS entry path (the R1 fix).
-        let fast = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false);
+        let fast = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false, false);
         assert_eq!(fast.flag, "--require");
         assert_eq!(fast.value, "/opt/nub/runtime/preload.cjs");
         assert_eq!(
@@ -6279,23 +6338,52 @@ mod tests {
             "--require=/opt/nub/runtime/preload.cjs"
         );
 
+        // On Linux the compat tier carries the threadpool sidecar as its own
+        // `--require` token ahead of the preload; the fast tier never does (its
+        // `--require` preload takes the snapshot itself), and the re-entrancy key
+        // stays the preload's token alone.
+        let compat_linux = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false, true);
+        assert_eq!(
+            compat_linux.sidecar.as_deref(),
+            Some("/opt/nub/runtime/threadpool-snapshot.cjs")
+        );
+        assert_eq!(
+            compat_linux.node_options_tokens(),
+            vec![
+                "--require=/opt/nub/runtime/threadpool-snapshot.cjs",
+                "--import=file:///opt/nub/runtime/preload.mjs"
+            ]
+        );
+        assert_eq!(
+            compat_linux.node_options_token(),
+            "--import=file:///opt/nub/runtime/preload.mjs"
+        );
+        let fast_linux = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false, true);
+        assert!(fast_linux.sidecar.is_none());
+        assert_eq!(
+            fast_linux.node_options_tokens(),
+            vec![fast_linux.node_options_token()]
+        );
+        assert!(fast.sidecar.is_none(), "no sidecar on the fast tier");
+
         // A clearly-fast version too (24.x).
-        let fast24 = preload_injection_for(mjs, &NodeVersion::new(24, 0, 0), false);
+        let fast24 = preload_injection_for(mjs, &NodeVersion::new(24, 0, 0), false, false);
         assert_eq!(fast24.flag, "--require");
         assert_eq!(fast24.value, "/opt/nub/runtime/preload.cjs");
 
         // Compat tier (< 22.15): `--import` the ESM preload by file:// URL — the
         // async path stays unchanged.
-        let compat = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false);
+        let compat = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false, false);
         assert_eq!(compat.flag, "--import");
         assert_eq!(compat.value, "file:///opt/nub/runtime/preload.mjs");
+        assert!(compat.sidecar.is_none(), "no sidecar off Linux");
         assert_eq!(
             compat.node_options_token(),
             "--import=file:///opt/nub/runtime/preload.mjs"
         );
 
         // The 22.14.x boundary stays on the compat (import) channel.
-        let boundary = preload_injection_for(mjs, &NodeVersion::new(22, 14, 99), false);
+        let boundary = preload_injection_for(mjs, &NodeVersion::new(22, 14, 99), false, false);
         assert_eq!(boundary.flag, "--import");
 
         // 23.0–23.4 sorts above 22.15 but predates `registerHooks` on the 23.x line
@@ -6307,7 +6395,7 @@ mod tests {
             NodeVersion::new(23, 4, 0),
             NodeVersion::new(23, 4, 99),
         ] {
-            let injection = preload_injection_for(mjs, &pre, false);
+            let injection = preload_injection_for(mjs, &pre, false, false);
             assert_eq!(
                 injection.flag, "--import",
                 "Node {pre} has no sync registerHooks and must use the compat preload"
@@ -6316,7 +6404,7 @@ mod tests {
         }
 
         // 23.5.0 is the 23.x line's fast floor — the release that added registerHooks.
-        let fast235 = preload_injection_for(mjs, &NodeVersion::new(23, 5, 0), false);
+        let fast235 = preload_injection_for(mjs, &NodeVersion::new(23, 5, 0), false, false);
         assert_eq!(fast235.flag, "--require");
         assert_eq!(fast235.value, "/opt/nub/runtime/preload.cjs");
     }
