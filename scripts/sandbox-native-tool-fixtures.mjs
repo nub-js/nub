@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /** Provision the pinned native tool matrix used by native_tool_functionality.rs. */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { delimiter, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const root = resolve(process.env.NUB_SANDBOX_NATIVE_TOOL_ROOT ?? '.sandbox-native-tool-fixtures');
@@ -90,7 +90,12 @@ async function installComposer() {
   mkdirSync(composerRoot, { recursive: true });
   const phar = join(composerRoot, 'composer.phar');
   await downloadChecked(`https://getcomposer.org/download/${pins.composer}/composer.phar`, `https://getcomposer.org/download/${pins.composer}/composer.phar.sha256sum`, 'sha256', phar);
-  return { php: find('php'), phar, root: composerRoot };
+  const php = find('php');
+  const config = JSON.parse(output(php, ['-r', 'echo json_encode([php_ini_loaded_file(), php_ini_scanned_files()]);']));
+  const configRoots = config.filter(Boolean).flatMap(value => value.split(/,\s*/))
+    .map(value => value.trim()).filter(Boolean)
+    .flatMap(file => [dirname(file), dirname(realpathSync(file))]);
+  return { php, phar, root: composerRoot, configRoots: [...new Set(configRoots)] };
 }
 function entry(name, program, args, toolRoot, { prefix = [], runtimeRoots = [], toolEnv = {}, mavenSeed } = {}) {
   const version = output(program, [...prefix, ...args], { env: { ...process.env, ...toolEnv } });
@@ -116,7 +121,7 @@ const matrix = [
   entry('gradle', jvm.gradle.program, ['--version'], jvm.gradle.root, { runtimeRoots, toolEnv: runtimeEnv }),
   entry('maven', jvm.maven.program, ['--version'], jvm.maven.root, { runtimeRoots, toolEnv: runtimeEnv, mavenSeed: jvm.maven.seedRepository }),
   entry('nuget', dotnet, ['--info'], process.env.DOTNET_ROOT, { runtimeRoots, toolEnv: runtimeEnv }),
-  entry('composer', composer.php, ['--version'], composer.root, { prefix: [composer.phar], runtimeRoots: [resolve(composer.php, '..')] }),
+  entry('composer', composer.php, ['--version'], composer.root, { prefix: [composer.phar], runtimeRoots: [resolve(composer.php, '..'), ...composer.configRoots] }),
 ];
 const matrixFile = join(root, 'matrix.json');
 writeFileSync(matrixFile, `${JSON.stringify(matrix, null, 2)}\n`);

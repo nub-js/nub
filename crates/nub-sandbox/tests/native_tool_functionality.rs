@@ -52,7 +52,7 @@ fn fixture() -> tempfile::TempDir {
         .prefix("sandbox-native-tool-")
         .tempdir_in(parent)
         .expect("fixture root");
-    for path in ["home", "home/.m2", "project", "cache", "tmp"] {
+    for path in ["home", "home/.m2", "project/java-tmp", "cache", "tmp"] {
         std::fs::create_dir_all(root.path().join(path)).expect("fixture directory");
     }
     root
@@ -104,7 +104,11 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
     env.insert("GOSUMDB".into(), "off".into());
     env.insert(
         "JAVA_TOOL_OPTIONS".into(),
-        format!("-Djava.io.tmpdir={}", root.join("tmp").display()),
+        format!(
+            "-Djava.io.tmpdir={} -Duser.home={}",
+            root.join("project/java-tmp").display(),
+            home.display()
+        ),
     );
     env.extend(tool.tool_env.clone());
     if let Some(seed) = &tool.maven_seed {

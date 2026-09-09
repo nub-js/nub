@@ -504,6 +504,7 @@ fn run_uv_operations(
     root: &Path,
     env: &BTreeMap<String, String>,
     policy: Option<&nub_sandbox::SandboxPolicy>,
+    expected_cache: &Path,
 ) {
     let wheel = tool.wheel.to_string_lossy().into_owned();
     let python = tool.python.to_string_lossy().into_owned();
@@ -587,7 +588,7 @@ fn run_uv_operations(
         ),
     );
     let cache = invoke(tool, &["cache", "dir"], root, env, policy);
-    assert_cache_path(tool, &cache, env.get("UV_CACHE_DIR").expect("uv cache env"));
+    assert_cache_path(tool, &cache, expected_cache.to_str().unwrap());
     assert_success(
         tool,
         "configured cache prune",
@@ -596,13 +597,20 @@ fn run_uv_operations(
 }
 
 fn run_tool_control(name: &str, label: &str, tooldirs: Option<bool>) {
-    let tool = tool(name);
+    let tool = tool(if name == "uv-default" { "uv" } else { name });
     let root = fixture();
-    let paths = configured_paths(root.path());
+    let mut paths = configured_paths(root.path());
+    if name == "uv-default" {
+        paths.uv_cache = root.path().join("home/.cache/uv");
+    }
     // Existing configured roots are a native-backend precondition. A separate report records
     // absent-root behavior rather than treating it as a normal-operation pass.
     initialize_configured_roots(&paths);
-    let env = env_for(root.path(), &tool, &paths);
+    let mut env = env_for(root.path(), &tool, &paths);
+    if name == "uv-default" {
+        env.remove("UV_CACHE_DIR");
+        env.remove("XDG_CACHE_HOME");
+    }
     let policy =
         tooldirs.map(|tooldirs| grant_policy(&tool, root.path(), &paths, env.clone(), tooldirs));
     eprintln!(
@@ -611,7 +619,9 @@ fn run_tool_control(name: &str, label: &str, tooldirs: Option<bool>) {
     );
     match name {
         "pip" => run_pip_operations(&tool, root.path(), &env, policy.as_ref()),
-        "uv" => run_uv_operations(&tool, root.path(), &env, policy.as_ref()),
+        "uv" | "uv-default" => {
+            run_uv_operations(&tool, root.path(), &env, policy.as_ref(), &paths.uv_cache)
+        }
         _ => unreachable!("tool matrix was validated above"),
     }
 }
@@ -632,3 +642,20 @@ python_tool_test!(pip_tooldirs, "pip", "$tooldirs", Some(true));
 python_tool_test!(uv_unconfined, "uv", "unconfined", None);
 python_tool_test!(uv_exact_grants, "uv", "exact", Some(false));
 python_tool_test!(uv_tooldirs, "uv", "$tooldirs", Some(true));
+
+#[cfg(unix)]
+python_tool_test!(
+    uv_default_cache_unconfined,
+    "uv-default",
+    "unconfined",
+    None
+);
+#[cfg(unix)]
+python_tool_test!(uv_default_cache_exact, "uv-default", "exact", Some(false));
+#[cfg(unix)]
+python_tool_test!(
+    uv_default_cache_tooldirs,
+    "uv-default",
+    "$tooldirs",
+    Some(true)
+);

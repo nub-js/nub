@@ -108,9 +108,10 @@ fn tree_size(root: &Path) -> (u64, u64) {
 fn native_session_costs_and_unique_policy_churn() {
     let binary = std::env::current_exe().unwrap();
     let digest = Sha256::digest(std::fs::read(&binary).unwrap());
+    let hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     println!(
         "SANDBOX_COST_BINARY {}",
-        json!({"path": binary, "sha256": format!("{digest:x}"), "debug_assertions": cfg!(debug_assertions)})
+        json!({"path": binary, "sha256": hash, "debug_assertions": cfg!(debug_assertions)})
     );
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

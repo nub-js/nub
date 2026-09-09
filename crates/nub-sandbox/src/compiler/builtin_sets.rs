@@ -1,8 +1,8 @@
 //! The built-in `$`-sets the compiler expands in place: `$trusted` (a curated network
 //! host allowlist) and `$downloads` (the install-time artifact hosts) on the net axis,
 //! `$tooldirs` (the per-OS package-manager / toolchain cache+store dirs) on the fs axis.
-//! All are ORDINARY last-match-wins entries — a set expands at its authored position and
-//! a later rule can override any member, like a `...:#/pointer`-reused list's entries.
+//! Network sets expand at their authored position under last-match-wins rules.
+//! Positive filesystem grants combine; a later read-only grant cannot revoke write access.
 //!
 //! Provenance / curation:
 //! - `$trusted` derives from the Claude Code default-allowed-domains list, filtered by a
@@ -342,6 +342,8 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     // Python
     "~/Library/Caches/pip",
     "~/Library/Caches/uv",
+    "~/.cache/uv",
+    "~/Library/Application Support/uv",
     "~/Library/Application Support/pip",
     "~/.config/pip",
     "~/.pip",
@@ -511,6 +513,8 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         "UV_TOOL_BIN_DIR",
         "UV_PYTHON_INSTALL_DIR",
         "UV_PYTHON_BIN_DIR",
+        "UV_INSTALL_DIR",
+        "UV_PROJECT_ENVIRONMENT",
         "CARGO_HOME",
         "RUSTUP_HOME",
         "CARGO_TARGET_DIR",
@@ -576,6 +580,10 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     );
     env_subpaths(env, "XDG_STATE_HOME", &["pnpm"], &mut paths);
     env_path(env, "XDG_BIN_HOME", &mut paths);
+    // uv falls back to this executable directory when XDG_BIN_HOME is absent.
+    if let Some(root) = env.get("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        paths.insert(format!("{root}/../bin"));
+    }
     // A redirected Windows profile is not represented by Homes, so use the
     // embedder-approved environment rather than assuming ~/AppData defaults.
     #[cfg(windows)]
@@ -941,6 +949,7 @@ mod tests {
             assert!(paths.contains(&cache.join(tool)));
         }
         assert!(paths.contains(&data.join("pip")));
+        assert!(paths.contains(&data.join("../bin")));
         assert!(paths.contains(&config.join("yarn")));
         for root in [&cache, &data, &config] {
             assert!(!paths.contains(root));
@@ -955,6 +964,8 @@ mod tests {
         #[cfg(target_os = "macos")]
         let expected = [
             "~/Library/Caches/pnpm",
+            "~/.cache/uv",
+            "~/Library/Application Support/uv",
             "~/.local/state/pnpm",
             "~/Library/Python",
             "~/Library/Caches/go-build",
