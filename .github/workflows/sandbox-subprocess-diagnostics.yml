@@ -6,6 +6,7 @@ on:
     paths:
       - crates/nub-sandbox/tests/windows_subprocess_diagnostics.rs
       - crates/nub-sandbox/tests/tool_functionality.rs
+      - crates/nub-sandbox/src/**
       - .github/workflows/sandbox-subprocess-diagnostics.yml
 
 permissions:
@@ -59,7 +60,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo clippy -p nub-sandbox --profile fast --test windows_subprocess_diagnostics --test tool_functionality -- -D warnings 2>&1 | tee reports/clippy.log
+          cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings 2>&1 | tee reports/clippy.log
+      - name: Checking explicit adapter composition
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib reusable_node_options -- --nocapture 2>&1 | tee reports/adapter-composition.log
       - name: Comparing subprocess startup operations
         shell: bash
         run: |

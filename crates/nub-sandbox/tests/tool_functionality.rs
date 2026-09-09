@@ -404,7 +404,11 @@ fn grant_policy(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let fs = if tooldirs {
+    policy(root, grant_fs(tool, root, cache, global, tooldirs), &env)
+}
+
+fn grant_fs(tool: &Tool, root: &Path, cache: &Path, global: &Path, tooldirs: bool) -> Value {
+    if tooldirs {
         let mut entries = Map::new();
         entries.insert("$tooldirs".into(), Value::String("rw".into()));
         entries.insert(
@@ -430,8 +434,7 @@ fn grant_policy(
             grants.push((&yarn_home, "rw"));
         }
         exact_grants(&grants)
-    };
-    policy(root, fs, &env)
+    }
 }
 
 fn assert_success(tool: &Tool, phase: &str, output: &Output) {
@@ -664,7 +667,7 @@ tool_controls!(
 );
 
 #[cfg(windows)]
-fn run_node_adapter_control(name: &str, tooldirs: bool) {
+fn run_node_adapter_control(name: &str, tooldirs: bool, cache_parent: bool) {
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -676,22 +679,26 @@ fn run_node_adapter_control(name: &str, tooldirs: bool) {
     project_manifest(root.path());
     let canary = root.path().join("outside-secret");
     std::fs::write(&canary, "DENIED_CANARY").unwrap();
-    let mut policy = grant_policy(tool, root.path(), &cache, &global, &env, tooldirs);
-    // Deliberate opt-in to the existing Node adapters, not backend auto-detection.
-    // The build-jail helper also carries its userland network gate; this fixture's
-    // OS policy already denies networking and never installs a registry package.
-    let options = format!(
-        "{} {}",
-        nub_sandbox::windows_build_jail_node_options(None, None),
-        nub_sandbox::realpath_shim_node_options(&[
-            root.path().join("project"),
-            cache,
-            global,
-            root.path().join("home/.yarn"),
-            tool.tool_root.clone(),
-            tool.runtime_root.clone(),
-        ])
-    );
+    let mut fs = grant_fs(tool, root.path(), &cache, &global, tooldirs);
+    if cache_parent {
+        fs.as_object_mut().unwrap().insert(
+            cache.parent().unwrap().to_string_lossy().into_owned(),
+            Value::String("rw".into()),
+        );
+    }
+    let env: Vec<_> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut policy = policy(root.path(), fs, &env);
+    let options = nub_sandbox::windows_node_compat_options(&[
+        root.path().join("project"),
+        cache,
+        global,
+        root.path().join("home/.yarn"),
+        tool.tool_root.clone(),
+        tool.runtime_root.clone(),
+    ]);
     policy
         .env
         .constructed
@@ -750,7 +757,6 @@ fn run_node_adapter_control(name: &str, tooldirs: bool) {
     } else {
         ["cache", "clean"]
     };
-    assert_success(tool, "adapted cache prune", &run(args(tool, &prune)));
     let check = format!(
         "const fs=require('node:fs');try{{fs.readFileSync({});process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}};console.log('CANARY_DENIED')",
         serde_json::to_string(&canary).unwrap()
@@ -758,6 +764,29 @@ fn run_node_adapter_control(name: &str, tooldirs: bool) {
     let output = run(vec!["-e".into(), check]);
     assert_success(tool, "adapted canary denial", &output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("CANARY_DENIED"));
+    let output = run(args(tool, &prune));
+    if tool.kind == "yarn1" && !cache_parent {
+        // Yarn deletes its cache root before recreating it. A root-only grant
+        // must not silently become a writable-parent grant to accommodate that.
+        assert!(
+            !output.status.success(),
+            "root-only Yarn cache cleanup unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("EPERM") && stderr.contains("mkdir"),
+            "{stderr}"
+        );
+        assert!(!root.path().join("cache/yarn1").exists());
+    } else {
+        assert_success(tool, "adapted cache prune", &output);
+        // Continue using the SAME session after cache-root replacement.
+        assert_success(
+            tool,
+            "adapted reinstall after prune",
+            &run(args(tool, &install)),
+        );
+    }
     sandbox.close();
     nub_sandbox::cleanup().expect("adapted idle resources are reclaimed");
 }
@@ -773,12 +802,12 @@ macro_rules! node_adapter_controls {
         #[test]
         #[ignore = "requires the pinned native tool matrix"]
         fn $exact() {
-            run_node_adapter_control($tool, false);
+            run_node_adapter_control($tool, false, false);
         }
         #[test]
         #[ignore = "requires the pinned native tool matrix"]
         fn $tooldirs() {
-            run_node_adapter_control($tool, true);
+            run_node_adapter_control($tool, true, false);
         }
     };
 }
@@ -811,6 +840,20 @@ node_adapter_controls!(
     windows_node_adapter_yarn1_exact,
     windows_node_adapter_yarn1_tooldirs
 );
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn windows_node_adapter_yarn1_explicit_cache_parent() {
+    run_node_adapter_control("yarn1", false, true);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn windows_node_adapter_yarn1_tooldirs_with_cache_parent() {
+    run_node_adapter_control("yarn1", true, true);
+}
 
 #[test]
 #[ignore = "requires the pinned native tool matrix"]

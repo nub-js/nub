@@ -606,6 +606,29 @@ pub fn windows_build_jail_node_options(
     build_jail_node_options(package_name, package_version)
 }
 
+/// Explicit Node compatibility preloads for a Windows sandbox session.
+///
+/// Pass the result as the policy's constructed `NODE_OPTIONS` before acquisition.
+/// This adapts subprocess streams and realpath traversal without adding filesystem
+/// grants or the build jail's package-specific network gate. The OS policy remains
+/// the security boundary. Requires Node 18.18+ or 19+ (`--import`).
+///
+/// `roots` must name the caller's granted anchors and interpreter installation.
+/// The realpath adapter preserves dependency symlink resolution, but the main entry
+/// uses `--preserve-symlinks-main`: callers should supply its resolved path. Stream
+/// adaptation buffers synchronous output and rejects advanced IPC serialization
+/// and handle passing. This is opt-in, not unchanged raw Node execution.
+#[cfg(windows)]
+pub fn windows_node_compat_options(roots: &[std::path::PathBuf]) -> String {
+    format!(
+        "{} {}",
+        data_url_import(&strip_js_comments(WINDOWS_STDIO_SHIM)),
+        realpath_shim_node_options(roots)
+    )
+    .trim_end()
+    .to_owned()
+}
+
 /// Both build-jail preloads on one `NODE_OPTIONS`, as two `--import` terms.
 ///
 /// ORDER IS NOT SIGNIFICANT, AND ONE THING IS WHAT MAKES THAT TRUE. Both shims patch the same
@@ -1425,6 +1448,27 @@ mod tests {
                 "whole-line comments must be gone from every delivered payload"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reusable_node_options_include_only_explicit_compatibility_preloads() {
+        let stdio = data_url_import(&strip_js_comments(WINDOWS_STDIO_SHIM));
+        assert_eq!(windows_node_compat_options(&[]), stdio);
+        let roots = vec![std::path::PathBuf::from(r"C:\sandbox fixture\project")];
+        let options = windows_node_compat_options(&roots);
+        assert_eq!(
+            options,
+            format!("{stdio} {}", realpath_shim_node_options(&roots))
+        );
+        assert_eq!(
+            options
+                .split_whitespace()
+                .filter(|word| *word == "--import")
+                .count(),
+            2
+        );
+        assert!(options.encode_utf16().count() < 26_000);
     }
 
     #[test]
