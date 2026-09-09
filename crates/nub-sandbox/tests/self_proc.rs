@@ -356,10 +356,11 @@ mod linux {
         use sha2::{Digest, Sha256};
         assert!(!cfg!(debug_assertions), "measure a release binary");
         let exe = std::env::current_exe().unwrap();
-        println!(
-            "SELF_PROC_BINARY {}",
-            json!({"path": exe, "sha256": format!("{:x}", Sha256::digest(std::fs::read(&exe).unwrap()))})
-        );
+        let hash: String = Sha256::digest(std::fs::read(&exe).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        println!("SELF_PROC_BINARY {}", json!({"path": exe, "sha256": hash}));
         for files in [&[][..], &["maps", "stat"][..]] {
             let (root, sandbox) = fixture(files);
             for sample in 0..12 {

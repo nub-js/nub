@@ -52,6 +52,8 @@ The [fixture](tests/tool_functionality.rs) retains both cache-grant variants. Th
 
 The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. Windows sequences remain incomplete because of device and subprocess access restrictions.
 
+An [installation-closure test](https://github.com/nubjs/nub/actions/runs/34408888398) adds explicit read access to the entire known Git installation. This does not repair the Windows Git/LFS sequences. The [startup controls](https://github.com/nubjs/nub/actions/runs/34409754352) distinguish direct Git from its bundled MSYS shell: direct Git runs in all seven descriptor configurations on Windows 11 arm64, while the shell exits with `0xC0000005` even for a builtin-only command. On Server 2022, Git reports denied `/dev/null` access and shell startup exits with `0xC0000142`. Every plain control passes and every confined denied-file canary remains inaccessible. These results establish the failure stage, not the immediate cause of the Windows 11 access violation.
+
 Git creates an adjacent lock file and renames it when updating global configuration. A grant on an existing file cannot substitute for parent-directory write access on Linux and Windows. For example, with `GIT_CONFIG_GLOBAL=/work/git-config/config` supplied by the embedder:
 
 ```json
@@ -101,6 +103,8 @@ The parent sandbox launcher can supply an existing handle; it cannot make an unm
 The [Windows 11 run](https://github.com/nubjs/nub/actions/runs/34405367987), at `04566d64c9`, exercises native toolchains separately from the Server results above. Cargo 1.91.1, Go 1.25.1 and Composer 2.8.12 pass their complete exact-grant and tool-directory sequences, as do their plain controls. Maven 3.9.11 and rustup 1.29.1 also pass. Gradle passes with the explicitly acknowledged network limitation; its two strict-policy cases refuse preparation.
 
 The runner is Windows 11 arm64. Cargo, Go and the JVM use x64 emulation with x64 MSVC libraries; .NET uses the ARM64 host. These results are not Server results or an all-ARM64 toolchain test. The .NET workload's `global.json` pins SDK 10.0.100, while the original provisioning metadata lists the runner's other installed SDKs too. Installing an SDK alone does not select it for a project.
+
+The [SDK-selection run](https://github.com/nubjs/nub/actions/runs/34407256061), at `f5d73291ad`, asserts `dotnet --version` is exactly `10.0.100` inside each plain, explicit-grant and tool-directory fixture. All three restore/build/cache-cleanup sequences pass.
 
 ## Nub build-jail coverage
 

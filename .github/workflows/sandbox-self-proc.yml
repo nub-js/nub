@@ -57,6 +57,7 @@ jobs:
         with:
           dotnet-version: '10.0.100'
       - name: Provisioning pinned Linux tool controls
+        id: tools
         if: runner.os == 'Linux'
         run: |
           node scripts/sandbox-tool-fixtures.mjs > reports/provision.log 2>&1
@@ -70,14 +71,14 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as f: f.write(f'NUB_SANDBOX_NATIVE_TOOL_MATRIX_FILE={matrix}\n')
           PY
       - name: Exercising plain Linux runtime controls
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.tools.outcome == 'success' }}
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality yarn1_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/yarn-plain.log
           cargo test -p nub-sandbox --profile fast --test tool_functionality bun140_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/bun-plain.log
           cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_unconfined -- --ignored --nocapture 2>&1 | tee reports/dotnet-plain.log
       - name: Exercising explicit metadata grants with real tools
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.tools.outcome == 'success' }}
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/js-tools.log
