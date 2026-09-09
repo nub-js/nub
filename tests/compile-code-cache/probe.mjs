@@ -86,6 +86,15 @@ if (expectCache) assert.match(cold.result.stderr, /V8 code cache for ESM .*cache
 run("warm");
 run("disabled", { NODE_DISABLE_COMPILE_CACHE: "1" });
 run("portable", { NODE_COMPILE_CACHE: path.join(root, "portable"), NODE_COMPILE_CACHE_PORTABLE: "1" });
+const readOnly = path.join(root, "read-only");
+const readOnlyTagged = path.join(readOnly, path.basename(cold.data.cache));
+fs.mkdirSync(readOnlyTagged, { recursive: true });
+run("read-only", { NODE_COMPILE_CACHE: readOnly, NODE_COMPILE_CACHE_READONLY: "1" });
+assert.equal(fs.readdirSync(readOnlyTagged).some((name) => name.startsWith(".nub-")), false);
+const [targetMajor, targetMinor] = target.split(".").map(Number);
+if (targetMajor > 26 || (targetMajor === 26 && targetMinor >= 8)) {
+  assert.deepEqual(fs.readdirSync(readOnlyTagged), [], "read-only execution wrote cache files");
+}
 run("different-flags", { NODE_OPTIONS: "--jitless" });
 fs.writeFileSync(path.join(root, "not-a-directory"), "cache unavailable");
 run("unwritable-cache", { NODE_COMPILE_CACHE: path.join(root, "not-a-directory") });

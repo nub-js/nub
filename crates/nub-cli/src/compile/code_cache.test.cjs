@@ -9,6 +9,8 @@ const { createHash } = require("node:crypto");
 const { zstdCompressSync, zstdDecompressSync, constants } = require("node:zlib");
 
 const supported = Number(process.versions.node.split(".")[0]) >= 24;
+const [major, minor] = process.versions.node.split(".").map(Number);
+const readOnlySupported = major > 26 || (major === 26 && minor >= 8);
 const generator = path.join(__dirname, "code_cache_generate.cjs");
 const installer = fs.readFileSync(path.join(__dirname, "code_cache_install.cjs"), "utf8");
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("NODE_") && !key.startsWith("__NUB_")));
@@ -84,6 +86,7 @@ test("source changes use Node's normal source-validation fallback", { skip: !sup
 for (const [name, extra, flags] of [
   ["disabled", { NODE_DISABLE_COMPILE_CACHE: "1" }, []],
   ["portable", { NODE_COMPILE_CACHE_PORTABLE: "1" }, []],
+  ["read-only", { NODE_COMPILE_CACHE_READONLY: "1" }, []],
   ["different V8 flags", {}, ["--no-lazy"]],
 ]) {
   test(`${name} skips packaged caches`, { skip: !supported }, (t) => {
@@ -93,6 +96,27 @@ for (const [name, extra, flags] of [
     assert.equal(all.some((name) => name.includes(`.nub-${f.id}`)), false);
   });
 }
+
+test("read-only caches remain unchanged even when their directory is writable", { skip: !readOnlySupported }, (t) => {
+  const f = fixture(t);
+  const prepare = spawnSync(process.execPath, ["-p", "require('node:module').getCompileCacheDir()"], {
+    env: { ...env, NODE_COMPILE_CACHE: f.cache }, encoding: "utf8",
+  });
+  assert.equal(prepare.status, 0, prepare.stderr);
+  const directory = prepare.stdout.trim();
+  assert.ok(fs.statSync(directory).isDirectory());
+  const sentinel = path.join(directory, "sentinel");
+  fs.writeFileSync(sentinel, "existing cache");
+  const snapshot = () => fs.readdirSync(directory).sort().map((name) => {
+    const file = path.join(directory, name);
+    return [name, createHash("sha256").update(fs.readFileSync(file)).digest("hex"), fs.statSync(file).mtimeMs];
+  });
+  const before = snapshot();
+  const directoryTime = fs.statSync(directory).mtimeMs;
+  assert.match(f.run({ NODE_COMPILE_CACHE_READONLY: "1" }).stdout.toString(), /^2000 /);
+  assert.deepEqual(snapshot(), before);
+  assert.equal(fs.statSync(directory).mtimeMs, directoryTime);
+});
 
 test("a missing cache pack leaves program execution intact", { skip: !supported }, (t) => {
   const f = fixture(t);

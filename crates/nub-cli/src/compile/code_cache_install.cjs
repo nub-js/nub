@@ -4,7 +4,8 @@
 (function (packName, packId, version, arch, tag) {
   try {
     if (process.version !== version || process.arch !== arch ||
-        process.env.NODE_COMPILE_CACHE_PORTABLE === "1") return;
+        process.env.NODE_COMPILE_CACHE_PORTABLE === "1" ||
+        process.env.NODE_COMPILE_CACHE_READONLY === "1") return;
     const getBuiltin = process[Symbol.for("nub.compile.bootstrap")].getBuiltin;
     const cacheDir = getBuiltin("node:module").getCompileCacheDir?.();
     if (!cacheDir || getBuiltin("node:v8").cachedDataVersionTag() !== tag) return;

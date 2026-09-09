@@ -122,7 +122,7 @@ Large, native-target extracted artifacts on Node 24 and later carry eagerly comp
 
 The [[crates/nub-cli/src/compile/code_cache.rs#attach|cache builder]] runs the target Node in a separate process. It compiles modules without linking or evaluating them, restores normal V8 flags before serializing, and packages the caches as one compressed asset. The bootstrap installs them atomically into Node's ordinary cache before the ESM graph loads; later starts check a completion marker.
 
-The cache requires the same Node version, architecture, and V8 flags. Disabled or portable caches, an unwritable cache directory, and missing or incompatible data fall back to source loading. SEA, inline, `--smol`, and cross-target artifacts do not use this optimization.
+The cache requires the same Node version, architecture, and V8 flags. Disabled, portable, or read-only caches, an unwritable cache directory, and missing or incompatible data skip packaged-cache installation. Node retains its normal source-loading fallback. SEA, inline, `--smol`, and cross-target artifacts do not use this optimization.
 
 The pack remains compressed in the extracted tree and is decompressed only when seeding a new cache. Builds include it when ESM sources total at least 256 KiB. Bytecode increases the executable and cache sizes in exchange for avoiding repeated compilation; application code is never evaluated during the build.
 

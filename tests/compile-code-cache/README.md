@@ -18,7 +18,7 @@ The fixture covers:
 
 For a merge-base control, pass `--expect-cache false`. The same program must still produce identical results, without a packaged-cache completion marker.
 
-The lower-level tests exercise cache relocation, source validation, damaged packs, and reproducible generation:
+The lower-level tests exercise cache relocation, source validation, damaged packs, reproducible generation, and read-only caches with writable directories on Node 26.8 or later:
 
 ```sh
 node --test ../../crates/nub-cli/src/compile/code_cache.test.cjs
