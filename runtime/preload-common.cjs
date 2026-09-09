@@ -1733,17 +1733,18 @@ function installVersionMarker() {
 //     synchronously inside the first pool submit, so one `fs.stat` call makes them
 //     all exist; the new thread ids (or the `libuv-worker` name, libuv 1.50+) name
 //     them, and `os.setPriority(tid)` targets one thread on Linux. The thread ids
-//     only work from a snapshot taken BEFORE the pool: the fast tier's `--require`
-//     preload runs before any pool use, but the compat tier's `--import` preload is
-//     itself read through the pool, so the launcher `--require`s
-//     threadpool-snapshot.cjs ahead of it to take the snapshot there.
+//     are exact only across the call that builds the pool: the fast tier's
+//     `--require` preload runs before any pool use and builds it here, but the
+//     compat tier's `--import` preload is itself read through the pool, so the
+//     launcher `--require`s threadpool-snapshot.cjs ahead of it to build the pool
+//     and record its threads there.
 const THREADPOOL_ENV = "UV_THREADPOOL_SIZE";
 const THREADPOOL_MARK_ENV = "__NUB_AUGMENTED_UV_THREADPOOL_SIZE";
 const COMPAT_PRESENT_ENV = "__NUB_COMPAT_PRESENT";
 const THREADPOOL_PRESENT_BIT = 1 << 5;
 const THREADPOOL_NODE_DEFAULT = 4;
 const THREADPOOL_EXTRA_NICE = 10;
-const THREADPOOL_SNAPSHOT = Symbol.for("nub.threadpool.snapshot");
+const THREADPOOL_WORKERS = Symbol.for("nub.threadpool.workers");
 
 function installThreadpoolPolicy() {
   const size = process.env[THREADPOOL_ENV];
@@ -1762,21 +1763,24 @@ function installThreadpoolPolicy() {
     const fs = require("node:fs");
     const linux = process.platform === "linux";
     const tids = () => fs.readdirSync("/proc/self/task").map(Number).filter(Boolean);
-    const before = linux ? (process[THREADPOOL_SNAPSHOT] ?? new Set(tids())) : null;
-    fs.stat("/", () => {});
+    let workers = linux ? process[THREADPOOL_WORKERS] : undefined;
+    if (workers === undefined) {
+      const before = linux ? new Set(tids()) : null;
+      fs.stat("/", () => {});
+      const isWorker = (t) => {
+        if (!before.has(t)) return true;
+        try {
+          return fs.readFileSync(`/proc/self/task/${t}/comm`, "latin1").trim() === "libuv-worker";
+        } catch {
+          return false;
+        }
+      };
+      if (linux) workers = tids().filter(isWorker);
+    }
     delete process.env[THREADPOOL_ENV];
     if (!linux) return;
     const os = require("node:os");
-    const isWorker = (t) => {
-      if (!before.has(t)) return true;
-      try {
-        return fs.readFileSync(`/proc/self/task/${t}/comm`, "latin1").trim() === "libuv-worker";
-      } catch {
-        return false;
-      }
-    };
-    const workers = tids().filter(isWorker).sort((a, b) => a - b);
-    for (const t of workers.slice(THREADPOOL_NODE_DEFAULT)) {
+    for (const t of workers.sort((a, b) => a - b).slice(THREADPOOL_NODE_DEFAULT)) {
       try {
         os.setPriority(t, THREADPOOL_EXTRA_NICE);
       } catch {}

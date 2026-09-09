@@ -3305,8 +3305,8 @@ pub struct PreloadInjection {
     pub value: String,
     /// A `--require` sidecar that runs before the preload: the compat tier on Linux
     /// carries `runtime/threadpool-snapshot.cjs`, because the `--import` preload is
-    /// read through the very threadpool the policy needs to see being built (see
-    /// that file). Its own NODE_OPTIONS token, ahead of the preload's, and never part
+    /// read through the very threadpool the policy needs to build itself (see that
+    /// file). Its own NODE_OPTIONS token, ahead of the preload's, and never part
     /// of the re-entrancy key: a consumer that re-parses NODE_OPTIONS by flag name
     /// may drop it, which costs the demotion and nothing else.
     pub sidecar: Option<String>,
@@ -3573,9 +3573,9 @@ fn preload_injection_for(
             sidecar: None,
         }
     } else {
-        // The threadpool policy's thread-id snapshot has to precede the pool, which
-        // the ESM loader builds while reading this very preload; a `--require` runs
-        // first (`PreloadInjection::sidecar`). Only where the policy demotes: Linux.
+        // The threadpool policy has to build the pool itself to know its threads,
+        // and the ESM loader builds it while reading this very preload; a `--require`
+        // runs first (`PreloadInjection::sidecar`). Only where the policy demotes: Linux.
         let sidecar = linux
             .then(|| preload_mjs.strip_suffix("preload.mjs"))
             .flatten()
