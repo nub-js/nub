@@ -533,6 +533,39 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     operations(name, &tool, root.path(), &env, policy.as_ref());
 }
 
+fn cargo_project_target(tooldirs: Option<bool>) {
+    let tool = tool("cargo");
+    eprintln!(
+        "NATIVE TOOL {} {} default project target",
+        tool.name, tool.version
+    );
+    let root = fixture();
+    let mut env = env_for(root.path(), &tool);
+    env.remove("CARGO_TARGET_DIR");
+    write_projects(root.path());
+    let policy = tooldirs.map(|value| policy(root.path(), &tool, env.clone(), value));
+    operations("cargo", &tool, root.path(), &env, policy.as_ref());
+    assert!(!root.path().join("project/target").exists());
+}
+
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn cargo_default_target_unconfined() {
+    cargo_project_target(None);
+}
+
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn cargo_default_target_exact() {
+    cargo_project_target(Some(false));
+}
+
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn cargo_default_target_tooldirs() {
+    cargo_project_target(Some(true));
+}
+
 macro_rules! tool_cases {
     ($name:literal, $u:ident, $e:ident, $d:ident) => {
         #[test]

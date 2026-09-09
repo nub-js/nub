@@ -3560,8 +3560,9 @@ pub(super) mod launch {
     }
 
     /// Reopen the journaled object even when the caller moved or replaced its name.
-    /// A missing ID is conclusive only when the filesystem supports this lookup;
-    /// access denied (including delete-pending) and unsupported lookups are errors.
+    /// A missing ID is conclusive only when the filesystem supports this lookup.
+    /// Access denied and unsupported lookups remain errors; even delete-pending
+    /// objects can reopen successfully and must have their identities checked.
     pub(super) fn open_recorded_acl_file(
         path: &Path,
         expected: &str,
@@ -3612,12 +3613,15 @@ pub(super) mod launch {
                 Err(_) => continue,
             };
             let hint_id = object_handle_id(hint.as_raw_handle())?;
-            if hint_id
+            let hint_parts = hint_id
                 .split(':')
-                .next()
-                .and_then(|part| part.parse::<u32>().ok())
-                != Some(*volume)
-            {
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)?;
+            let [hint_volume, hint_high, hint_low] = hint_parts.as_slice() else {
+                return Err(io::Error::other("unsupported sandbox ACL volume identity"));
+            };
+            if hint_volume != volume {
                 continue;
             }
             let mut filesystem = [0u16; 32];
@@ -3635,9 +3639,10 @@ pub(super) mod launch {
                 )
             } == 0
             {
+                let error = io::Error::last_os_error();
                 return Err(acl_error(
                     format!("GetVolumeInformationByHandleW hint {}", ancestor.display()),
-                    io::Error::last_os_error(),
+                    error,
                 ));
             }
             let len = filesystem
@@ -3667,6 +3672,86 @@ pub(super) mod launch {
             };
             if raw == INVALID_HANDLE_VALUE {
                 let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(87) {
+                    // An ACL-access-specific failure is not evidence of deletion.
+                    // Zero desired access is the documented existence-only open.
+                    let present = unsafe {
+                        OpenFileById(
+                            hint.as_raw_handle(),
+                            &descriptor,
+                            0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            std::ptr::null(),
+                            FILE_FLAG_BACKUP_SEMANTICS,
+                        )
+                    };
+                    if present != INVALID_HANDLE_VALUE {
+                        let file = unsafe { std::fs::File::from_raw_handle(present) };
+                        let found = object_handle_id(file.as_raw_handle())?;
+                        return Err(acl_error(
+                            format!("OpenFileById ACL access failed for existing ID {found}"),
+                            error,
+                        ));
+                    }
+                    let existence_error = io::Error::last_os_error();
+                    if !matches!(existence_error.raw_os_error(), Some(2 | 3 | 87)) {
+                        return Err(acl_error("OpenFileById existence check", existence_error));
+                    }
+                    if hint_id == expected {
+                        return Err(acl_error(
+                            "recorded ACL object is still the live volume hint",
+                            error,
+                        ));
+                    }
+                    // NTFS also reports INVALID_PARAMETER for a retired file ID.
+                    // Do not confuse that with an unsupported call: keep every
+                    // parameter identical except the ID, reopen the live volume
+                    // hint, and verify the returned object before retiring a record.
+                    let control = FILE_ID_DESCRIPTOR {
+                        Anonymous: FILE_ID_DESCRIPTOR_0 {
+                            FileId: ((u64::from(*hint_high) << 32) | u64::from(*hint_low)) as i64,
+                        },
+                        ..descriptor
+                    };
+                    #[cfg(test)]
+                    let control = if std::env::var("__NUB_WINDOWS_REPLACEMENT_FIXTURE").as_deref()
+                        == Ok("lookup-control-failure")
+                    {
+                        FILE_ID_DESCRIPTOR {
+                            dwSize: 0,
+                            ..control
+                        }
+                    } else {
+                        control
+                    };
+                    let control_raw = unsafe {
+                        OpenFileById(
+                            hint.as_raw_handle(),
+                            &control,
+                            0x0002_0000 | 0x0004_0000,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            std::ptr::null(),
+                            FILE_FLAG_BACKUP_SEMANTICS,
+                        )
+                    };
+                    if control_raw == INVALID_HANDLE_VALUE {
+                        let control_error = io::Error::last_os_error();
+                        return Err(acl_error(
+                            format!(
+                                "OpenFileById live control ID {hint_id}, hint {} after retired ID {expected}: {error}",
+                                ancestor.display()
+                            ),
+                            control_error,
+                        ));
+                    }
+                    let control_file = unsafe { std::fs::File::from_raw_handle(control_raw) };
+                    if object_handle_id(control_file.as_raw_handle())? != hint_id {
+                        return Err(io::Error::other(
+                            "sandbox ACL live-control lookup returned a different identity",
+                        ));
+                    }
+                    return Ok(None);
+                }
                 return if matches!(error.raw_os_error(), Some(2 | 3)) {
                     Ok(None)
                 } else {

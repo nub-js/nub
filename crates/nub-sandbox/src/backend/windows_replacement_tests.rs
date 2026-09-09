@@ -159,15 +159,53 @@ fn lookup_states(root: &Path) {
         "{}",
         std::io::Error::last_os_error()
     );
-    // Keep the named handle open to distinguish delete-pending from a completed
-    // unlink. Neither failure is classified as missing by this evidence probe.
-    assert!(lookup("delete-pending", false).is_err());
+    // Native Windows can still reopen this object while the named handle is
+    // held. Record either outcome; the lookup validates and closes every handle.
+    let _pending = lookup("delete-pending", false);
     drop(held);
     assert!(lookup("deleted", false).is_err());
-    eprintln!(
-        "FILE_ID_RECOVERY deleted={:?}",
-        super::launch::open_recorded_acl_file(&path, &expected)
+    let recovered = super::launch::open_recorded_acl_file(&path, &expected);
+    eprintln!("FILE_ID_RECOVERY deleted={recovered:?}");
+    assert!(recovered.unwrap().is_none());
+
+    let directory = root.join("retired-directory");
+    std::fs::create_dir(&directory).unwrap();
+    let directory_id = windows_registry::object_id(&directory).unwrap().unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    let recovered = super::launch::open_recorded_acl_file(&directory, &directory_id);
+    eprintln!("FILE_ID_RECOVERY deleted-directory={recovered:?}");
+    assert!(recovered.unwrap().is_none());
+}
+
+fn lookup_control_failure(root: &Path) {
+    let path = root.join("package.json");
+    let identity =
+        windows_registry::PolicyIdentity::new([path.clone()], [], [], None, false, false)
+            .unwrap()
+            .with_objects([path.clone()])
+            .unwrap();
+    let mut resource = windows_registry::acquire(identity).unwrap();
+    let profile = resource.entry.profile_name.clone();
+    resource
+        .record_mutation(windows_registry::AclMutation {
+            path: path.display().to_string(),
+            kind: windows_registry::AclKind::Subtree,
+            access: 0x0012_0089,
+        })
+        .unwrap();
+    let expected = resource.entry.object_ids.clone();
+    super::launch::test_set_profile_ace(&profile, &path, true).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    drop(resource);
+    let error = cleanup_resources().unwrap_err();
+    assert!(
+        error.to_string().contains("OpenFileById live control"),
+        "{error}"
     );
+    let retained = windows_registry::test_entry(&profile).unwrap().unwrap();
+    assert_eq!(retained.state, windows_registry::EntryState::RecoveryNeeded);
+    assert_eq!(retained.object_ids, expected);
+    assert!(!retained.mutations.is_empty());
 }
 
 fn replace(root: &Path, value: &str) {
@@ -468,6 +506,7 @@ fn windows_replacement_fixture() {
         "crash" => crash_recovery(&root),
         "binding" => opened_object_binding(&root),
         "lookup-states" => lookup_states(&root),
+        "lookup-control-failure" => lookup_control_failure(&root),
         "fault" => {
             let _resource = plan(&root, "hold").acquire().unwrap();
             panic!("fault was not reached");
@@ -516,4 +555,9 @@ fn windows_recorded_object_lookup_and_acl_write_need_only_file_owner_access() {
 #[test]
 fn windows_recorded_object_lookup_distinguishes_link_and_deletion_states() {
     isolated("lookup-states");
+}
+
+#[test]
+fn windows_recorded_object_lookup_keeps_ownership_when_live_control_fails() {
+    isolated("lookup-control-failure");
 }
