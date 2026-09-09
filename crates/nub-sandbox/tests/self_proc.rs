@@ -354,7 +354,9 @@ mod linux {
     #[ignore = "serialized release measurement with plain and unchanged-policy controls"]
     fn metadata_costs() {
         use sha2::{Digest, Sha256};
-        assert!(!cfg!(debug_assertions), "measure a release binary");
+        if cfg!(debug_assertions) {
+            panic!("measure a release binary");
+        }
         let exe = std::env::current_exe().unwrap();
         let hash: String = Sha256::digest(std::fs::read(&exe).unwrap())
             .iter()

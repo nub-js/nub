@@ -1666,7 +1666,11 @@ pub(super) mod launch {
             kind != AclKind::Object,
             kind != AclKind::Object,
         );
-        if optional { Ok(()) } else { result }
+        if optional {
+            Ok(())
+        } else {
+            acquisition_step("file-grant", result)
+        }
     }
 
     /// See [`super::windows_object_traverse_ace`].
@@ -2136,6 +2140,17 @@ pub(super) mod launch {
         }
     }
 
+    fn acquisition_step<T>(stage: &str, result: io::Result<T>) -> io::Result<T> {
+        result.inspect_err(|error| {
+            tracing::warn!(stage, %error, "sandbox resource acquisition failed");
+            #[cfg(test)]
+            eprintln!(
+                "WINDOWS_ACQUIRE_ERROR {} {stage}: {error:?}",
+                std::process::id()
+            );
+        })
+    }
+
     impl AppContainerLaunch {
         #[cfg(test)]
         pub(crate) fn acquire(self) -> io::Result<WindowsResource> {
@@ -2147,10 +2162,16 @@ pub(super) mod launch {
             retained: &BTreeMap<String, WindowsLease>,
         ) -> io::Result<WindowsResource> {
             if let Some(env) = self.env.as_mut() {
-                ensure_appcontainer_environment(env)?;
+                acquisition_step("environment", ensure_appcontainer_environment(env))?;
             }
-            let identity = timed("resource_identity", || reusable_identity(&self))?;
-            let window_objects = crate::backend::windows_ace::current_objects()?;
+            let identity = acquisition_step(
+                "identity",
+                timed("resource_identity", || reusable_identity(&self)),
+            )?;
+            let window_objects = acquisition_step(
+                "window-objects",
+                crate::backend::windows_ace::current_objects(),
+            )?;
             if let Some(lease) = retained.get(&identity.hash) {
                 let same_windows = timed("resource_cache_hit", || {
                     super::windows_registry::validate_entry(&lease._state._lease.entry)?;
@@ -2163,47 +2184,65 @@ pub(super) mod launch {
             // An equivalent retained resource already passed this check. Repeating
             // it on a hit would rewrite the protected registry DACL per grant.
             for path in self.read_grants.iter().chain(&self.write_grants) {
-                super::windows_registry::reject_registry_grant(path)?;
+                acquisition_step(
+                    "registry-grant",
+                    super::windows_registry::reject_registry_grant(path),
+                )?;
             }
-            let _operation = super::windows_registry::OperationLock::acquire("resources")?;
-            recover_idle_resources(false, true)?;
+            let _operation = acquisition_step(
+                "resource-lock",
+                super::windows_registry::OperationLock::acquire("resources"),
+            )?;
+            acquisition_step("idle-recovery", recover_idle_resources(false, true))?;
             let ancestors = if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_some() {
                 Vec::new()
             } else {
                 ancestor_chain(&self, None)
             };
-            let identity = identity.with_objects(
-                self.read_grants
-                    .iter()
-                    .chain(&self.write_grants)
-                    .chain(&self.read_node_grants)
-                    .chain(&ancestors)
-                    .cloned(),
+            let identity = acquisition_step(
+                "object-identities",
+                identity.with_objects(
+                    self.read_grants
+                        .iter()
+                        .chain(&self.write_grants)
+                        .chain(&self.read_node_grants)
+                        .chain(&ancestors)
+                        .cloned(),
+                ),
             )?;
-            let mut resource = super::windows_registry::acquire(identity)?;
+            let mut resource = acquisition_step(
+                "registry-acquire",
+                super::windows_registry::acquire(identity),
+            )?;
             if !resource.fresh {
-                super::windows_registry::validate_entry(&resource.entry)?;
+                acquisition_step(
+                    "entry-validation",
+                    super::windows_registry::validate_entry(&resource.entry),
+                )?;
             }
             let name = resource.entry.profile_name.clone();
             let sid = SidGuard(if resource.fresh {
-                create_appcontainer(&name)?
+                acquisition_step("profile-create", create_appcontainer(&name))?
             } else {
-                derive_appcontainer(&name)?
+                acquisition_step("profile-derive", derive_appcontainer(&name))?
             });
             let ac_sid = sid.0;
-            let profile_folder = appcontainer_folder(ac_sid)?;
+            let profile_folder = acquisition_step("profile-folder", appcontainer_folder(ac_sid))?;
             #[cfg(test)]
             test_crash_transition("profile-created", &name, &profile_folder);
             let private_tmp = self.private_tmp.then(|| profile_folder.join("Temp"));
             if resource.fresh {
-                resource.record_private_path(&profile_folder)?;
+                acquisition_step(
+                    "profile-journal",
+                    resource.record_private_path(&profile_folder),
+                )?;
                 if let Some(path) = &private_tmp {
                     resource.record_mutation(super::windows_registry::AclMutation {
                         path: path.to_string_lossy().into_owned(),
                         kind: super::windows_registry::AclKind::PrivateProfile,
                         access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
                     })?;
-                    std::fs::create_dir_all(path)?;
+                    acquisition_step("profile-temp-create", std::fs::create_dir_all(path))?;
                     #[cfg(test)]
                     test_crash_transition("private-root-created", &name, &profile_folder);
                     grant_recorded_ace(
@@ -2222,8 +2261,14 @@ pub(super) mod launch {
             // Window objects are session-local, whereas profiles are user-global.
             // Journal each session's station/desktop before changing either DACL.
             for object in &window_objects {
-                resource.record_window_object(object.clone())?;
-                crate::backend::windows_ace::grant_persistent(object, ac_sid)?;
+                acquisition_step(
+                    "window-journal",
+                    resource.record_window_object(object.clone()),
+                )?;
+                acquisition_step(
+                    "window-grant",
+                    crate::backend::windows_ace::grant_persistent(object, ac_sid),
+                )?;
             }
 
             if resource.fresh {
@@ -2241,7 +2286,10 @@ pub(super) mod launch {
                             kind: super::windows_registry::AclKind::PrivateProfile,
                             access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
                         })?;
-                        std::fs::create_dir_all(&path)?;
+                        acquisition_step(
+                            "redirected-profile-create",
+                            std::fs::create_dir_all(&path),
+                        )?;
                         grant_recorded_ace(
                             &mut resource,
                             &path,
