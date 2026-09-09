@@ -583,6 +583,123 @@ fn run_tool_control(name: &str, control: ToolControl) {
     run_global_install_and_cache_prune(tool, root.path(), &env, policy.as_ref());
 }
 
+#[cfg(target_os = "linux")]
+fn run_self_proc_tool(name: &str, tooldirs: bool) {
+    let tools = tools();
+    let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+    let root = fixture();
+    let (cache, global, env) = tool_env(tool, root.path());
+    for path in [&cache, &global, &root.path().join("home/.yarn")] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    fixture_package(root.path());
+    project_manifest(root.path());
+    let canary = root.path().join("outside-secret");
+    std::fs::write(&canary, "DENIED_CANARY").unwrap();
+    let mut fs = grant_fs(tool, root.path(), &cache, &global, tooldirs);
+    // Cache cleanup removes/recreates the configured cache root. This is an
+    // explicit dedicated parent grant, not a widening of $tooldirs.
+    fs[cache.parent().unwrap().to_string_lossy().as_ref()] = json!("rw");
+    fs["/proc/self/maps"] = json!("r");
+    fs["/proc/self/stat"] = json!("r");
+    let env_refs: Vec<_> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let policy = policy(root.path(), fs, &env_refs);
+    let sandbox = Sandbox::acquire(&policy).unwrap();
+    let run = |argv: Vec<String>| {
+        eprintln!(
+            "SELF_PROC {} {} {argv:?}",
+            tool.name,
+            if tooldirs { "$tooldirs" } else { "exact" }
+        );
+        let prepared = sandbox
+            .prepare(
+                CommandSpec::new(&tool.program)
+                    .args(argv)
+                    .cwd(root.path().join("project"))
+                    .redact_stdout(true)
+                    .redact_stderr(true),
+            )
+            .unwrap();
+        assert!(
+            prepared.degradation.lost.is_empty(),
+            "{:?}",
+            prepared.degradation
+        );
+        tool_output::output(prepared)
+    };
+    for _ in 0..2 {
+        assert_success(
+            tool,
+            "retained install",
+            &run(args(tool, &["install", "--ignore-scripts"])),
+        );
+    }
+    let bin = if tool.kind == "bun" {
+        vec!["x", "--no-install", "fixture-bin"]
+    } else {
+        vec!["run", "fixture-bin"]
+    };
+    let output = run(args(tool, &bin));
+    assert_success(tool, "installed bin", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture-bin-ok"));
+    let package = root.path().join("project/package").display().to_string();
+    let global = if tool.kind == "bun" {
+        vec!["install".into(), "--global".into(), package]
+    } else {
+        vec!["global".into(), "add".into(), package]
+    };
+    assert_success(tool, "global install", &run(args_owned(tool, &global)));
+    let prune = if tool.kind == "bun" {
+        vec!["pm", "cache", "rm"]
+    } else {
+        vec!["cache", "clean"]
+    };
+    assert_success(tool, "cache prune", &run(args(tool, &prune)));
+    assert_success(
+        tool,
+        "retained reinstall after prune",
+        &run(args(tool, &["install", "--ignore-scripts"])),
+    );
+    let script = format!(
+        "const fs=require('fs');for(const p of [{},'/proc/self/environ','/proc/{}/environ']){{try{{fs.readFileSync(p);process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}}}};console.log('CANARY_DENIED')",
+        serde_json::to_string(&canary).unwrap(),
+        std::process::id()
+    );
+    let output = run(vec!["-e".into(), script]);
+    assert_success(tool, "canaries after repeated commands", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CANARY_DENIED"));
+    sandbox.close();
+    nub_sandbox::cleanup().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned native tools"]
+fn linux_self_proc_yarn1_exact() {
+    run_self_proc_tool("yarn1", false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned native tools"]
+fn linux_self_proc_yarn1_tooldirs() {
+    run_self_proc_tool("yarn1", true);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned native tools"]
+fn linux_self_proc_bun140_exact() {
+    run_self_proc_tool("bun140", false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned native tools"]
+fn linux_self_proc_bun140_tooldirs() {
+    run_self_proc_tool("bun140", true);
+}
+
 macro_rules! tool_controls {
     ($tool:literal, $unconfined:ident, $exact:ident, $tooldirs:ident) => {
         #[test]

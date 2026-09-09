@@ -29,7 +29,11 @@
 #![allow(dead_code)]
 
 use crate::matcher::path::PathMatcher;
+use crate::policy::SelfProcFile;
 use crate::policy::{Effect, FsAccess, FsRuleSet};
+use std::collections::BTreeSet;
+
+mod self_proc;
 use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;
@@ -159,6 +163,8 @@ const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 const OFF_NR: u32 = 0;
 const OFF_ARCH: u32 = 4;
 const OFF_ARG0: u32 = 16;
+#[cfg(target_arch = "x86_64")]
+const OFF_ARG1: u32 = 24;
 const OFF_ARG2: u32 = 32; // args[2] = 16 + 2*8; the openat flags word
 
 // Supervisor-created DGRAM sockets are pinned into this descriptor window so the
@@ -263,7 +269,7 @@ const WRITE_INTENT_NRS: &[libc::c_long] = &[
 /// window. When `write_broker` is set, the write-intent syscalls above are also notified —
 /// `openat` gated on its flags carrying a write bit — so the deny-inside-allow broker can
 /// mediate them; otherwise those syscalls are never trapped and cost nothing.
-fn notifier_program(write_broker: bool) -> Vec<seccompiler::sock_filter> {
+fn notifier_program(write_broker: bool, self_proc: bool) -> Vec<seccompiler::sock_filter> {
     let nr = |n: libc::c_long| n as u32;
     let ld = BPF_LD | BPF_W | BPF_ABS;
     let jeq = BPF_JMP | BPF_JEQ | BPF_K;
@@ -311,6 +317,32 @@ fn notifier_program(write_broker: bool) -> Vec<seccompiler::sock_filter> {
         Ins::Jump(jeq, nr(libc::SYS_recvmsg), "dnscheck", "n8"),
         Ins::Label("n8"),
     ];
+    if self_proc {
+        p.push(Ins::Jump(
+            jeq,
+            nr(libc::SYS_openat),
+            "proc_openat_flags",
+            "proc_openat2",
+        ));
+        p.push(Ins::Label("proc_openat2"));
+        p.push(Ins::Jump(
+            jeq,
+            nr(libc::SYS_openat2),
+            "notify",
+            "proc_legacy",
+        ));
+        p.push(Ins::Label("proc_legacy"));
+        #[cfg(target_arch = "x86_64")]
+        {
+            p.push(Ins::Jump(
+                jeq,
+                nr(libc::SYS_open),
+                "proc_open_flags",
+                "proc_end",
+            ));
+            p.push(Ins::Label("proc_end"));
+        }
+    }
     if write_broker {
         // `openat` routes to the flags check; the rest go straight to the notifier.
         p.push(Ins::Jump(
@@ -340,6 +372,22 @@ fn notifier_program(write_broker: bool) -> Vec<seccompiler::sock_filter> {
         p.push(Ins::Stmt(ld, OFF_ARG2));
         p.push(Ins::Stmt(BPF_ALU | BPF_AND | BPF_K, write_open_mask()));
         p.push(Ins::Jump(jeq, 0, "allow", "notify"));
+    }
+    if self_proc {
+        let mut flags = |label, offset| {
+            p.push(Ins::Label(label));
+            p.push(Ins::Stmt(ld, offset));
+            p.push(Ins::Stmt(BPF_ALU | BPF_AND | BPF_K, write_open_mask()));
+            p.push(Ins::Jump(
+                jeq,
+                0,
+                "notify",
+                if write_broker { "notify" } else { "allow" },
+            ));
+        };
+        flags("proc_openat_flags", OFF_ARG2);
+        #[cfg(target_arch = "x86_64")]
+        flags("proc_open_flags", OFF_ARG1);
     }
     // shared return tail — placed LAST so every jump above reaches it forward.
     p.push(Ins::Label("notify"));
@@ -411,6 +459,7 @@ struct SkEntry {
 }
 
 struct SupState {
+    self_proc: BTreeSet<SelfProcFile>,
     allow_all: bool,
     allow: Vec<String>,
     /// The full fs policy the write broker enforces. `Some` ⇒ the broker is THE write-intent
@@ -517,6 +566,7 @@ impl SupState {
 impl SupState {
     fn new(policy: EgressPolicy) -> Self {
         Self {
+            self_proc: policy.self_proc,
             allow_all: policy.allow_all,
             allow: policy.allow,
             write_matcher: policy
@@ -1472,6 +1522,10 @@ fn supervisor(listener: OwnedFd, mut state: SupState, control: Arc<WorkerControl
         let nr = req.data.nr as libc::c_long;
         let cfd = req.data.args[0] as i32;
 
+        if !state.self_proc.is_empty() && self_proc::handle_open(&state, nfd, &req) {
+            continue;
+        }
+
         // Write-intent syscalls: the deny-inside-allow broker. Only reached when the filter was
         // built with the write branch (a policy carried carve-outs), so this is inert for the
         // build jail.
@@ -1883,6 +1937,7 @@ fn supervisor(listener: OwnedFd, mut state: SupState, control: Arc<WorkerControl
 /// The egress allowlist plus (for a supervised launch that confines the filesystem) the full fs
 /// policy the write broker enforces.
 pub struct EgressPolicy {
+    pub self_proc: BTreeSet<SelfProcFile>,
     pub allow_all: bool,
     pub allow: Vec<String>,
     /// `Some` ⇒ arm the write broker as THE write-intent authority, enforcing this whole fs
@@ -2169,7 +2224,7 @@ pub(super) fn spawn_supervised_with_ready(
 ) -> io::Result<SupervisedChild> {
     // Built in the PARENT and copied into the child by `fork`; the child installs it without
     // allocating. The write-intent dispatch is present only when the policy carries carve-outs.
-    let filter = notifier_program(policy.write_broker());
+    let filter = notifier_program(policy.write_broker(), !policy.self_proc.is_empty());
     let state = SupState::new(policy);
     let control = Arc::new(WorkerControl::new()?);
 
@@ -2313,6 +2368,9 @@ pub(super) fn spawn_supervised_with_ready(
     let listener = unsafe { OwnedFd::from_raw_fd(nfd) };
     let worker_control = Arc::clone(&control);
     let pidfd = unsafe { OwnedFd::from_raw_fd(pf) };
+    if !state.self_proc.is_empty() {
+        self_proc::check_atomic_addfd(nfd)?;
+    }
     let sup_thread = std::thread::Builder::new()
         .name("sandbox-egress".into())
         .spawn(move || supervisor(listener, state, worker_control))?;
@@ -2508,6 +2566,7 @@ mod lifecycle_tests {
 
     fn policy(host: &str) -> EgressPolicy {
         EgressPolicy {
+            self_proc: BTreeSet::new(),
             allow_all: false,
             allow: vec![host.into()],
             write_policy: None,

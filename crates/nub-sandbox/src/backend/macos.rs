@@ -1648,6 +1648,7 @@ mod tests {
                     default_effect,
                 },
                 tmp: TmpMode::Shared,
+                ..Default::default()
             },
             ..Default::default()
         }

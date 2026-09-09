@@ -14,7 +14,7 @@ use super::{CompileCtx, CompileError, ScopeCapabilities};
 use crate::matcher::path::expand_symbolic;
 use crate::policy::{
     CanonGlob, CredentialBroker, Effect, EnvFormat, EnvPolicy, EnvRule, FsAccess, FsOrigin,
-    FsPolicy, FsRule, FsRuleSet, NetPolicy, NetRule, NetTarget, TmpMode,
+    FsPolicy, FsRule, FsRuleSet, NetPolicy, NetRule, NetTarget, SelfProcFile, TmpMode,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use serde_json::Value;
@@ -125,7 +125,25 @@ pub fn fold_fs(
     }
     // Authored filesystem policy is positive-only. Credentials are handled through the
     // environment policy; filesystem grants are not implicitly subtracted.
-    Ok(FsPolicy { rules: set, tmp })
+    let mut self_proc = std::collections::BTreeSet::new();
+    for rule in &set.entries {
+        if let Some(file) = SelfProcFile::from_path(rule.matcher.as_str()) {
+            if rule.effect != Effect::Allow || rule.access != FsAccess::Read {
+                return Err(CompileError::shape(
+                    path,
+                    "self-process metadata accepts only read-only grants (\"r\")",
+                ));
+            }
+            self_proc.insert(file);
+        }
+    }
+    set.entries
+        .retain(|rule| SelfProcFile::from_path(rule.matcher.as_str()).is_none());
+    Ok(FsPolicy {
+        rules: set,
+        tmp,
+        self_proc,
+    })
 }
 
 /// `$tmp` is managed session storage. Suffixes do not define separate grants.
@@ -434,6 +452,17 @@ fn push_fs_rules(
         access
     };
     let expanded = expand_symbolic(pattern, &ctx.homes);
+    // Keep dynamic process identity out of the ordinary canonical-path ruleset.
+    // fold_fs extracts this marker into its resolved metadata capability.
+    if SelfProcFile::from_path(&expanded).is_some() {
+        out.push(FsRule {
+            matcher: CanonGlob(expanded),
+            effect,
+            access,
+            origin: FsOrigin::Authored,
+        });
+        return;
+    }
     for g in defaults::subtree_globs(&expanded) {
         out.push(FsRule {
             matcher: CanonGlob(crate::matcher::canonicalize_glob_prefix(&g)),
@@ -594,6 +623,7 @@ pub(super) fn secure_default_fs(ctx: &CompileCtx) -> FsPolicy {
     FsPolicy {
         rules: set,
         tmp: TmpMode::Private,
+        ..Default::default()
     }
 }
 

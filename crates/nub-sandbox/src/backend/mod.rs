@@ -571,6 +571,13 @@ impl Sandbox {
     /// This is the sole compatibility ambient lookup: credential values are captured here
     /// for the broker session and are never re-read for later command submissions.
     pub fn new(policy: &SandboxPolicy) -> Result<Self, Degradation> {
+        #[cfg(not(target_os = "linux"))]
+        if !policy.fs.self_proc.is_empty() {
+            return Err(Degradation {
+                lost: vec!["fs-self-proc".into()],
+                reason: Some("self-process procfs grants are supported only on Linux".into()),
+            });
+        }
         if !policy.env.resolved {
             return Err(Degradation {
                 lost: vec!["env-unresolved".to_string()],

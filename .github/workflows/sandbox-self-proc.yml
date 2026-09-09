@@ -1,0 +1,90 @@
+name: Sandbox self-process metadata
+
+on:
+  push:
+    branches: [sandbox-self-proc]
+    paths:
+      - crates/nub-sandbox/**
+      - .github/workflows/sandbox-self-proc.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: sandbox-reuse-native
+      - name: Recording source and platform
+        run: |
+          mkdir -p reports
+          git rev-parse HEAD > reports/environment.txt
+          rustc -Vv >> reports/environment.txt
+      - name: Checking every sandbox target
+        run: |
+          set -o pipefail
+          cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings 2>&1 | tee reports/clippy.log
+      - name: Exercising library and metadata contracts
+        if: ${{ !cancelled() }}
+        env:
+          WITHHELD_AMBIENT_SECRET: synthetic-procfs-canary
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib -- --nocapture 2>&1 | tee reports/lib.log
+          cargo test -p nub-sandbox --profile fast --test self_proc -- --nocapture --test-threads=1 2>&1 | tee reports/self-proc.log
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: runner.os == 'Linux'
+        with:
+          node-version: '22.18.0'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        if: runner.os == 'Linux'
+        with:
+          dotnet-version: '10.0.100'
+      - name: Provisioning pinned Linux tool controls
+        if: runner.os == 'Linux'
+        run: |
+          node scripts/sandbox-tool-fixtures.mjs > reports/provision.log 2>&1
+          cp .sandbox-tool-fixtures/matrix.json reports/js-matrix.json
+          python3 - <<'PY'
+          import json, os, pathlib, shutil
+          runtime = os.environ['DOTNET_ROOT']
+          program = str(pathlib.Path(shutil.which('dotnet')).resolve())
+          matrix = pathlib.Path('reports/dotnet-matrix.json').resolve()
+          matrix.write_text(json.dumps([dict(name='nuget', program=program, prefix=[], version='10.0.100', toolRoot=runtime, runtimeRoots=[runtime], toolEnv={'DOTNET_ROOT': runtime})]))
+          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write(f'NUB_SANDBOX_NATIVE_TOOL_MATRIX_FILE={matrix}\n')
+          PY
+      - name: Exercising plain Linux runtime controls
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test tool_functionality yarn1_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/yarn-plain.log
+          cargo test -p nub-sandbox --profile fast --test tool_functionality bun140_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/bun-plain.log
+          cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_unconfined -- --ignored --nocapture 2>&1 | tee reports/dotnet-plain.log
+      - name: Exercising explicit metadata grants with real tools
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/js-tools.log
+          cargo test -p nub-sandbox --profile fast --test native_tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/dotnet.log
+      - name: Preserving native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: self-proc-${{ matrix.os }}
+          path: reports

@@ -160,6 +160,18 @@ pub(crate) fn preflight(
         reason: Some(reason),
     })?;
     let confine_fs = fs_confines(&policy.fs);
+    if !policy.fs.self_proc.is_empty() {
+        if std::env::var("NUB_SANDBOX_MECHANISM").as_deref() == Ok("landlock") {
+            return Err(Degradation {
+                lost: vec!["fs-self-proc".into()],
+                reason: Some("self-process metadata requires the seccomp supervisor, not the Landlock-only mechanism".into()),
+            });
+        }
+        return Ok(LinuxPreflight {
+            confine_without_landlock: true,
+            landlock: None,
+        });
+    }
     let sandboxing =
         confine_fs || policy.net.enforce || policy.env.enforce || policy.fs.tmp != TmpMode::Shared;
     if !sandboxing {
@@ -395,6 +407,7 @@ fn build_supervised_plan(
             allow_all,
             allow,
             write_policy,
+            self_proc: policy.fs.self_proc.clone(),
             proxy_port,
             proxy_token: proxy_token.map(str::to_string),
         },

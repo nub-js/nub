@@ -4390,6 +4390,7 @@ mod tests {
                 default_effect,
             },
             tmp: TmpMode::Private,
+            ..Default::default()
         }
     }
     fn rule(m: &str, effect: Effect, access: FsAccess) -> FsRule {

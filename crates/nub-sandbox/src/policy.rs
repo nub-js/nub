@@ -18,7 +18,7 @@
 //! rule, so a later user allow can override one by ordering.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One resolved policy for one spawned process. Every axis composes
 /// independently. Produced by [`crate::compile`], consumed by [`crate::apply`].
@@ -66,6 +66,36 @@ pub enum Effect {
 pub struct FsPolicy {
     pub rules: FsRuleSet,
     pub tmp: TmpMode,
+    /// Explicit read access to the calling process's Linux metadata. Unlike ordinary
+    /// paths, these objects are resolved separately for every descendant at open time.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub self_proc: BTreeSet<SelfProcFile>,
+}
+
+/// Read-only Linux process files supported by explicit filesystem grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfProcFile {
+    Maps,
+    Stat,
+}
+
+impl SelfProcFile {
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        match path {
+            "/proc/self/maps" => Some(Self::Maps),
+            "/proc/self/stat" => Some(Self::Stat),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Maps => "maps",
+            Self::Stat => "stat",
+        }
+    }
 }
 
 /// Throwaway-tmp handling for the sandboxed child.

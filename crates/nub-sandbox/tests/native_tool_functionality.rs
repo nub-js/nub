@@ -597,6 +597,86 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     operations(name, &tool, root.path(), &env, policy.as_ref());
 }
 
+#[cfg(target_os = "linux")]
+fn run_nuget_self_proc(tooldirs: bool) {
+    let tool = tool("nuget");
+    let root = fixture();
+    let env = env_for(root.path(), &tool);
+    write_projects(root.path());
+    let mut policy = policy(root.path(), &tool, env, tooldirs);
+    policy
+        .fs
+        .self_proc
+        .insert(nub_sandbox::policy::SelfProcFile::Maps);
+    let sandbox = Sandbox::acquire(&policy).unwrap();
+    for tail in [
+        &["--version"][..],
+        &["restore", "--ignore-failed-sources"][..],
+        &["build", "--no-restore"][..],
+        &["nuget", "locals", "all", "--clear"][..],
+        &["restore", "--ignore-failed-sources"][..],
+    ] {
+        let argv = tool
+            .prefix
+            .iter()
+            .cloned()
+            .chain(tail.iter().map(|arg| (*arg).to_owned()));
+        let prepared = sandbox
+            .prepare(
+                CommandSpec::new(&tool.program)
+                    .args(argv)
+                    .cwd(root.path().join("project"))
+                    .redact_stdout(true)
+                    .redact_stderr(true),
+            )
+            .unwrap();
+        assert!(
+            prepared.degradation.lost.is_empty(),
+            "{:?}",
+            prepared.degradation
+        );
+        let output = tool_output::output(prepared);
+        if tail == ["--version"] {
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "10.0.100");
+        }
+        assert_ok(&tool, &format!("self-metadata {tail:?}"), output);
+    }
+    let secret = root.path().join("secret");
+    std::fs::write(&secret, "WITHHELD").unwrap();
+    let script = format!(
+        "for p in '{}' /proc/self/environ /proc/{}/environ; do if cat \"$p\" >/dev/null; then exit 91; fi; done",
+        secret.display(),
+        std::process::id()
+    );
+    let output = sandbox
+        .prepare(
+            CommandSpec::new("/bin/sh")
+                .args(["-c", &script])
+                .cwd(root.path().join("project")),
+        )
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("WITHHELD"));
+    sandbox.close();
+    nub_sandbox::cleanup().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned .NET SDK"]
+fn linux_self_proc_nuget_exact() {
+    run_nuget_self_proc(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned .NET SDK"]
+fn linux_self_proc_nuget_tooldirs() {
+    run_nuget_self_proc(true);
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "requires pinned Gradle; diagnoses the explicitly acknowledged net-full limit"]
