@@ -64,6 +64,15 @@ fn augmented_sizes_pool_to_cores() {
         size <= cores.max(4),
         "pool must not exceed max(4, cores={cores}), got {size}"
     );
+    // The pool libuv really built, not the value nub installed: libuv reads the
+    // variable at first use, so a preload that hid it too early would leave four.
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            v["workers"].as_u64(),
+            Some(size as u64),
+            "libuv must build the installed pool: {v}"
+        );
+    }
 }
 
 /// `nub run` goes through the shared script-runner environment rather than the
@@ -371,29 +380,44 @@ fn user_value_still_inherits() {
 }
 
 /// The workers beyond Node's four run at nice 10 on Linux, so on a busy box they
-/// only take idle cycles. CI's runners have 4 cores, where nothing is demoted, so
-/// the test stands in for the launcher: a value equal to the ownership marker is
-/// nub's own, which is exactly what a nested launcher hands the preload.
+/// only take idle cycles. CI's runners have 4 cores, where nub sizes nothing to
+/// demote, so this drives the preload under plain `node` with the environment a
+/// launcher hands it: the value, its augmented marker, and a compat capture saying
+/// the variable was absent before nub.
 #[cfg(target_os = "linux")]
 #[test]
 fn extra_workers_run_at_low_priority() {
-    let v = run(
-        &[],
-        &[
-            ("UV_THREADPOOL_SIZE", "8"),
-            ("__NUB_AUGMENTED_UV_THREADPOOL_SIZE", "8"),
-            ("__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT", "1"),
-        ],
+    let f = fixture();
+    let preload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/preload.cjs");
+    let output = Command::new("node")
+        .arg("--require")
+        .arg(&preload)
+        .arg(&f)
+        .current_dir(f.parent().unwrap())
+        .env("UV_THREADPOOL_SIZE", "8")
+        .env("__NUB_AUGMENTED_UV_THREADPOOL_SIZE", "8")
+        .env("__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT", "1")
+        .env("__NUB_COMPAT_UV_THREADPOOL_SIZE", "")
+        .env("__NUB_COMPAT_PRESENT", "0")
+        .output()
+        .expect("failed to spawn node");
+    assert!(
+        output.status.success(),
+        "node exited {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
     assert_eq!(v["size"].as_str(), Some("8"));
     assert!(
         v["env"].is_null(),
-        "nub's value must be stripped from process.env"
+        "nub's value must be stripped from process.env: {v}"
     );
     assert_eq!(
         v["workers"].as_u64(),
         Some(8),
-        "libuv must run the sized pool: {v}"
+        "libuv must build the sized pool: {v}"
     );
     let nices: Vec<i64> = v["nices"]
         .as_array()

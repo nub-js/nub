@@ -1720,7 +1720,11 @@ function installVersionMarker() {
 //     1 << 5 is this variable's slot). A shell value, an env-file value, or a value
 //     the launcher merely passed through fails one of the two and inherits as it
 //     would under plain Node. The markers themselves stay, which is how a nested
-//     `nub` knows to size its child again.
+//     `nub` knows to size its child again. libuv reads the variable LAZILY, at the
+//     first pool use, and a `process.env` delete reaches the C environment, so the
+//     pool is created (one `fs.stat`) before the variable goes; otherwise libuv
+//     would find nothing and build Node's four. A pool of four needs neither: it is
+//     Node's default, so inheriting it is harmless and nothing is demoted.
 //  2. The threads beyond Node's four run at a lower priority on Linux, so they only
 //     take cycles nothing else on the box wants (Chromium's best-effort tier, nice
 //     10). Measured on 16 vCPU beside twelve busy processes: the neighbours keep
@@ -1740,17 +1744,19 @@ function installThreadpoolPolicy() {
   const size = process.env[THREADPOOL_ENV];
   if (size === undefined || size !== process.env[THREADPOOL_MARK_ENV]) return;
   if ((Number(process.env[COMPAT_PRESENT_ENV]) || 0) & THREADPOOL_PRESENT_BIT) return;
-  delete process.env[THREADPOOL_ENV];
-  if (process.platform !== "linux" || !(Number(size) > THREADPOOL_NODE_DEFAULT)) return;
+  if (!(Number(size) > THREADPOOL_NODE_DEFAULT)) return;
   try {
     // The `--require` preload re-runs inside every loader worker; the pool is
     // process-wide, so only the main thread touches it.
     if (!require("node:worker_threads").isMainThread) return;
     const fs = require("node:fs");
-    const os = require("node:os");
+    const linux = process.platform === "linux";
     const tids = () => fs.readdirSync("/proc/self/task").map(Number).filter(Boolean);
-    const before = new Set(tids());
+    const before = linux ? new Set(tids()) : null;
     fs.stat("/", () => {});
+    delete process.env[THREADPOOL_ENV];
+    if (!linux) return;
+    const os = require("node:os");
     const isWorker = (t) => {
       if (!before.has(t)) return true;
       try {
