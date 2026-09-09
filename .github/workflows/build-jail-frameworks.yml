@@ -2,7 +2,7 @@ name: Build-jail framework applications
 
 on:
   push:
-    branches: [build-jail-productionization]
+    branches: [build-jail-productionization, sandbox-reuse-epic]
     paths:
       - tests/build-jail-frameworks/**
       - tests/build-jail-corpus/**
@@ -20,14 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [ubuntu-24.04, macos-14, windows-latest]
+        source: [current, baseline]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       FRAMEWORK_REPORT: ${{ github.workspace }}/reports/frameworks
       FRAMEWORK_CONTROLS: all
-      SOURCE_REVISION: ${{ github.sha }}
     defaults:
       run:
         shell: bash
@@ -35,6 +35,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
+          ref: ${{ matrix.source == 'baseline' && 'b03f68bed9' || github.sha }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -51,7 +52,9 @@ jobs:
           npm install --no-audit --no-fund --loglevel=error
           npm install --global node-gyp@12.4.0 --no-audit --no-fund
           mkdir -p reports
+          echo "SOURCE_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Building the application-test artifact
+        id: artifact
         run: |
           (cd crates/nub-native && cargo build --profile fast)
           mkdir -p runtime/addons
@@ -62,7 +65,11 @@ jobs:
             sha256sum target/fast/busybox.exe > reports/windows-shell.sha256
             echo "NUB_BIN=$GITHUB_WORKSPACE/target/fast/nub.exe" >> "$GITHUB_ENV"
           else
-            cp target/fast/libnub_native.dylib runtime/addons/nub-native.node
+            if [ "$RUNNER_OS" = Linux ]; then
+              cp target/fast/libnub_native.so runtime/addons/nub-native.node
+            else
+              cp target/fast/libnub_native.dylib runtime/addons/nub-native.node
+            fi
             echo "NUB_BIN=$GITHUB_WORKSPACE/target/fast/nub" >> "$GITHUB_ENV"
           fi
           cargo build -p nub-cli --profile fast
@@ -71,7 +78,11 @@ jobs:
           node --test tests/build-jail-frameworks/harness.test.mjs
           node --test --test-concurrency=1 tests/build-jail-corpus/contract.mjs tests/build-jail-corpus/network.mjs > reports/contracts.log 2>&1
       - name: Testing framework applications
+        if: (success() || failure()) && steps.artifact.outcome == 'success'
         run: node tests/build-jail-frameworks/run.mjs
+      - name: Exercising sandbox cleanup through the CLI
+        if: (success() || failure()) && steps.artifact.outcome == 'success' && matrix.source == 'current'
+        run: '"$NUB_BIN" sandbox cleanup > reports/sandbox-cleanup.log 2>&1'
       - name: Comparing Windows path spellings with npm
         if: always() && runner.os == 'Windows'
         env:
@@ -80,7 +91,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: build-jail-frameworks-${{ matrix.os }}
+          name: build-jail-frameworks-${{ matrix.os }}-${{ matrix.source }}
           path: reports
           include-hidden-files: true
           retention-days: 14

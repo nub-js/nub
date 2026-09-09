@@ -374,6 +374,37 @@ fn assert_fixture_runs(tool: &Tool, output: &Output) {
     );
 }
 
+fn assert_cache_path(tool: &Tool, output: &Output, expected: &str) {
+    assert_success(tool, "configured cache directory", output);
+    let actual = String::from_utf8_lossy(&output.stdout);
+    let actual = Path::new(actual.trim());
+    let actual = std::fs::canonicalize(actual).unwrap_or_else(|error| {
+        panic!(
+            "{} reported an unusable cache path `{actual:?}`: {error}",
+            tool.name
+        )
+    });
+    let expected = std::fs::canonicalize(expected).unwrap_or_else(|error| {
+        panic!(
+            "{} configured cache path `{expected}` is unavailable: {error}",
+            tool.name
+        )
+    });
+    #[cfg(windows)]
+    let matches = actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy());
+    #[cfg(not(windows))]
+    let matches = actual == expected;
+    assert!(
+        matches,
+        "{} did not select the configured cache: reported {}, expected {}",
+        tool.name,
+        actual.display(),
+        expected.display()
+    );
+}
+
 fn run_pip_operations(
     tool: &Tool,
     root: &Path,
@@ -434,6 +465,7 @@ fn run_pip_operations(
                 "--no-deps",
                 "--user",
                 "--force-reinstall",
+                "--break-system-packages",
                 &wheel,
             ],
             root,
@@ -442,11 +474,10 @@ fn run_pip_operations(
         ),
     );
     let cache = invoke(tool, &["cache", "dir"], root, env, policy);
-    assert_success(tool, "configured cache directory", &cache);
-    let cache_stdout = String::from_utf8_lossy(&cache.stdout).to_string();
-    assert!(
-        cache_stdout.contains(env.get("PIP_CACHE_DIR").expect("pip cache env")),
-        "pip did not select the configured cache: {cache_stdout}"
+    assert_cache_path(
+        tool,
+        &cache,
+        env.get("PIP_CACHE_DIR").expect("pip cache env"),
     );
     assert_success(
         tool,
@@ -551,12 +582,7 @@ fn run_uv_operations(
         ),
     );
     let cache = invoke(tool, &["cache", "dir"], root, env, policy);
-    assert_success(tool, "configured cache directory", &cache);
-    let cache_stdout = String::from_utf8_lossy(&cache.stdout).to_string();
-    assert!(
-        cache_stdout.contains(env.get("UV_CACHE_DIR").expect("uv cache env")),
-        "uv did not select the configured cache: {cache_stdout}"
-    );
+    assert_cache_path(tool, &cache, env.get("UV_CACHE_DIR").expect("uv cache env"));
     assert_success(
         tool,
         "configured cache prune",

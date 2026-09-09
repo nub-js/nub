@@ -69,6 +69,12 @@ pub(super) const ESSENTIAL_READ_PATHS: &[&str] = &[
     "/lib64",
     "/lib32",
     "/libx32",
+    // Python's distro detection reads these public release identifiers.
+    "/etc/os-release",
+    "/etc/debian_version",
+    "/etc/lsb-release",
+    "/etc/redhat-release",
+    "/etc/alpine-release",
     "/etc/ld.so.cache",
     "/etc/ld.so.preload",
     "/etc/ld.so.conf",
@@ -938,9 +944,9 @@ fn resolve_program(program: &OsStr, child_cwd: &Path, path: Option<&OsStr>) -> O
         } else {
             child_cwd.join(p)
         };
-        return executable(&candidate)
-            .then(|| fs::canonicalize(candidate).ok())
-            .flatten();
+        // Interpreter entrypoint spelling is semantic: resolving a venv's
+        // python symlink here would make Python select the host environment.
+        return executable(&candidate).then_some(candidate);
     }
     std::env::split_paths(path?).find_map(|dir| {
         let dir = if dir.is_absolute() {
@@ -949,9 +955,7 @@ fn resolve_program(program: &OsStr, child_cwd: &Path, path: Option<&OsStr>) -> O
             child_cwd.join(dir)
         };
         let candidate = dir.join(p);
-        executable(&candidate)
-            .then(|| fs::canonicalize(candidate).ok())
-            .flatten()
+        executable(&candidate).then_some(candidate)
     })
 }
 
@@ -983,6 +987,8 @@ mod tests {
             "/usr/include/stdio.h",
             "/lib/aarch64-linux-gnu/libc.so.6",
             "/etc/ld.so.cache",
+            "/etc/os-release",
+            "/etc/debian_version",
             "/etc/nsswitch.conf",
             "/etc/passwd",
             "/etc/resolv.conf",
@@ -1634,6 +1640,25 @@ mod tests {
         assert_eq!(
             resolve_program(OsStr::new("direct"), &cwd, target_path(&empty).as_deref()),
             Some(fs::canonicalize(&direct).unwrap())
+        );
+    }
+
+    #[test]
+    fn program_resolution_preserves_interpreter_symlink_identity() {
+        let root = tempdir().unwrap();
+        let alias = root.path().join("python");
+        std::os::unix::fs::symlink("/bin/true", &alias).unwrap();
+        assert_eq!(
+            resolve_program(alias.as_os_str(), root.path(), None),
+            Some(alias.clone())
+        );
+        assert_eq!(
+            resolve_program(
+                OsStr::new("python"),
+                root.path(),
+                Some(root.path().as_os_str())
+            ),
+            Some(alias)
         );
     }
 

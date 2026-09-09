@@ -150,6 +150,7 @@ struct Tool {
     tool_root: PathBuf,
     #[serde(rename = "runtimeRoot")]
     runtime_root: PathBuf,
+    architecture: String,
     version: String,
 }
 
@@ -297,7 +298,9 @@ fn tool_env(tool: &Tool, root: &Path) -> (PathBuf, PathBuf, Vec<(String, String)
             (
                 "PATH".into(),
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}{}",
+                    global.to_string_lossy(),
+                    if cfg!(windows) { ";" } else { ":" },
                     global.join("bin").to_string_lossy(),
                     if cfg!(windows) { ";" } else { ":" },
                     std::env::var("PATH").expect("runner PATH")
@@ -551,7 +554,10 @@ fn run_tool_control(name: &str, control: ToolControl) {
         .iter()
         .find(|tool| tool.name == name)
         .unwrap_or_else(|| panic!("tool matrix omitted {name}"));
-    eprintln!("TOOL {} {} ({})", tool.name, tool.version, tool.spec);
+    eprintln!(
+        "TOOL {} {} ({}, {})",
+        tool.name, tool.version, tool.spec, tool.architecture
+    );
     let root = fixture();
     let (cache, global, env) = tool_env(tool, root.path());
     // Precondition for native inode/ACL backends: these existing roots are what their grants
