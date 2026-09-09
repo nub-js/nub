@@ -559,7 +559,7 @@ fn npm_cold_cache_root_remains_a_backend_limit_control() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(&cache.to_string_lossy()),
+        stderr.contains(cache.to_string_lossy().as_ref()),
         "npm cold-cache denial omitted {}: {stderr}",
         cache.display()
     );

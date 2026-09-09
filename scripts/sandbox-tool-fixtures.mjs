@@ -15,14 +15,14 @@ const root = resolve(process.env.NUB_SANDBOX_TOOL_ROOT ?? '.sandbox-tool-fixture
 const node = process.env.NUB_SANDBOX_NODE ?? process.execPath;
 // npm's public package is the provisioning source. These are pinned, not dist-tags:
 // npm 11.6.2, pnpm 9.15.9 / 10.18.3 / 11.26.0, Yarn 1.22.22,
-// @yarnpkg/cli-dist 2.4.3 / 3.8.7 / 4.17.0, Bun 1.3.2 / 1.4.0.
+// @yarnpkg/cli-dist 2.4.2 / 3.8.7 / 4.17.0, Bun 1.3.2 / 1.4.0.
 const packages = [
   ['npm', 'npm@11.6.2', 'node_modules/npm/bin/npm-cli.js', 'npm'],
   ['pnpm9', 'pnpm@9.15.9', 'node_modules/pnpm/bin/pnpm.cjs', 'pnpm'],
   ['pnpm10', 'pnpm@10.18.3', 'node_modules/pnpm/bin/pnpm.cjs', 'pnpm'],
   ['pnpm11', 'pnpm@11.26.0', 'node_modules/pnpm/bin/pnpm.cjs', 'pnpm'],
   ['yarn1', 'yarn@1.22.22', 'node_modules/yarn/bin/yarn.js', 'yarn1'],
-  ['yarn2', '@yarnpkg/cli-dist@2.4.3', 'node_modules/@yarnpkg/cli-dist/bin/yarn.js', 'yarn'],
+  ['yarn2', '@yarnpkg/cli-dist@2.4.2', 'node_modules/@yarnpkg/cli-dist/bin/yarn.js', 'yarn'],
   ['yarn3', '@yarnpkg/cli-dist@3.8.7', 'node_modules/@yarnpkg/cli-dist/bin/yarn.js', 'yarn'],
   ['yarn4', '@yarnpkg/cli-dist@4.17.0', 'node_modules/@yarnpkg/cli-dist/bin/yarn.js', 'yarn'],
   ['bun132', 'bun@1.3.2', process.platform === 'win32' ? 'node_modules/bun/bin/bun.exe' : 'node_modules/bun/bin/bun', 'bun'],
