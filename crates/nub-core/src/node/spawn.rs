@@ -2549,6 +2549,15 @@ static RESTORABLE_VARS: [RestorableVar; 6] = [
 /// `nubx`/`exec`, lifecycle scripts and `nub watch` through
 /// [`AugmentationEnv::apply_threadpool_size`] or its equivalent.
 ///
+/// The value is for the process it is handed to. Node's own maintainers closed
+/// the same default (nodejs/node#61533) because the cores a host shows are not
+/// necessarily free, so the preload (`installThreadpoolPolicy`, preload-common.cjs)
+/// deletes nub's own value from `process.env` once Node has read it — a cluster or
+/// PM2 fork and any child spawn start with Node's default, a `nub` child is sized
+/// again — and on Linux runs the workers beyond Node's four at nice 10, so on a
+/// busy box they only take idle cycles. Windows is capped at
+/// [`WINDOWS_THREADPOOL_CAP`] threads.
+///
 /// libuv creates the WHOLE pool on first use and aborts the process if one
 /// thread fails (`uv_thread_create_ex` → `abort()` in threadpool.c), and
 /// `available_parallelism` knows nothing of a cgroup `pids.max` or
@@ -2565,10 +2574,25 @@ pub fn threadpool_size() -> usize {
     threadpool_size_from(cores, crate::resource_limits::spawn_headroom())
 }
 
+/// The most threads nub asks for on Windows. libuv gives every pool thread an 8 MB
+/// stack, and Windows passes that to `_beginthreadex` as the COMMIT size (Linux
+/// and macOS reserve it and touch it lazily), so a 32-core box would commit 256 MB
+/// the moment any fs, dns or crypto call starts the pool (nodejs/node#57911
+/// measured about 8 MB per thread). Eight threads is 64 MB.
+const WINDOWS_THREADPOOL_CAP: usize = 8;
+
 /// `max(4, cores)`, clamped to the detected thread headroom and never below
 /// libuv's own default of 4 (where plain Node would abort just the same).
 pub fn threadpool_size_from(cores: usize, headroom: Option<usize>) -> usize {
-    let wanted = cores.max(4);
+    threadpool_size_from_on(cores, headroom, cfg!(windows))
+}
+
+/// [`threadpool_size_from`] with the platform explicit, for the cap test.
+fn threadpool_size_from_on(cores: usize, headroom: Option<usize>, windows: bool) -> usize {
+    let mut wanted = cores.max(4);
+    if windows {
+        wanted = wanted.min(WINDOWS_THREADPOOL_CAP);
+    }
     match headroom {
         Some(room) if room < wanted => room.max(4),
         _ => wanted,
@@ -6109,6 +6133,11 @@ mod tests {
         assert_eq!(threadpool_size_from(64, Some(16)), 16);
         assert_eq!(threadpool_size_from(64, Some(2)), 4);
         assert_eq!(threadpool_size_from(8, Some(100)), 8);
+        // Windows commits 8 MB per pool thread, so the pool stops at 8 there.
+        assert_eq!(threadpool_size_from_on(64, None, true), 8);
+        assert_eq!(threadpool_size_from_on(6, None, true), 6);
+        assert_eq!(threadpool_size_from_on(64, Some(6), true), 6);
+        assert_eq!(threadpool_size_from_on(64, None, false), 64);
         // A restorable-var slot exists for it, so a compat boundary removes it.
         assert!(RestorableVar::lookup(THREADPOOL_SIZE_ENV).is_some());
     }
