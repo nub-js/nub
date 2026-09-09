@@ -286,6 +286,7 @@ impl Acquired {
             path: canonical_path_or_lexical(Path::new(&mutation.path))?,
             ..mutation
         };
+        let observed_id = object_id(Path::new(&mutation.path))?;
         let _lock = MutationLock::acquire(&self.root)?;
         let mut file = load(&self.root)?;
         let changed = {
@@ -294,6 +295,9 @@ impl Acquired {
                 .get_mut(&self.entry.identity)
                 .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
             if !entry.mutations.contains(&mutation) {
+                if let Some(id) = observed_id {
+                    entry.object_ids.insert(mutation.path.clone(), id);
+                }
                 entry.mutations.push(mutation);
                 true
             } else {
@@ -309,6 +313,7 @@ impl Acquired {
 
     pub(crate) fn record_private_path(&mut self, path: &Path) -> io::Result<()> {
         let path = canonical_path_or_lexical(path)?;
+        let observed_id = object_id(Path::new(&path))?;
         let _lock = MutationLock::acquire(&self.root)?;
         let mut file = load(&self.root)?;
         let changed = {
@@ -321,6 +326,9 @@ impl Acquired {
                 .iter()
                 .any(|parent| Path::new(&path).starts_with(parent))
             {
+                if let Some(id) = observed_id {
+                    entry.object_ids.insert(path.clone(), id);
+                }
                 entry
                     .private_paths
                     .retain(|child| !Path::new(child).starts_with(&path));
@@ -347,9 +355,15 @@ impl Acquired {
             .entries
             .get_mut(&self.entry.identity)
             .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
-        for mutation in &entry.mutations {
-            if let Some(id) = object_id(Path::new(&mutation.path))? {
-                entry.object_ids.insert(mutation.path.clone(), id);
+        for path in entry
+            .mutations
+            .iter()
+            .map(|mutation| &mutation.path)
+            .chain(&entry.private_paths)
+        {
+            validate_object(entry, Path::new(path))?;
+            if let Some(id) = object_id(Path::new(path))? {
+                entry.object_ids.insert(path.clone(), id);
             }
         }
         save(&self.root, &file)?;
@@ -380,6 +394,9 @@ impl Acquired {
 /// spawning; a missing/replaced object is recovery work, never a reason to grant a
 /// SID onto a newly discovered path.
 pub(crate) fn validate_entry(entry: &Entry) -> io::Result<()> {
+    for path in &entry.private_paths {
+        validate_private_path(entry, Path::new(path))?;
+    }
     for mutation in &entry.mutations {
         validate_object(entry, Path::new(&mutation.path))?;
         let observed = canonical_path(Path::new(&mutation.path)).map_err(|error| {
@@ -394,6 +411,22 @@ pub(crate) fn validate_entry(entry: &Entry) -> io::Result<()> {
                 entry.profile_name
             )));
         }
+    }
+    Ok(())
+}
+
+/// A path alone is not deletion authority. An interrupted creation without a
+/// recorded identity stays recoverable state rather than deleting a replacement.
+pub(crate) fn validate_private_path(entry: &Entry, path: &Path) -> io::Result<()> {
+    let Some(actual) = object_id(path)? else {
+        return Ok(());
+    };
+    if entry.object_ids.get(&normalize(path)) != Some(&actual) {
+        return Err(io::Error::other(format!(
+            "sandbox resource {} requires recovery: private path {} has no matching ownership identity",
+            entry.profile_name,
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -1174,6 +1207,61 @@ mod tests {
         std::fs::rename(&path, dir.path().join("original")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(validate_entry(&acquired.entry).is_err());
+    }
+
+    #[test]
+    fn preparation_records_existing_acl_identity_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let mut acquired = acquire_at(root.clone(), id(dir.path())).unwrap();
+        let path = dir.path().join("read");
+        acquired
+            .record_mutation(AclMutation {
+                path: path.display().to_string(),
+                kind: AclKind::Subtree,
+                access: 1,
+            })
+            .unwrap();
+        let recorded = load(&root)
+            .unwrap()
+            .entries
+            .remove(&acquired.entry.identity)
+            .unwrap();
+        assert!(recorded.object_ids.contains_key(&normalize(&path)));
+        std::fs::rename(&path, dir.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(validate_object(&recorded, &path).is_err());
+        assert!(acquired.ready().is_err());
+    }
+
+    #[test]
+    fn replaced_private_root_is_not_cleanup_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut acquired = acquire_at(dir.path().join("registry"), id(dir.path())).unwrap();
+        let path = dir.path().join("private");
+        std::fs::create_dir(&path).unwrap();
+        acquired.record_private_path(&path).unwrap();
+        acquired.ready().unwrap();
+        validate_private_path(&acquired.entry, &path).unwrap();
+        std::fs::rename(&path, dir.path().join("original-private")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("caller-output"), b"keep").unwrap();
+        assert!(validate_private_path(&acquired.entry, &path).is_err());
+        assert!(validate_entry(&acquired.entry).is_err());
+        assert_eq!(std::fs::read(path.join("caller-output")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn interrupted_private_creation_does_not_authorize_an_unknown_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut acquired = acquire_at(dir.path().join("registry"), id(dir.path())).unwrap();
+        let path = dir.path().join("private");
+        acquired.record_private_path(&path).unwrap();
+        validate_private_path(&acquired.entry, &path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(validate_private_path(&acquired.entry, &path).is_err());
+        acquired.ready().unwrap();
+        validate_private_path(&acquired.entry, &path).unwrap();
     }
 
     #[test]

@@ -139,12 +139,48 @@ pub(crate) use launch::cleanup_resources;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) enum WindowsLaunch {
     /// Per-run AppContainer (LowBox) — the pure-allowlist path. No elevation, ever.
-    AppContainer(AppContainerLaunch),
+    AppContainer(Box<AppContainerLaunch>),
+    Plain(PlainLaunch),
+}
+
+/// Final command data shared by plain and AppContainer native launches.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone)]
+pub(crate) struct PlainLaunch {
+    program: OsString,
+    args: super::CommandArgs,
+    cwd: Option<PathBuf>,
+    env: Option<BTreeMap<String, String>>,
+    stdout: WindowsStdio,
+    stderr: WindowsStdio,
 }
 
 #[cfg(target_os = "windows")]
 #[allow(dead_code)] // Retained synchronous adapters; Prepared uses the native spawn path.
 impl WindowsLaunch {
+    pub(crate) fn plain(spec: super::CommandSpec, env: BTreeMap<String, String>) -> Self {
+        Self::Plain(PlainLaunch {
+            program: spec.program,
+            args: spec.args,
+            cwd: spec.cwd,
+            env: Some(env),
+            stdout: if spec.redact_stdout {
+                WindowsStdio::Piped
+            } else {
+                WindowsStdio::Inherit
+            },
+            stderr: if spec.redact_stderr {
+                WindowsStdio::Piped
+            } else {
+                WindowsStdio::Inherit
+            },
+        })
+    }
+
+    pub(crate) fn is_appcontainer(&self) -> bool {
+        matches!(self, Self::AppContainer(_))
+    }
+
     pub(crate) fn run(self) -> std::io::Result<std::process::ExitStatus> {
         self.run_cancellable(&std::sync::atomic::AtomicBool::new(false))
     }
@@ -179,6 +215,7 @@ impl WindowsLaunch {
     pub(super) fn acquire(self) -> std::io::Result<WindowsResource> {
         match self {
             Self::AppContainer(plan) => plan.acquire(),
+            Self::Plain(plan) => Ok(WindowsResource::plain(plan)),
         }
     }
 }
@@ -599,6 +636,27 @@ fn plain_command(
     command
 }
 
+#[cfg(windows)]
+fn finalized_plain_launch(
+    spec: super::CommandSpec,
+    command: &std::process::Command,
+) -> WindowsLaunch {
+    // plain_command always clears the environment. Its final entries include
+    // proxy/CA/temp changes, while the original spec preserves raw cmd.exe args.
+    let env = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    WindowsLaunch::plain(spec, env)
+}
+
 /// The Windows network mechanisms never depend on the caller's elevation.
 #[derive(Debug, PartialEq, Eq)]
 enum WinNetPlan {
@@ -744,7 +802,14 @@ pub(crate) fn apply(
     }
     if policy.build_jail && !confine_fs {
         let mut deg = Degradation::full();
-        let mut command = plain_command(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir);
+        let mut command = plain_command(
+            policy,
+            spec.clone(),
+            proxy_port,
+            proxy_token,
+            ca_bundle,
+            tmp_dir,
+        );
         if policy.net.enforce {
             deg.lost.push("net".to_string());
             deg.reason = Some(
@@ -767,11 +832,12 @@ pub(crate) fn apply(
         if let Some(axis) = tmp_lost {
             deg.lost.push(axis.to_string());
         }
+        let launch = finalized_plain_launch(spec, &command);
         return Ok(Prepared {
             command,
             degradation: deg,
             proxy: None,
-            launch: None,
+            launch: Some(launch),
             _private_tmp: None,
             session: None,
             redact_stdout: false,
@@ -797,11 +863,20 @@ pub(crate) fn apply(
     // Nothing needs the AppContainer: only env-scrub (or nothing). Use the plain
     // command path — identical contract to the mac/linux relaxed case.
     if !sandboxing && tmp_lost.is_none() {
+        let command = plain_command(
+            policy,
+            spec.clone(),
+            proxy_port,
+            proxy_token,
+            ca_bundle,
+            tmp_dir,
+        );
+        let launch = finalized_plain_launch(spec, &command);
         return Ok(Prepared {
-            command: plain_command(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir),
+            command,
             degradation: Degradation::full(),
             proxy: None,
-            launch: None,
+            launch: Some(launch),
             _private_tmp: None,
             session: None,
             redact_stdout: false,
@@ -935,7 +1010,7 @@ pub(crate) fn apply(
         command: std::process::Command::new(&launch.program),
         degradation: deg,
         proxy: None,
-        launch: Some(WindowsLaunch::AppContainer(launch)),
+        launch: Some(WindowsLaunch::AppContainer(Box::new(launch))),
         _private_tmp: None,
         session: None,
         redact_stdout: false,
@@ -1181,7 +1256,8 @@ pub fn windows_publish_appcontainer_read(dir: &std::path::Path) -> std::io::Resu
 
 #[cfg(target_os = "windows")]
 pub(super) mod launch {
-    use super::{AppContainerLaunch, WindowsStdio, dedupe_windows_env_pairs};
+    use super::{AppContainerLaunch, PlainLaunch, WindowsStdio, dedupe_windows_env_pairs};
+    use std::collections::BTreeMap;
     use std::io;
     use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt;
@@ -1942,8 +2018,10 @@ pub(super) mod launch {
     }
 
     pub(crate) struct WindowsResource {
-        plan: AppContainerLaunch,
-        state: Arc<ResourceState>,
+        plan: PlainLaunch,
+        state: Option<Arc<ResourceState>>,
+        allow_internet: bool,
+        egress_funnel: Option<super::NetPolicy>,
     }
 
     /// Shared identity ownership without a command, arguments or environment.
@@ -1960,7 +2038,10 @@ pub(super) mod launch {
     }
 
     impl AppContainerLaunch {
-        pub(crate) fn acquire(self) -> io::Result<WindowsResource> {
+        pub(crate) fn acquire(mut self) -> io::Result<WindowsResource> {
+            if let Some(env) = self.env.as_mut() {
+                ensure_appcontainer_environment(env)?;
+            }
             let _operation = super::windows_registry::OperationLock::acquire("resources")?;
             for path in self.read_grants.iter().chain(&self.write_grants) {
                 super::windows_registry::reject_registry_grant(path)?;
@@ -2079,33 +2160,61 @@ pub(super) mod launch {
                 resource.ready()?;
             }
             Ok(WindowsResource {
-                plan: self,
-                state: Arc::new(ResourceState {
+                plan: PlainLaunch {
+                    program: self.program,
+                    args: self.args,
+                    cwd: self.cwd,
+                    env: self.env,
+                    stdout: self.stdout,
+                    stderr: self.stderr,
+                },
+                allow_internet: self.allow_internet,
+                egress_funnel: self.egress_funnel,
+                state: Some(Arc::new(ResourceState {
                     _lease: resource,
                     sid,
                     private_tmp,
-                }),
+                })),
             })
         }
     }
 
     impl WindowsResource {
-        pub(crate) fn identity(&self) -> &str {
-            &self.state._lease.entry.identity
+        pub(super) fn plain(plan: PlainLaunch) -> Self {
+            Self {
+                plan,
+                state: None,
+                allow_internet: false,
+                egress_funnel: None,
+            }
         }
 
-        pub(crate) fn lease(&self) -> WindowsLease {
-            WindowsLease {
-                _state: self.state.clone(),
-            }
+        pub(crate) fn identity(&self) -> Option<&str> {
+            self.state
+                .as_ref()
+                .map(|state| state._lease.entry.identity.as_str())
+        }
+
+        pub(crate) fn lease(&self) -> Option<WindowsLease> {
+            self.state.as_ref().map(|state| WindowsLease {
+                _state: state.clone(),
+            })
         }
         #[cfg(test)]
         pub(crate) fn private_tmp(&self) -> Option<&Path> {
-            self.state.private_tmp.as_deref()
+            self.state
+                .as_ref()
+                .and_then(|state| state.private_tmp.as_deref())
         }
         #[cfg(test)]
         pub(crate) fn profile_name(&self) -> &str {
-            &self.state._lease.entry.profile_name
+            &self
+                .state
+                .as_ref()
+                .expect("AppContainer resource")
+                ._lease
+                .entry
+                .profile_name
         }
 
         pub(crate) fn spawn(&self) -> io::Result<WindowsChild> {
@@ -2118,9 +2227,27 @@ pub(super) mod launch {
             stdout: WindowsStdio,
             stderr: WindowsStdio,
         ) -> io::Result<WindowsChild> {
+            self.spawn_before_resume(stdin, stdout, stderr, |_| Ok(()))
+        }
+
+        pub(crate) fn spawn_before_resume(
+            &self,
+            stdin: WindowsStdio,
+            stdout: WindowsStdio,
+            stderr: WindowsStdio,
+            before_resume: impl FnOnce(u32) -> io::Result<()>,
+        ) -> io::Result<WindowsChild> {
             let mut plan = self.plan.clone();
-            let ac_sid = self.state.sid.0;
-            if let Some(path) = &self.state.private_tmp {
+            let confined = self.state.is_some();
+            let ac_sid = self
+                .state
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |state| state.sid.0);
+            if let Some(path) = self
+                .state
+                .as_ref()
+                .and_then(|state| state.private_tmp.as_ref())
+            {
                 let env = plan.env.get_or_insert_with(|| std::env::vars().collect());
                 env.retain(|key, _| {
                     !["TEMP", "TMP", "TMPDIR"]
@@ -2138,7 +2265,7 @@ pub(super) mod launch {
             //    ancestor chain contributes none — see the DEAD note in 2b.
             let mut cap_sid_owned: Option<CapSid> = None;
             let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-            if plan.allow_internet {
+            if self.allow_internet {
                 let cs = CapSid::new(INTERNET_CLIENT_SID)?;
                 caps.push(SID_AND_ATTRIBUTES {
                     Sid: cs.0,
@@ -2159,26 +2286,28 @@ pub(super) mod launch {
 
             // 4. Job with KILL_ON_JOB_CLOSE; `_job` closes the handle on drop (declared
             //    LAST ⇒ dropped FIRST ⇒ reaps any lingering tree before ACE revoke).
-            let job = create_confinement_job()?;
+            let job = create_process_job(confined)?;
             let job_guard = HandleGuard(job);
 
             // 5. Proc-thread attribute list: SECURITY_CAPABILITIES, plus a HANDLE_LIST
             //    scoping inheritance to EXACTLY the std handles (see `bInheritHandles`
             //    below). The list must be alive across CreateProcessW (it stores the
             //    pointer); `inherit_handles` outlives the call.
-            let mut stdio = NativeStdio::new([stdin, stdout, stderr])?;
+            let mut stdio = NativeStdio::new([stdin, stdout, stderr], confined)?;
             let std_triple = stdio.triple;
             let inherit_handles = &stdio.child_handles;
-            let n_attrs = 2 + u32::from(!inherit_handles.is_empty());
+            let n_attrs = 1 + u32::from(confined) + u32::from(!inherit_handles.is_empty());
             let jobs = [job];
             let mut attr = ProcThreadAttrList::new(n_attrs)?;
             // The attribute list stores a POINTER to `sec_caps` rather than a copy, so it must
             // stay live until CreateProcessW returns.
-            attr.update(
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                std::ptr::from_mut(&mut sec_caps).cast(),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-            )?;
+            if confined {
+                attr.update(
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    std::ptr::from_mut(&mut sec_caps).cast(),
+                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                )?;
+            }
             attr.update(
                 PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
                 jobs.as_ptr().cast_mut().cast(),
@@ -2206,9 +2335,9 @@ pub(super) mod launch {
             //     holds the helper in a KILL_ON_JOB_CLOSE job dropped when `run` returns (after the
             //     child is waited + reaped below), so the helper lives exactly the child's lifetime
             //     and dies with nub even on a crash.
-            let _egress_helper = if let Some(policy) = plan.egress_funnel.take() {
+            let _egress_helper = if let Some(policy) = &self.egress_funnel {
                 let (port, token, guard) = timed("egress_funnel_helper", || {
-                    launch_egress_helper(ac_sid, &policy, plan.env.as_ref())
+                    launch_egress_helper(ac_sid, policy, plan.env.as_ref())
                 })?;
                 if let Some(env) = plan.env.as_mut() {
                     let url = format!("http://{token}@127.0.0.1:{port}");
@@ -2237,7 +2366,26 @@ pub(super) mod launch {
             };
 
             // 6. Build the command line + env block + cwd (kept alive across the call).
-            let mut cmdline = build_command_line(&plan.program, &plan.args);
+            let (application, mut cmdline) = if confined {
+                (None, build_command_line(&plan.program, &plan.args))
+            } else {
+                let application = resolve_plain_image(&plan)?;
+                let batch = application.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+                });
+                if batch {
+                    let cmd = windows_directory(true)?.join("cmd.exe");
+                    (
+                        Some(to_wide_path(&cmd)),
+                        build_batch_command_line(&application, &plan.args)?,
+                    )
+                } else {
+                    (
+                        Some(to_wide_path(&application)),
+                        build_command_line(&plan.program, &plan.args),
+                    )
+                }
+            };
             let env_block = plan.env.as_ref().map(build_env_block);
             let cwd_wide = plan.cwd.as_ref().map(|c| to_wide(&c.to_string_lossy()));
 
@@ -2288,7 +2436,10 @@ pub(super) mod launch {
             // new console. Every byte of script output vanished in both the piped and the
             // interactive arm. `CREATE_NO_WINDOW` gives the console up front so nothing reallocates
             // it, and unlike `CREATE_NEW_CONSOLE` it flashes no window on an interactive desktop.
-            let mut flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
+            let mut flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
+            if confined {
+                flags |= CREATE_NO_WINDOW;
+            }
             let env_ptr: *const std::ffi::c_void = match &env_block {
                 Some(b) => {
                     flags |= CREATE_UNICODE_ENVIRONMENT;
@@ -2302,7 +2453,9 @@ pub(super) mod launch {
             // call; lpCommandLine is a writable UTF-16 buffer as CreateProcessW requires.
             let mut launch = || unsafe {
                 CreateProcessW(
-                    std::ptr::null(),
+                    application
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
                     cmdline.as_mut_ptr(),
                     std::ptr::null(),
                     std::ptr::null(),
@@ -2321,7 +2474,14 @@ pub(super) mod launch {
             };
             let ok = launch();
             if ok == 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "CreateProcessW ({}) failed: {error}",
+                        if confined { "AppContainer" } else { "plain" }
+                    ),
+                ));
             }
             let _ = &cap_sid_owned; // backs `sec_caps` through attribute-list destruction
 
@@ -2345,6 +2505,7 @@ pub(super) mod launch {
                 tracked: Vec::new(),
                 last_exit: None,
             };
+            before_resume(child.pid)?;
             if unsafe { ResumeThread(thread.0) } == u32::MAX {
                 let error = io::Error::last_os_error();
                 let _ = child.kill();
@@ -2352,6 +2513,153 @@ pub(super) mod launch {
             }
             Ok(child)
         }
+    }
+
+    fn windows_directory(system: bool) -> io::Result<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        unsafe extern "system" {
+            fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+            fn GetWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        }
+        let mut buffer = vec![0u16; 32768];
+        let len = unsafe {
+            if system {
+                GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32)
+            } else {
+                GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32)
+            }
+        } as usize;
+        if len == 0 || len >= buffer.len() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(std::ffi::OsString::from_wide(&buffer[..len]).into())
+    }
+
+    fn resolve_plain_image(plan: &PlainLaunch) -> io::Result<PathBuf> {
+        let name = Path::new(&plan.program);
+        if name.as_os_str().is_empty() || name.file_name().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program path has no file name",
+            ));
+        }
+        if name.components().count() != 1 {
+            let path = std::path::absolute(name)?;
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                let mut exe = path.as_os_str().to_os_string();
+                exe.push(".exe");
+                let exe = PathBuf::from(exe);
+                if exe.is_file() {
+                    return Ok(exe);
+                }
+            }
+            return Ok(path);
+        }
+        // Match std's Windows search order, including a command's replaced PATH.
+        let mut roots = Vec::new();
+        if let Some(path) = plan.env.as_ref().and_then(|env| {
+            env.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .map(|(_, value)| value)
+        }) {
+            roots.extend(std::env::split_paths(path));
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            roots.push(parent.to_path_buf());
+        }
+        roots.push(windows_directory(true)?);
+        roots.push(windows_directory(false)?);
+        if let Some(path) = std::env::var_os("PATH") {
+            roots.extend(std::env::split_paths(&path));
+        }
+        for root in roots
+            .into_iter()
+            .filter(|root| !root.as_os_str().is_empty())
+        {
+            let mut path = root.join(name);
+            if !plan.program.as_encoded_bytes().contains(&b'.') {
+                path.set_extension("exe");
+            }
+            if path.is_file() {
+                return std::path::absolute(path);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::NotFound, "program not found"))
+    }
+
+    // Match std's batch-file escaping, rather than treating cmd syntax as argv.
+    // In particular, percent expansion and embedded quotes require cmd's rules.
+    fn build_batch_command_line(
+        script: &Path,
+        args: &crate::backend::CommandArgs,
+    ) -> io::Result<Vec<u16>> {
+        let script = super::strip_verbatim_prefix(script.to_path_buf());
+        let script: Vec<u16> = script.as_os_str().encode_wide().collect();
+        if script.contains(&u16::from(b'"')) || script.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid batch script path",
+            ));
+        }
+        let mut line: Vec<u16> = "cmd.exe /e:ON /v:OFF /d /c \"\"".encode_utf16().collect();
+        line.extend(script);
+        line.push(u16::from(b'"'));
+        match args {
+            crate::backend::CommandArgs::Verbatim(raw) => {
+                line.push(u16::from(b' '));
+                line.extend(raw.encode_wide());
+            }
+            crate::backend::CommandArgs::Argv(args) => {
+                for arg in args {
+                    let chars: Vec<u16> = arg.encode_wide().collect();
+                    if chars.iter().any(|c| matches!(*c, 0 | 10 | 13)) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid batch argument",
+                        ));
+                    }
+                    let quote = chars.is_empty()
+                        || chars.last() == Some(&u16::from(b'\\'))
+                        || char::decode_utf16(chars.iter().copied())
+                            .filter_map(Result::ok)
+                            .any(|c| {
+                                (c.is_ascii()
+                                    && !(c.is_ascii_alphanumeric() || r"#$*+-./:?@\_".contains(c)))
+                                    || c.is_control()
+                            });
+                    line.push(u16::from(b' '));
+                    if quote {
+                        line.push(u16::from(b'"'));
+                    }
+                    let mut slashes = 0;
+                    for c in chars {
+                        if c == u16::from(b'\\') {
+                            slashes += 1;
+                        } else {
+                            if c == u16::from(b'"') {
+                                line.extend(std::iter::repeat_n(u16::from(b'\\'), slashes));
+                                line.push(u16::from(b'"'));
+                            } else if c == u16::from(b'%') {
+                                line.extend("%%cd:~,".encode_utf16());
+                            }
+                            slashes = 0;
+                        }
+                        line.push(c);
+                    }
+                    if quote {
+                        line.extend(std::iter::repeat_n(u16::from(b'\\'), slashes));
+                        line.push(u16::from(b'"'));
+                    }
+                }
+            }
+        }
+        line.extend([u16::from(b'"'), 0]);
+        Ok(line)
     }
 
     /// A capability SID string converted to a PSID (LocalFree'd on drop).
@@ -2574,7 +2882,7 @@ pub(super) mod launch {
     }
 
     impl NativeStdio {
-        fn new(modes: [WindowsStdio; 3]) -> io::Result<Self> {
+        fn new(modes: [WindowsStdio; 3], relay_console: bool) -> io::Result<Self> {
             let mut result = Self {
                 triple: [std::ptr::null_mut(); 3],
                 inherit_list: Vec::new(),
@@ -2591,7 +2899,10 @@ pub(super) mod launch {
             ];
             for (index, mode) in modes.into_iter().enumerate() {
                 let raw = parent[index];
-                let relay = mode == WindowsStdio::Inherit && index > 0 && is_console_handle(raw);
+                let relay = relay_console
+                    && mode == WindowsStdio::Inherit
+                    && index > 0
+                    && is_console_handle(raw);
                 let handle = if mode == WindowsStdio::Piped {
                     let (ours, theirs) = child_stdio_pipe(index != 0)?;
                     if index == 0 {
@@ -2643,7 +2954,7 @@ pub(super) mod launch {
         stderr: Option<std::process::ChildStderr>,
         relays: Vec<std::thread::JoinHandle<()>>,
         helper: Option<HelperGuard>,
-        _resource: Arc<ResourceState>,
+        _resource: Option<Arc<ResourceState>>,
         status: Option<ExitStatus>,
         tracked: Vec<(u32, HandleGuard)>,
         last_exit: Option<(u64, u32)>,
@@ -2885,6 +3196,39 @@ pub(super) mod launch {
         Ok(sid)
     }
 
+    /// AppContainer process creation requires LOCALAPPDATA even with a scrubbed
+    /// environment. Supply only the native known-folder path, before fingerprinting
+    /// the resulting profile storage grants; never copy the ambient environment.
+    fn ensure_appcontainer_environment(env: &mut BTreeMap<String, String>) -> io::Result<()> {
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+        if env
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("LOCALAPPDATA"))
+        {
+            return Ok(());
+        }
+        let mut path = std::ptr::null_mut();
+        let hr = unsafe {
+            SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, std::ptr::null_mut(), &mut path)
+        };
+        if hr < 0 {
+            return Err(io::Error::other(format!(
+                "SHGetKnownFolderPath(LocalAppData) failed hr=0x{hr:08x}"
+            )));
+        }
+        let mut len = 0;
+        unsafe {
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(path, len) });
+        unsafe { CoTaskMemFree(path.cast()) };
+        env.insert("LOCALAPPDATA".into(), value);
+        Ok(())
+    }
+
     fn appcontainer_folder(sid: PSID) -> io::Result<PathBuf> {
         use windows_sys::Win32::Security::Isolation::GetAppContainerFolderPath;
         use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -2961,6 +3305,7 @@ pub(super) mod launch {
                 }
                 for path in &entry.private_paths {
                     if Path::new(path).exists() {
+                        super::windows_registry::validate_private_path(&entry, Path::new(path))?;
                         std::fs::remove_dir_all(path)?;
                     }
                 }
@@ -3008,9 +3353,8 @@ pub(super) mod launch {
         Ok(sid)
     }
 
-    /// The confinement Job: whole-tree reap on handle close, plus the active-process
-    /// ceiling (see [`super::active_process_cap`]).
-    fn create_confinement_job() -> io::Result<HANDLE> {
+    /// Every command gets whole-tree ownership; only confinement imposes a cap.
+    fn create_process_job(confined: bool) -> io::Result<HANDLE> {
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             return Err(io::Error::last_os_error());
@@ -3019,9 +3363,11 @@ pub(super) mod launch {
         // ACTIVE_PROCESS is transitive to grandchildren and refuses CREATE_BREAKAWAY_FROM_JOB,
         // so confined code cannot escape it; it needs no privilege, which is why it is the
         // containment lever the zero-privilege jail can actually use.
-        info.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.BasicLimitInformation.ActiveProcessLimit = super::active_process_cap();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if confined {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            info.BasicLimitInformation.ActiveProcessLimit = super::active_process_cap();
+        }
         let ok = unsafe {
             SetInformationJobObject(
                 job,
@@ -3134,7 +3480,7 @@ pub(super) mod launch {
         // 4. Proc-thread attribute list: SECURITY_CAPABILITIES + a HANDLE_LIST scoping inheritance
         //    to exactly the stdout write end.
         let inherit = [w];
-        let job_guard = HandleGuard(create_confinement_job()?);
+        let job_guard = HandleGuard(create_process_job(true)?);
         let jobs = [job_guard.0];
         let mut attr = ProcThreadAttrList::new(3)?;
         attr.update(
@@ -3166,7 +3512,7 @@ pub(super) mod launch {
         si.StartupInfo.hStdError = w;
 
         // Only OS startup roots, never ambient or injected credential values.
-        let helper_env: std::collections::BTreeMap<String, String> = [
+        let mut helper_env: std::collections::BTreeMap<String, String> = [
             "SystemRoot",
             "WINDIR",
             "TEMP",
@@ -3181,6 +3527,7 @@ pub(super) mod launch {
                 .map(|(_, value)| (key.to_string(), value.clone()))
         })
         .collect();
+        ensure_appcontainer_environment(&mut helper_env)?;
         let env_block = build_env_block(&helper_env);
         let flags = EXTENDED_STARTUPINFO_PRESENT
             | CREATE_SUSPENDED
@@ -3204,7 +3551,11 @@ pub(super) mod launch {
             )
         };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("CreateProcessW (AppContainer egress helper) failed: {error}"),
+            ));
         }
         let _ = &cap_owned; // backs `sec_caps` — held alive until here
 

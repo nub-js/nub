@@ -78,6 +78,12 @@ fn native_child() {
             std::fs::write(root.join("project/later/nested/output"), b"later").unwrap();
             assert!(std::env::var_os("SANDBOX_PARENT_SECRET").is_none());
         }
+        #[cfg(target_os = "macos")]
+        "sharedtmp" => {
+            let canary = std::fs::read_to_string(root.join("project/canary-path")).unwrap();
+            assert!(std::fs::read(&canary).is_err());
+            assert!(std::fs::write(&canary, b"forbidden").is_err());
+        }
         "tmp" => {
             let tmp = std::env::temp_dir();
             let marker = tmp.join("session-marker");
@@ -250,6 +256,24 @@ fn managed_temp_is_shared_by_commands_until_session_close() {
         !tmp.exists(),
         "closed Unix session retained its managed temp"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn private_temp_does_not_grant_the_shared_darwin_scratch_directory() {
+    let root = fixture();
+    for path in ["project", "readable", "cache"] {
+        std::fs::create_dir_all(root.path().join(path)).unwrap();
+    }
+    let canary = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(canary.path(), b"unchanged").unwrap();
+    std::fs::write(
+        root.path().join("project/canary-path"),
+        canary.path().to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    run(&sandbox(root.path(), "sharedtmp"), root.path(), "sharedtmp");
+    assert_eq!(std::fs::read(canary.path()).unwrap(), b"unchanged");
 }
 
 #[test]

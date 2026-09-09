@@ -1,8 +1,31 @@
-use nub_sandbox::{CommandSpec, Sandbox, SandboxPolicy};
+use nub_sandbox::{
+    CommandSpec, CompileCtx, Homes, Sandbox, SandboxPolicy, ScopeCapabilities, compile,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
 
-fn resolved_policy() -> SandboxPolicy {
-    let mut policy = SandboxPolicy::default();
-    policy.env.resolved = true;
+fn resolved_policy(root: &Path) -> SandboxPolicy {
+    let environment: BTreeMap<String, String> = ["PATH", "SystemRoot", "WINDIR", "COMSPEC"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
+        .collect();
+    let context = CompileCtx::new(
+        Homes {
+            home: root.into(),
+            cache: root.into(),
+            tmp: root.into(),
+            project: root.into(),
+        },
+        root.into(),
+        ScopeCapabilities::approved(),
+        environment.clone(),
+    );
+    let mut policy = compile(
+        &serde_json::json!({"fs": {"./": "rw", "$tmp": "rw"}, "net": false}),
+        &context,
+    )
+    .unwrap();
+    policy.env.constructed = environment;
     policy
 }
 
@@ -17,19 +40,21 @@ fn echo_command(value: &str) -> CommandSpec {
 fn echo_command(value: &str) -> CommandSpec {
     CommandSpec::new("cmd.exe")
         .args(["/d", "/s", "/c"])
-        .arg(format!("<nul set /p ={value}"))
+        .arg(format!("<nul set /p ={value} & exit /b 0"))
 }
 
 #[test]
 fn acquired_sandbox_submits_independent_commands() {
-    let sandbox = Sandbox::acquire(&resolved_policy()).expect("resolved policy acquires");
+    let root = tempfile::tempdir().unwrap();
+    let sandbox =
+        Sandbox::acquire(&resolved_policy(root.path())).expect("resolved policy acquires");
     let first = sandbox
-        .prepare(echo_command("one"))
+        .prepare(echo_command("one").cwd(root.path()))
         .expect("first command prepares")
         .output()
         .expect("first command runs");
     let second = sandbox
-        .prepare(echo_command("two"))
+        .prepare(echo_command("two").cwd(root.path()))
         .expect("second command prepares")
         .output()
         .expect("second command runs");
@@ -42,9 +67,10 @@ fn acquired_sandbox_submits_independent_commands() {
 
 #[test]
 fn prepared_command_keeps_acquired_resources_alive_after_close() {
-    let sandbox = Sandbox::new(&resolved_policy()).expect("resolved policy acquires");
+    let root = tempfile::tempdir().unwrap();
+    let sandbox = Sandbox::new(&resolved_policy(root.path())).expect("resolved policy acquires");
     let prepared = sandbox
-        .prepare(echo_command("live"))
+        .prepare(echo_command("live").cwd(root.path()))
         .expect("command prepares before close");
     sandbox.close();
 

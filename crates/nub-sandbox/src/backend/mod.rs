@@ -17,7 +17,7 @@
 //! Callers launch through [`Prepared::spawn`], [`Prepared::status`], or
 //! [`Prepared::output`], preserving startup verification and resource ownership.
 //! Windows AppContainer launches own CreateProcessW, Job Object and ACL lifetimes.
-//! Plain Windows launches keep Command's argument/stdio handling and own a process-tree job.
+//! Windows launches own a process-tree Job from process creation, with or without a LowBox token.
 
 use crate::policy::{Effect, Inspection, ProxyMode, SandboxPolicy};
 use crate::proxy::mitm::{BrokerSession, MitmEngine, RuntimeCredentialBroker};
@@ -146,8 +146,6 @@ pub fn landlock_abi() -> Option<u32> {
 #[cfg(any(target_os = "windows", test))]
 mod windows;
 
-#[cfg(windows)]
-mod windows_job;
 #[cfg(target_os = "windows")]
 pub use windows::windows_publish_appcontainer_read;
 #[cfg(target_os = "windows")]
@@ -424,9 +422,8 @@ pub struct Prepared {
     /// a process group after the kernel confirms the backend's requested grouping.
     #[cfg(unix)]
     pub(crate) signal_process_group: bool,
-    /// Windows launch plan — the backend owns spawn+wait+teardown when this is `Some`.
-    /// A per-run AppContainer plan. Without one, `status` uses the plain command
-    /// path, retaining process-tree ownership without a LowBox token.
+    /// Native Windows launch plan, including the plain compatibility path. Every
+    /// Windows command receives creation-time process-tree ownership.
     #[cfg(target_os = "windows")]
     pub(crate) launch: Option<windows::WindowsLaunch>,
     /// Compatibility owner for a one-shot private tmp directory. Reusable sessions retain
@@ -531,8 +528,6 @@ pub struct PreparedChild {
     child_id: u32,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     guardian: Option<unix_guardian::UnixGuardian>,
-    #[cfg(windows)]
-    windows_job: Option<windows_job::Job>,
     #[cfg(unix)]
     signal_target: Option<i32>,
     _proxy: Option<EgressProxy>,
@@ -837,8 +832,6 @@ impl PreparedChild {
     fn release_resources(&mut self) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.guardian.take();
-        #[cfg(windows)]
-        self.windows_job.take();
         // Drop order matters: the proxy before the private tmp dir it may have written into.
         self._proxy.take();
         self._private_tmp.take();
@@ -916,30 +909,10 @@ fn kill_and_reap(child: &mut std::process::Child) {
     let _ = wait_child_eintr(child);
 }
 
-/// Confirm the just-spawned child leads its OWN process group, which is what makes `-pid`
-/// name its tree and nothing else.
-///
-/// THE GATE IS THE SAFETY PROPERTY. If the `pre_exec` hook's `setpgid`/`setsid` failed the
-/// child is still in nub's group, where a negative target would SIGKILL nub itself along
-/// with every sibling script — so the group is signalled on the kernel's word, never on the
-/// assumption that the hook ran.
-///
-/// A PURE READ, deliberately: it never puts the child INTO a group. Completing the textbook
-/// race-free `setpgid` pair from the parent would be both dead and dangerous — dead because
-/// `pre_exec` forces std off `posix_spawn` onto fork+exec, where the parent blocks on the
-/// exec-report pipe until the child has exec'd, so the hook has always run by the time
-/// `spawn` returns; dangerous because it would MANUFACTURE the leadership this then
-/// "confirms", turning any future launch that sets the flag without installing the hook
-/// into a silent relocate-and-kill of an unrelated process.
-///
-/// `ESRCH` counts as confirmation, and is not the fail-open it looks like: macOS `getpgid`
-/// refuses a ZOMBIE (measured; Linux answers correctly), so a script that exits the instant
-/// it is spawned would otherwise disable reaping in precisely the case it exists for — the
-/// shell gone, the writer it backgrounded running on. Safe because the hook provably ran (a
-/// failing `pre_exec` fails the spawn instead) and the pid cannot be recycled while the
-/// caller still holds the unreaped `Child`, so `-pid` names that child's own group or
-/// nothing. The `getpgrp` check keeps that reasoning from being the only thing between a
-/// pid and nub's own group.
+/// Confirm membership in the launch-owned group without changing it. Never signal
+/// the host's group. A failed pre-exec join fails spawn; ESRCH is accepted for an
+/// already-exited, still-unreaped child (macOS getpgid rejects zombies). The caller
+/// retains the guardian, so its expected group identity cannot be recycled here.
 #[cfg(unix)]
 fn confirm_group_membership(pid: i32, expected: i32) -> bool {
     // SAFETY: `getpgid` on a child of this process, `getpgrp` on ourselves — plain reads.
@@ -977,13 +950,15 @@ fn try_wait_child_eintr(
 impl Prepared {
     #[cfg(windows)]
     fn retain_windows_lease(&self, resource: &windows::WindowsResource) -> std::io::Result<()> {
-        if let Some(session) = &self.session {
+        if let (Some(session), Some(identity), Some(lease)) =
+            (&self.session, resource.identity(), resource.lease())
+        {
             session
                 .windows_leases
                 .lock()
                 .map_err(|_| std::io::Error::other("sandbox session lease lock poisoned"))?
-                .entry(resource.identity().to_owned())
-                .or_insert_with(|| resource.lease());
+                .entry(identity.to_owned())
+                .or_insert(lease);
         }
         Ok(())
     }
@@ -996,7 +971,9 @@ impl Prepared {
     /// Whether this launch confines through the Windows AppContainer path.
     #[cfg(target_os = "windows")]
     pub fn will_confine(&self) -> bool {
-        self.launch.is_some()
+        self.launch
+            .as_ref()
+            .is_some_and(windows::WindowsLaunch::is_appcontainer)
     }
 
     /// Install a signal target while a supervised Linux child is still blocked.
@@ -1006,130 +983,128 @@ impl Prepared {
         ready: impl FnOnce(PreparedSignalTarget) -> std::io::Result<()>,
     ) -> std::io::Result<PreparedChild> {
         #[cfg(target_os = "windows")]
-        if let Some(launch) = self.launch.take() {
+        {
+            let launch = self.launch.take().ok_or_else(|| {
+                std::io::Error::other("Windows command is missing its owned launch plan")
+            })?;
             let resource = launch.acquire()?;
             self.retain_windows_lease(&resource)?;
             let child = resource.spawn()?;
             let child_id = child.id();
             let _ = ready;
-            return Ok(PreparedChild {
+            Ok(PreparedChild {
                 child: None,
                 windows_child: Some(child),
                 child_id,
-                windows_job: None,
                 _proxy: self.proxy.take(),
                 _private_tmp: self._private_tmp.take(),
                 _session: self.session.take(),
-            });
+            })
         }
-        #[cfg(target_os = "linux")]
-        if let Some(plan) = self.supervised.take() {
-            let stdout = if self.redact_stdout {
-                linux_supervisor::SupervisedStdio::Piped
-            } else {
-                linux_supervisor::SupervisedStdio::Inherit
+        #[cfg(not(windows))]
+        {
+            #[cfg(target_os = "linux")]
+            if let Some(plan) = self.supervised.take() {
+                let stdout = if self.redact_stdout {
+                    linux_supervisor::SupervisedStdio::Piped
+                } else {
+                    linux_supervisor::SupervisedStdio::Inherit
+                };
+                let stderr = if self.redact_stderr {
+                    linux_supervisor::SupervisedStdio::Piped
+                } else {
+                    linux_supervisor::SupervisedStdio::Inherit
+                };
+                let child = plan.spawn_with_ready(
+                    linux_supervisor::SupervisedStdio::Inherit,
+                    stdout,
+                    stderr,
+                    |group| ready(PreparedSignalTarget::Direct(-group)),
+                )?;
+                let child_id = child.id();
+                let signal_target = child.process_group_id().map(|group| -group);
+                return Ok(PreparedChild {
+                    child: None,
+                    supervised_child: Some(child),
+                    guardian: None,
+                    child_id,
+                    signal_target,
+                    _proxy: self.proxy.take(),
+                    _private_tmp: self._private_tmp.take(),
+                    _session: self.session.take(),
+                });
+            }
+            // Pipe the requested fds so the host can drain them through its redactor. stdin is
+            // left untouched (interactive input still reaches the child). Both flags off (the
+            // default) = inherit, so the non-redacting path is byte-for-byte unchanged.
+            if self.redact_stdout {
+                self.command.stdout(std::process::Stdio::piped());
+            }
+            if self.redact_stderr {
+                self.command.stderr(std::process::Stdio::piped());
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let guardian = {
+                let guardian = unix_guardian::UnixGuardian::start()?;
+                guardian.join_command(&mut self.command);
+                #[cfg(target_os = "linux")]
+                linux_lifetime::attach(&mut self.command)?;
+                guardian
             };
-            let stderr = if self.redact_stderr {
-                linux_supervisor::SupervisedStdio::Piped
-            } else {
-                linux_supervisor::SupervisedStdio::Inherit
+            #[allow(unused_mut)]
+            let mut child = self.command.spawn()?;
+            // The Landlock backend inherits its ruleset descriptor across spawn; the parent copy
+            // can close the moment the child holds it (the `pre_exec` hook consumes it after fork).
+            #[cfg(target_os = "linux")]
+            self._inherited_files.clear();
+            // A failed guardian pre-exec hook fails spawn. Retain the backend's
+            // requested membership cross-check before handing a negative target out.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if self.signal_process_group
+                && !confirm_group_membership(child.id() as i32, guardian.process_group_id())
+            {
+                kill_and_reap(&mut child, Some(-guardian.process_group_id()));
+                return Err(std::io::Error::other(
+                    "sandbox command did not join its owner-death guardian",
+                ));
+            }
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+            let signal_process_group = self.signal_process_group
+                && confirm_group_membership(child.id() as i32, child.id() as i32);
+            // Negative targets name the private guardian group, never the host group.
+            #[cfg(unix)]
+            let signal_target = {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let target = -guardian.process_group_id();
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let target = if signal_process_group {
+                    -(child.id() as i32)
+                } else {
+                    child.id() as i32
+                };
+                if let Err(error) = ready(PreparedSignalTarget::Direct(target)) {
+                    kill_and_reap(&mut child, Some(target));
+                    return Err(error);
+                }
+                Some(target)
             };
-            let child = plan.spawn_with_ready(
-                linux_supervisor::SupervisedStdio::Inherit,
-                stdout,
-                stderr,
-                |group| ready(PreparedSignalTarget::Direct(-group)),
-            )?;
+            #[cfg(not(unix))]
+            let _ = ready;
             let child_id = child.id();
-            let signal_target = child.process_group_id().map(|group| -group);
-            return Ok(PreparedChild {
-                child: None,
-                supervised_child: Some(child),
-                guardian: None,
+            Ok(PreparedChild {
+                child: Some(child),
+                #[cfg(target_os = "linux")]
+                supervised_child: None,
                 child_id,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                guardian: Some(guardian),
+                #[cfg(unix)]
                 signal_target,
                 _proxy: self.proxy.take(),
                 _private_tmp: self._private_tmp.take(),
                 _session: self.session.take(),
-            });
+            })
         }
-        // Pipe the requested fds so the host can drain them through its redactor. stdin is
-        // left untouched (interactive input still reaches the child). Both flags off (the
-        // default) = inherit, so the non-redacting path is byte-for-byte unchanged.
-        if self.redact_stdout {
-            self.command.stdout(std::process::Stdio::piped());
-        }
-        if self.redact_stderr {
-            self.command.stderr(std::process::Stdio::piped());
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let guardian = {
-            let guardian = unix_guardian::UnixGuardian::start()?;
-            guardian.join_command(&mut self.command);
-            #[cfg(target_os = "linux")]
-            linux_lifetime::attach(&mut self.command)?;
-            guardian
-        };
-        #[allow(unused_mut)]
-        #[cfg(not(windows))]
-        let mut child = self.command.spawn()?;
-        #[cfg(windows)]
-        let (child, windows_job) = windows_job::spawn(&mut self.command)?;
-        // The Landlock backend inherits its ruleset descriptor across spawn; the parent copy
-        // can close the moment the child holds it (the `pre_exec` hook consumes it after fork).
-        #[cfg(target_os = "linux")]
-        self._inherited_files.clear();
-        // A failed guardian pre-exec hook fails spawn. Retain the backend's
-        // requested membership cross-check before handing a negative target out.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if self.signal_process_group
-            && !confirm_group_membership(child.id() as i32, guardian.process_group_id())
-        {
-            kill_and_reap(&mut child, Some(-guardian.process_group_id()));
-            return Err(std::io::Error::other(
-                "sandbox command did not join its owner-death guardian",
-            ));
-        }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        let signal_process_group = self.signal_process_group
-            && confirm_group_membership(child.id() as i32, child.id() as i32);
-        // Negative targets name the private guardian group, never the host group.
-        #[cfg(unix)]
-        let signal_target = {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let target = -guardian.process_group_id();
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let target = if signal_process_group {
-                -(child.id() as i32)
-            } else {
-                child.id() as i32
-            };
-            if let Err(error) = ready(PreparedSignalTarget::Direct(target)) {
-                kill_and_reap(&mut child, Some(target));
-                return Err(error);
-            }
-            Some(target)
-        };
-        #[cfg(not(unix))]
-        let _ = ready;
-        let child_id = child.id();
-        Ok(PreparedChild {
-            child: Some(child),
-            #[cfg(target_os = "linux")]
-            supervised_child: None,
-            #[cfg(target_os = "windows")]
-            windows_child: None,
-            child_id,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            guardian: Some(guardian),
-            #[cfg(windows)]
-            windows_job: Some(windows_job),
-            #[cfg(unix)]
-            signal_target,
-            _proxy: self.proxy.take(),
-            _private_tmp: self._private_tmp.take(),
-            _session: self.session.take(),
-        })
     }
 
     /// Launch and wait, retaining the backend's process-tree and resource ownership.
@@ -1176,7 +1151,6 @@ impl Prepared {
                 child: None,
                 windows_child: Some(child),
                 child_id,
-                windows_job: None,
                 _proxy: self.proxy.take(),
                 _private_tmp: self._private_tmp.take(),
                 _session: self.session.take(),

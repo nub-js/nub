@@ -681,7 +681,7 @@ fn shared_tmp_dirs() -> Vec<String> {
 /// LIMITATIONS.md.
 fn emit_tmp(policy: &SandboxPolicy, tmp_dir: Option<&std::path::Path>, out: &mut String) {
     use crate::policy::TmpMode;
-    if policy.fs.tmp == TmpMode::Shared {
+    if policy.fs.tmp == crate::policy::TmpMode::Shared {
         return;
     }
     // Legacy policies carrying an actual deny still need a Seatbelt subtraction to preserve
@@ -923,20 +923,15 @@ fn emit_fs(policy: &SandboxPolicy, spec: &CommandSpec, out: &mut String) {
             (Effect::Deny, _) => out.push_str(&format!("(deny file-write* {term})\n")),
         }
     }
-    // The Apple toolchain (xcrun/cc/libtool) writes its `xcrun_db` scratch to the
-    // per-user DARWIN confstr TEMP dir — NOT redirectable via TMPDIR — so a
-    // from-source compile fails without this grant. Emitted LAST so it survives every
-    // write-deny above it under last-match-wins; since only a Deny emits one, the only
-    // thing it can override is a user write-deny targeting the OS temp, which is rare
-    // and acceptable (and `emit_move_block` re-asserts that deny's unlink/create half
-    // afterwards). The persistent DARWIN CACHE dir is deliberately NOT
-    // granted — it is a cross-build poisoning surface a later unsandboxed tool
-    // consumes, and `cc`/`xcrun` need only the temp scratch.
-    for dir in confstr_scratch_dirs() {
-        out.push_str(&format!(
-            "(allow file-write* (subpath \"{}\"))\n",
-            sbpl_escape(&dir)
-        ));
+    // Shared tmp includes the Darwin scratch directory. Private tmp grants only
+    // xcrun's fixed cache/staging names in emit_tmp, not the whole scratch tree.
+    if policy.fs.tmp == crate::policy::TmpMode::Shared {
+        for dir in confstr_scratch_dirs() {
+            out.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                sbpl_escape(&dir)
+            ));
+        }
     }
 
     emit_move_block(policy, out);

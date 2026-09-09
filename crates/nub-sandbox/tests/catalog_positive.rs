@@ -49,15 +49,9 @@ fn catalog_user_home_grant_includes_a_credential_canary() {
         Effect::Allow,
         "the real catalog userHome grant must be literal, including credential-bearing files"
     );
-    assert!(
-        policy.fs.rules.entries.iter().any(|rule| {
-            rule.effect == Effect::Allow
-                && rule.access == FsAccess::ReadWrite
-                && rule
-                    .matcher
-                    .as_str()
-                    .contains(homes.home.to_string_lossy().as_ref())
-        }),
+    assert_eq!(
+        matcher.decide(&canary).access,
+        FsAccess::ReadWrite,
         "the userHome catalog grant must remain writable"
     );
 }

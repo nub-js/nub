@@ -48,6 +48,16 @@ fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
     }
 }
 
+fn plain_plan(root: &Path, mode: &str) -> WindowsLaunch {
+    let plan = plan(root, mode);
+    let mut spec = crate::CommandSpec::new(plan.program);
+    spec.args = plan.args;
+    spec.cwd = plan.cwd;
+    spec.redact_stdout = true;
+    spec.redact_stderr = true;
+    WindowsLaunch::plain(spec, plan.env.unwrap())
+}
+
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() {
@@ -99,6 +109,12 @@ fn windows_native_child_fixture() {
             println!("native-stdout:{input}");
             eprintln!("native-stderr");
             println!("{}", super::windows_token_report());
+        }
+        "scrubbed-env" => {
+            assert!(std::env::var_os("LOCALAPPDATA").is_some());
+            assert!(std::env::var_os("USERPROFILE").is_none());
+            assert!(std::env::var_os("PATH").is_none());
+            println!("scrubbed-env-ok");
         }
         "tmp" => {
             let tmp = std::env::var("TMP").unwrap();
@@ -157,6 +173,26 @@ fn windows_native_child_fixture() {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).unwrap();
             drop(child);
+        }
+        "plain-owner-suspended" => {
+            let resource = plain_plan(&root, "hold").acquire().unwrap();
+            assert!(resource.identity().is_none());
+            assert!(resource.lease().is_none());
+            let _child = resource
+                .spawn_before_resume(
+                    WindowsStdio::Null,
+                    WindowsStdio::Null,
+                    WindowsStdio::Null,
+                    |pid| {
+                        let pending = root.join("suspended.pending");
+                        std::fs::write(&pending, pid.to_string())?;
+                        std::fs::rename(pending, root.join("suspended"))?;
+                        let mut gate = String::new();
+                        std::io::stdin().read_to_string(&mut gate)?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
         }
         _ => panic!("unexpected fixture mode"),
     }
@@ -366,6 +402,33 @@ fn windows_native_owner_guard_reaps_on_fixture_panic() {
 }
 
 #[test]
+fn windows_native_scrubbed_environment_supplies_only_required_profile_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let mut launch = plan(root.path(), "scrubbed-env");
+    launch.env.as_mut().unwrap().retain(|key, _| {
+        !["LOCALAPPDATA", "USERPROFILE", "PATH"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+    });
+    let resource = launch.acquire().expect("acquire with scrubbed environment");
+    let mut child = resource
+        .spawn_with_stdio(
+            WindowsStdio::Null,
+            WindowsStdio::Piped,
+            WindowsStdio::Inherit,
+        )
+        .expect("spawn with scrubbed environment");
+    let mut output = String::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "{output}");
+    assert!(output.contains("scrubbed-env-ok"), "{output}");
+}
+
+#[test]
 fn windows_native_managed_tmp_reuses_slot_without_retaining_command_environment() {
     let root = tempfile::tempdir().unwrap();
     let mut first = plan(root.path(), "tmp");
@@ -385,8 +448,8 @@ fn windows_native_managed_tmp_reuses_slot_without_retaining_command_environment(
     }
     let first = first.acquire().unwrap();
     let slot = first.private_tmp().unwrap().to_path_buf();
-    let identity = first.identity().to_string();
-    let keepalive = first.lease();
+    let identity = first.identity().unwrap().to_string();
+    let keepalive = first.lease().unwrap();
     drop(first);
     assert!(
         keepalive.is_live(),
@@ -397,7 +460,7 @@ fn windows_native_managed_tmp_reuses_slot_without_retaining_command_environment(
         "session lease protects a resource between commands"
     );
     let second = second.acquire().unwrap();
-    assert_eq!(second.identity(), identity);
+    assert_eq!(second.identity(), Some(identity.as_str()));
     assert_eq!(second.private_tmp(), Some(slot.as_path()));
     let mut child = second
         .spawn_with_stdio(
@@ -438,4 +501,143 @@ fn windows_native_explicit_grant_changes_never_share_managed_tmp() {
     let second = second.acquire().unwrap();
     assert_ne!(first.identity(), second.identity());
     assert_ne!(first.private_tmp(), second.private_tmp());
+}
+
+#[test]
+fn windows_plain_streams_preserve_output_without_a_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = plain_plan(root.path(), "echo");
+    assert!(!launch.is_appcontainer());
+    let resource = launch.acquire().unwrap();
+    assert!(resource.identity().is_none());
+    assert!(resource.lease().is_none());
+    assert!(resource.private_tmp().is_none());
+    let mut child = resource
+        .spawn_with_stdio(
+            WindowsStdio::Piped,
+            WindowsStdio::Piped,
+            WindowsStdio::Piped,
+        )
+        .unwrap();
+    let mut input = child.take_stdin().unwrap();
+    let payload = "plain-pipe".repeat(16 * 1024);
+    input.write_all(payload.as_bytes()).unwrap();
+    drop(input);
+    let mut stdout = child.take_stdout().unwrap();
+    let mut stderr = child.take_stderr().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).unwrap();
+        text
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = String::new();
+        stderr.read_to_string(&mut text).unwrap();
+        text
+    });
+    assert!(child.wait().unwrap().success());
+    let out = out.join().unwrap();
+    assert!(out.contains(&payload));
+    assert!(out.contains("is_appcontainer=false"));
+    assert!(err.join().unwrap().contains("native-stderr"));
+}
+
+#[test]
+fn windows_plain_verbatim_args_and_exit_code_survive_native_launch() {
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = crate::CommandSpec::new("cmd.exe");
+    spec.args =
+        crate::backend::CommandArgs::Verbatim(r#"/d /s /c "echo raw marker& exit /b 7""#.into());
+    spec.cwd = Some(root.path().to_path_buf());
+    spec.redact_stdout = true;
+    let launch = WindowsLaunch::plain(spec, std::env::vars().collect());
+    let resource = launch.acquire().unwrap();
+    let mut child = resource.spawn().unwrap();
+    let mut output = String::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    assert!(output.contains("raw marker"));
+}
+
+#[test]
+fn windows_plain_owner_death_before_resume_reaps_the_suspended_child() {
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = OwnerFixture(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FIXTURE, "--nocapture", "--test-threads=1"])
+            .env(MODE, "plain-owner-suspended")
+            .env("__NUB_WINDOWS_FIXTURE_ROOT", root.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_file(&root.path().join("suspended"));
+    let pid: u32 = std::fs::read_to_string(root.path().join("suspended"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(is_running(pid));
+    assert!(
+        !root.path().join(format!("ready-{pid}")).exists(),
+        "child is still before ResumeThread"
+    );
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while is_running(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "owner death left the suspended child alive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!root.path().join(format!("ready-{pid}")).exists());
+}
+
+#[test]
+fn windows_plain_batch_args_and_child_path_match_standard_command() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("probe.cmd"),
+        "@echo off\r\necho [%1]\r\necho [%2]\r\necho [%3]\r\necho [%4]\r\nexit /b 9\r\n",
+    )
+    .unwrap();
+    let args = ["plain", "two words", "percent%PATH%", "tail\\"];
+    let reference = std::process::Command::new("probe.cmd")
+        .args(args)
+        .current_dir(root.path())
+        .env("PATH", root.path())
+        .output()
+        .unwrap();
+    let mut spec = crate::CommandSpec::new("probe.cmd");
+    spec.args = crate::backend::CommandArgs::Argv(args.into_iter().map(Into::into).collect());
+    spec.cwd = Some(root.path().to_path_buf());
+    let mut env: BTreeMap<_, _> = std::env::vars().collect();
+    env.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+    env.insert("PATH".into(), root.path().to_string_lossy().into_owned());
+    let resource = WindowsLaunch::plain(spec, env).acquire().unwrap();
+    let mut child = resource
+        .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Piped, WindowsStdio::Piped)
+        .unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .take_stderr()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert_eq!(child.wait().unwrap(), reference.status);
+    assert_eq!(stdout, reference.stdout);
+    assert_eq!(stderr, reference.stderr);
 }

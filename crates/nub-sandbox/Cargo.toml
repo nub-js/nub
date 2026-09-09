@@ -105,6 +105,7 @@ features = [
   "Win32_System_IO",
   "Win32_System_RemoteDesktop",
   "Win32_System_Com",
+  "Win32_UI_Shell",
 ]
 
 # build.rs bakes data/build-jail-catalog.json into `static` Rust, so the jail's carve-outs

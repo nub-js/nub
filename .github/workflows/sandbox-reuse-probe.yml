@@ -8,6 +8,7 @@ on:
       - .github/workflows/sandbox-reuse-probe.yml
       - Cargo.lock
       - Cargo.toml
+      - scripts/sandbox-tool-fixtures.mjs
 
 permissions:
   contents: read
@@ -60,6 +61,18 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test lifecycle_costs native_session_costs_and_unique_policy_churn -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/costs.log
+      - name: Provisioning pinned package managers
+        id: tools
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          node scripts/sandbox-tool-fixtures.mjs 2>&1 | tee reports/tools-provision.log
+          cp .sandbox-tool-fixtures/matrix.json reports/tools-matrix.json
+      - name: Exercising package-manager functionality
+        if: (success() || failure()) && steps.tools.outcome == 'success'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/tools.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

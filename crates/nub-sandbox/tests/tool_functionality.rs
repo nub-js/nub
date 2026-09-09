@@ -1,8 +1,9 @@
 //! Native tool-directory operations, with unconfined and narrow-policy controls.
 use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn fixture() -> tempfile::TempDir {
@@ -136,24 +137,42 @@ fn require_git() -> &'static str {
     "git"
 }
 
-fn optional_pinned_tool(variable: &str) -> Option<String> {
-    let Some(tool) = std::env::var_os(variable) else {
-        eprintln!(
-            "SKIP {variable}: native tool coverage requires a parent-provisioned pinned executable"
-        );
-        return None;
-    };
-    let tool = tool.to_string_lossy().into_owned();
-    if Command::new(&tool)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        Some(tool)
-    } else {
-        eprintln!("SKIP {variable}: `{tool}` is not an executable pinned tool");
-        None
-    }
+#[derive(Deserialize)]
+struct Tool {
+    name: String,
+    spec: String,
+    kind: String,
+    program: String,
+    prefix: Vec<String>,
+    #[serde(rename = "toolRoot")]
+    tool_root: PathBuf,
+    #[serde(rename = "runtimeRoot")]
+    runtime_root: PathBuf,
+    version: String,
+}
+
+fn tools() -> Vec<Tool> {
+    let matrix = std::env::var("NUB_SANDBOX_TOOL_MATRIX_FILE").expect(
+        "tool matrix missing: run `node scripts/sandbox-tool-fixtures.mjs` before native tests",
+    );
+    let text = std::fs::read_to_string(&matrix)
+        .unwrap_or_else(|error| panic!("tool matrix `{matrix}` unreadable: {error}"));
+    let tools: Vec<Tool> = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("tool matrix `{matrix}` is invalid: {error}"));
+    assert!(
+        tools.iter().any(|tool| tool.name == "npm")
+            && tools.iter().any(|tool| tool.name == "pnpm9")
+            && tools.iter().any(|tool| tool.name == "pnpm10")
+            && tools.iter().any(|tool| tool.name == "pnpm11")
+            && tools.iter().any(|tool| tool.name == "yarn1")
+            && tools.iter().any(|tool| tool.name == "yarn2")
+            && tools.iter().any(|tool| tool.name == "yarn3")
+            && tools.iter().any(|tool| tool.name == "yarn4")
+            && tools.iter().any(|tool| tool.name == "bun132")
+            && tools.iter().any(|tool| tool.name == "bun140"),
+        "tool matrix omitted a required compatibility target"
+    );
+    tools
 }
 
 #[test]
@@ -232,136 +251,316 @@ fn git_global_config_updates_an_existing_xdg_config_and_its_lock() {
     assert!(!tool_config.with_extension("lock").exists());
 }
 
-#[test]
-fn npm_cold_cache_creation_requires_a_materialized_parent_grant() {
-    let Some(npm) = optional_pinned_tool("NUB_SANDBOX_NPM") else {
-        return;
+fn fixture_package(root: &Path) -> PathBuf {
+    let package = root.join("project/package");
+    std::fs::create_dir_all(&package).expect("local package directory");
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"sandbox-tool-fixture-bin","version":"1.0.0","bin":{"fixture-bin":"cli.js"}}"#,
+    )
+    .expect("local package manifest");
+    std::fs::write(
+        package.join("cli.js"),
+        "#!/usr/bin/env node\nprocess.stdout.write('fixture-bin-ok\\n');\n",
+    )
+    .expect("local package bin");
+    package
+}
+
+fn project_manifest(root: &Path) {
+    std::fs::write(
+        root.join("project/package.json"),
+        r#"{"name":"sandbox-tool-project","private":true,"dependencies":{"sandbox-tool-fixture-bin":"file:./package"}}"#,
+    )
+    .expect("project manifest");
+}
+
+fn tool_env(tool: &Tool, root: &Path) -> (PathBuf, PathBuf, Vec<(String, String)>) {
+    let cache = root.join("cache").join(&tool.name);
+    let global = root.join("home/.tool-global").join(&tool.name);
+    let cache_text = cache.to_string_lossy().into_owned();
+    let global_text = global.to_string_lossy().into_owned();
+    let env = match tool.kind.as_str() {
+        "npm" => vec![
+            ("NPM_CONFIG_CACHE".into(), cache_text),
+            ("NPM_CONFIG_PREFIX".into(), global_text),
+        ],
+        "pnpm" => vec![
+            ("PNPM_CONFIG_CACHE_DIR".into(), cache_text.clone()),
+            (
+                "PNPM_CONFIG_STORE_DIR".into(),
+                cache.join("store").to_string_lossy().into(),
+            ),
+            ("PNPM_HOME".into(), global_text),
+            (
+                "PATH".into(),
+                format!(
+                    "{}{}{}",
+                    global.to_string_lossy(),
+                    if cfg!(windows) { ";" } else { ":" },
+                    std::env::var("PATH").expect("runner PATH")
+                ),
+            ),
+        ],
+        "yarn1" | "yarn" => vec![
+            ("YARN_CACHE_FOLDER".into(), cache_text),
+            ("YARN_GLOBAL_FOLDER".into(), global_text),
+        ],
+        "bun" => vec![
+            ("BUN_INSTALL_CACHE_DIR".into(), cache_text),
+            ("BUN_INSTALL".into(), global_text),
+        ],
+        other => panic!("unknown tool kind {other}"),
     };
-    let args = ["cache", "verify"];
+    (cache, global, env)
+}
 
-    let unconfined_root = fixture();
-    let unconfined_cache = unconfined_root.path().join("cache/npm");
-    let unconfined_cache_string = unconfined_cache.to_string_lossy().into_owned();
-    let control = unconfined(
-        &npm,
-        &args,
-        unconfined_root.path(),
-        &[("NPM_CONFIG_CACHE", &unconfined_cache_string)],
-    );
-    assert!(
-        control.status.success(),
-        "unconfined npm control failed: {}",
-        String::from_utf8_lossy(&control.stderr)
-    );
-    assert!(
-        unconfined_cache.exists(),
-        "npm did not create its cold cache root"
-    );
+fn args(tool: &Tool, tail: &[&str]) -> Vec<String> {
+    tool.prefix
+        .iter()
+        .cloned()
+        .chain(tail.iter().map(|value| (*value).to_string()))
+        .collect()
+}
 
-    let exact_root = fixture();
-    let exact_cache = exact_root.path().join("cache/npm");
-    std::fs::create_dir_all(&exact_cache).expect("materialized exact cache root");
-    let exact_cache_string = exact_cache.to_string_lossy().into_owned();
-    let exact = confined(
-        &npm,
-        &args,
-        exact_root.path(),
-        &policy(
-            exact_root.path(),
-            exact_grants(&[(&exact_cache, "rw")]),
-            &[("NPM_CONFIG_CACHE", &exact_cache_string)],
-        ),
-    );
-    assert!(
-        exact.status.success(),
-        "materialized exact npm cache grant failed: {}",
-        String::from_utf8_lossy(&exact.stderr)
-    );
+fn args_owned(tool: &Tool, tail: &[String]) -> Vec<String> {
+    tool.prefix
+        .iter()
+        .cloned()
+        .chain(tail.iter().cloned())
+        .collect()
+}
 
-    let tool_root = fixture();
-    let tool_cache = tool_root.path().join("cache/npm");
-    let tool_cache_string = tool_cache.to_string_lossy().into_owned();
-    let tool_dirs = confined(
-        &npm,
-        &args,
-        tool_root.path(),
-        &policy(
-            tool_root.path(),
-            json!(["$tooldirs"]),
-            &[("NPM_CONFIG_CACHE", &tool_cache_string)],
-        ),
-    );
-    // Seatbelt authorizes future names; inode/ACL-backed grants require an
-    // existing root. This is a backend-limit control, not a functionality pass.
-    if cfg!(target_os = "macos") {
-        assert!(
-            tool_dirs.status.success(),
-            "{}",
-            String::from_utf8_lossy(&tool_dirs.stderr)
+fn invoke_unconfined(tool: &Tool, tail: &[&str], root: &Path, env: &[(String, String)]) -> Output {
+    let args = args(tool, tail);
+    let env: Vec<_> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    unconfined(
+        &tool.program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        root,
+        &env,
+    )
+}
+
+fn invoke_confined(
+    tool: &Tool,
+    tail: &[&str],
+    root: &Path,
+    env: &[(String, String)],
+    policy: &nub_sandbox::SandboxPolicy,
+) -> Output {
+    let args = args(tool, tail);
+    let _ = env; // Environment is captured while compiling the policy.
+    confined(
+        &tool.program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        root,
+        policy,
+    )
+}
+
+fn invoke_owned(
+    tool: &Tool,
+    tail: &[String],
+    root: &Path,
+    env: &[(String, String)],
+    policy: Option<&nub_sandbox::SandboxPolicy>,
+) -> Output {
+    let args = args_owned(tool, tail);
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    match policy {
+        Some(policy) => confined(&tool.program, &refs, root, policy),
+        None => {
+            let env: Vec<_> = env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            unconfined(&tool.program, &refs, root, &env)
+        }
+    }
+}
+
+fn grant_policy(
+    tool: &Tool,
+    root: &Path,
+    cache: &Path,
+    global: &Path,
+    env: &[(String, String)],
+    tooldirs: bool,
+) -> nub_sandbox::SandboxPolicy {
+    let env: Vec<_> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let fs = if tooldirs {
+        let mut entries = Map::new();
+        entries.insert("$tooldirs".into(), Value::String("rw".into()));
+        entries.insert(
+            tool.tool_root.to_string_lossy().into_owned(),
+            Value::String("r".into()),
         );
-        assert!(tool_cache.exists());
+        entries.insert(
+            tool.runtime_root.to_string_lossy().into_owned(),
+            Value::String("r".into()),
+        );
+        Value::Object(entries)
+    } else {
+        exact_grants(&[
+            (cache, "rw"),
+            (global, "rw"),
+            (&tool.tool_root, "r"),
+            (&tool.runtime_root, "r"),
+        ])
+    };
+    policy(root, fs, &env)
+}
+
+fn assert_success(tool: &Tool, phase: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{} {} failed:\nstdout:\n{}\nstderr:\n{}",
+        tool.name,
+        phase,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_normal_operations(
+    tool: &Tool,
+    root: &Path,
+    env: &[(String, String)],
+    policy: Option<&nub_sandbox::SandboxPolicy>,
+) {
+    fixture_package(root);
+    project_manifest(root);
+    let run = |tail: &[&str]| match policy {
+        Some(policy) => invoke_confined(tool, tail, root, env, policy),
+        None => invoke_unconfined(tool, tail, root, env),
+    };
+    let install: &[&str] = match tool.kind.as_str() {
+        "npm" => &["install", "--ignore-scripts", "--no-audit", "--no-fund"],
+        "pnpm" => &["install", "--ignore-scripts"],
+        "yarn1" => &["install", "--ignore-scripts"],
+        "yarn" if tool.name == "yarn2" => &["install", "--skip-builds"],
+        "yarn" => &["install", "--mode=skip-build"],
+        "bun" => &["install", "--ignore-scripts"],
+        _ => unreachable!(),
+    };
+    assert_success(tool, "local install", &run(install));
+    assert_success(tool, "warm reinstall", &run(install));
+    let exec: &[&str] = match tool.kind.as_str() {
+        "npm" => &["exec", "--", "fixture-bin"],
+        "pnpm" => &["exec", "fixture-bin"],
+        "yarn1" => &["run", "fixture-bin"],
+        "yarn" => &["exec", "fixture-bin"],
+        "bun" => &["x", "--no-install", "fixture-bin"],
+        _ => unreachable!(),
+    };
+    let output = run(exec);
+    assert_success(tool, "installed-bin execution", &output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("fixture-bin-ok"),
+        "{} did not execute the installed fixture bin: {}",
+        tool.name,
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn run_global_install_and_cache_prune(
+    tool: &Tool,
+    root: &Path,
+    env: &[(String, String)],
+    policy: Option<&nub_sandbox::SandboxPolicy>,
+) {
+    if matches!(tool.kind.as_str(), "yarn") {
+        eprintln!(
+            "TOOL {} has no supported user-global command in this Berry fixture",
+            tool.name
+        );
         return;
     }
-    assert!(
-        !tool_dirs.status.success(),
-        "cold speculative cache unexpectedly worked"
+    let package = root.join("project/package").to_string_lossy().into_owned();
+    let global = match tool.kind.as_str() {
+        "npm" => vec!["install".into(), "--global".into(), package],
+        "pnpm" => vec!["add".into(), "--global".into(), package],
+        "yarn1" => vec!["global".into(), "add".into(), package],
+        "bun" => vec!["install".into(), "--global".into(), package],
+        _ => unreachable!(),
+    };
+    assert_success(
+        tool,
+        "configured global install",
+        &invoke_owned(tool, &global, root, env, policy),
     );
-    let stderr = String::from_utf8_lossy(&tool_dirs.stderr);
-    assert!(
-        stderr.contains(&tool_cache_string),
-        "npm cold-cache denial omitted the requested path {tool_cache_string}: {stderr}"
+    let prune: Vec<String> = match tool.kind.as_str() {
+        "npm" => vec!["cache".into(), "clean".into(), "--force".into()],
+        "pnpm" => vec!["store".into(), "prune".into()],
+        "yarn1" => vec!["cache".into(), "clean".into()],
+        "bun" => vec!["pm".into(), "cache".into(), "rm".into()],
+        _ => unreachable!(),
+    };
+    assert_success(
+        tool,
+        "configured cache prune",
+        &invoke_owned(tool, &prune, root, env, policy),
     );
 }
 
 #[test]
-fn uv_honors_a_materialized_custom_cache_under_tooldirs() {
-    let Some(uv) = optional_pinned_tool("NUB_SANDBOX_UV") else {
-        return;
-    };
-    let args = ["cache", "clean"];
+#[ignore = "requires the pinned native tool matrix"]
+fn pinned_js_package_managers_support_tooldir_backed_normal_operations() {
+    for tool in tools() {
+        eprintln!("TOOL {} {} ({})", tool.name, tool.version, tool.spec);
+        for (label, tooldirs) in [
+            ("unconfined", None),
+            ("exact", Some(false)),
+            ("$tooldirs", Some(true)),
+        ] {
+            let root = fixture();
+            let (cache, global, env) = tool_env(&tool, root.path());
+            // Precondition for native inode/ACL backends: these existing roots are what their
+            // grants can name. Cold-root denial is covered separately below.
+            std::fs::create_dir_all(&cache).expect("materialized cache precondition");
+            std::fs::create_dir_all(&global).expect("materialized global precondition");
+            let policy = tooldirs
+                .map(|tooldirs| grant_policy(&tool, root.path(), &cache, &global, &env, tooldirs));
+            eprintln!("TOOL {} {} control", tool.name, label);
+            run_normal_operations(&tool, root.path(), &env, policy.as_ref());
+            run_global_install_and_cache_prune(&tool, root.path(), &env, policy.as_ref());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned native tool matrix"]
+fn npm_cold_cache_root_remains_a_backend_limit_control() {
+    let tools = tools();
+    let npm = tools
+        .iter()
+        .find(|tool| tool.name == "npm")
+        .expect("matrix includes npm");
     let root = fixture();
-    let cache = root.path().join("cache/uv-custom");
-    std::fs::create_dir_all(&cache).expect("materialized uv cache root");
-    let cache_string = cache.to_string_lossy().into_owned();
-
-    let control = unconfined(&uv, &args, root.path(), &[("UV_CACHE_DIR", &cache_string)]);
+    let (cache, global, env) = tool_env(npm, root.path());
+    assert!(!cache.exists(), "cold cache fixture must start absent");
+    let policy = grant_policy(npm, root.path(), &cache, &global, &env, true);
+    let output = invoke_confined(npm, &["cache", "verify"], root.path(), &env, &policy);
+    if cfg!(target_os = "macos") {
+        assert_success(npm, "cold $tooldirs cache creation", &output);
+        assert!(cache.exists());
+        return;
+    }
     assert!(
-        control.status.success(),
-        "unconfined uv control failed: {}",
-        String::from_utf8_lossy(&control.stderr)
+        !output.status.success(),
+        "cold speculative npm cache unexpectedly worked"
     );
-    std::fs::create_dir_all(&cache).expect("restore cache root for confined controls");
-
-    let exact = confined(
-        &uv,
-        &args,
-        root.path(),
-        &policy(
-            root.path(),
-            exact_grants(&[(&cache, "rw")]),
-            &[("UV_CACHE_DIR", &cache_string)],
-        ),
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        exact.status.success(),
-        "exact custom uv cache grant failed: {}",
-        String::from_utf8_lossy(&exact.stderr)
-    );
-    std::fs::create_dir_all(&cache).expect("restore cache root for $tooldirs control");
-
-    let tool_dirs = confined(
-        &uv,
-        &args,
-        root.path(),
-        &policy(
-            root.path(),
-            json!(["$tooldirs"]),
-            &[("UV_CACHE_DIR", &cache_string)],
-        ),
-    );
-    assert!(
-        tool_dirs.status.success(),
-        "$tooldirs custom uv cache grant failed: {}",
-        String::from_utf8_lossy(&tool_dirs.stderr)
+        stderr.contains(&cache.to_string_lossy()),
+        "npm cold-cache denial omitted {}: {stderr}",
+        cache.display()
     );
 }
