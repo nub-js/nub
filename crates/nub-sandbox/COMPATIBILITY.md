@@ -65,6 +65,14 @@ The writable directory admits the lock/rename protocol without granting all of h
 
 ## Backend restrictions
 
+### Windows Gradle network qualification
+
+The strict matrix refuses Windows' `net-full` degradation before launching Gradle. A [separate execution probe](https://github.com/nubjs/nub/actions/runs/34403539949) explicitly acknowledges that limitation and passes on Server 2022 and Windows 11 arm64: Gradle 8.14 with Temurin 21.0.8 runs an offline task twice and performs daemon cleanup through one retained session. Its plain controls also pass. The [diagnostic test](tests/native_tool_functionality.rs) asserts the exact degradation rather than ignoring all unsupported permissions.
+
+This establishes that the tested Gradle workflow works with the narrower capability. It does not establish full host networking, access to arbitrary host-loopback services, or an unqualified strict-policy pass. No network grants or backend behavior were changed for this probe.
+
+### OS restrictions
+
 - **Linux procfs:** the backend rejects explicit grants under the reserved `/proc` tree. Ordinary static path grants cannot express each descendant's own dynamically created process files. [Syscall traces](https://github.com/nubjs/nub/actions/runs/34353404495) record denied `/proc/self/maps` reads in Bun 1.4 and CoreCLR, plus denied process metadata and private FIFO creation in CoreCLR. A test-only procfs grant was rejected before launch, so it does not prove which denial caused the runtime failure. No procfs fallback is enabled.
 - **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
