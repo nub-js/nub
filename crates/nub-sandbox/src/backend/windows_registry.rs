@@ -1,0 +1,1151 @@
+//! Durable ownership records for reusable Windows AppContainers.
+//!
+//! This module deliberately owns *intent* and liveness, rather than an ACL snapshot.
+//! A record is written before a profile, private directory, or ACE is touched; the
+//! Windows launcher records only the ACEs it added.  That lets recovery remove Nub's
+//! additions without rolling back another program's intervening DACL edits.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const BACKEND_VERSION: &str = "appcontainer-acl-v2";
+pub(crate) const MAX_IDLE_ENTRIES: usize = 64;
+pub(crate) const MAX_OWNED_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_IDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PolicyIdentity {
+    pub(crate) hash: String,
+    canonical: String,
+}
+
+impl PolicyIdentity {
+    /// Hash resolved grants, never caller-provided policy JSON.  In particular, the
+    /// constructed environment is excluded: it may contain an injected credential,
+    /// and credential injection belongs to a command rather than a shared identity.
+    pub(crate) fn new(
+        read: impl IntoIterator<Item = PathBuf>,
+        nodes: impl IntoIterator<Item = PathBuf>,
+        write: impl IntoIterator<Item = PathBuf>,
+        managed_profile: Option<PathBuf>,
+        allow_internet: bool,
+        uses_funnel: bool,
+    ) -> io::Result<Self> {
+        let canonical_paths = |paths: Vec<PathBuf>| -> io::Result<Vec<String>> {
+            paths
+                .into_iter()
+                .map(|path| canonical_path(&path))
+                .collect::<io::Result<BTreeSet<_>>>()
+                .map(|set| set.into_iter().collect())
+        };
+        let read = canonical_paths(read.into_iter().collect())?;
+        let nodes = canonical_paths(nodes.into_iter().collect())?;
+        let write = canonical_paths(write.into_iter().collect())?;
+        let profile = managed_profile
+            .map(|path| canonical_path_or_lexical(&path))
+            .transpose()?;
+        let canonical = serde_json::json!({
+            "schema": SCHEMA_VERSION,
+            "backend": BACKEND_VERSION,
+            "read": read,
+            "nodes": nodes,
+            "write": write,
+            "profile": profile,
+            "internet": allow_internet,
+            "funnel": uses_funnel,
+        })
+        .to_string();
+        let hash = hex(&Sha256::digest(canonical.as_bytes()));
+        Ok(Self { hash, canonical })
+    }
+
+    pub(crate) fn with_network(
+        mut self,
+        policy: Option<&crate::policy::NetPolicy>,
+    ) -> io::Result<Self> {
+        // A helper shares the package identity: policies allowing different hosts
+        // must never share that identity and its same-package loopback reachability.
+        let network = serde_json::to_string(&policy).map_err(io::Error::other)?;
+        self.canonical.push_str(&network);
+        self.hash = hex(&Sha256::digest(self.canonical.as_bytes()));
+        Ok(self)
+    }
+
+    pub(crate) fn profile_name(&self) -> String {
+        // Keep below the documented 64-char AppContainer profile-name limit.
+        format!("nub_sbx_r_{}", &self.hash[..40])
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WindowObject {
+    pub(crate) session: u32,
+    pub(crate) station: String,
+    /// None names the station itself; Some names a desktop in that station.
+    pub(crate) desktop: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AclMutation {
+    pub(crate) path: String,
+    pub(crate) kind: AclKind,
+    pub(crate) access: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AclKind {
+    Subtree,
+    Object,
+    PrivateProfile,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EntryState {
+    Preparing,
+    Ready,
+    Idle,
+    Closing,
+    RecoveryNeeded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Entry {
+    pub(crate) identity: String,
+    pub(crate) canonical_policy: String,
+    pub(crate) profile_name: String,
+    pub(crate) state: EntryState,
+    pub(crate) created_at: u64,
+    pub(crate) last_used_at: u64,
+    pub(crate) private_paths: Vec<String>,
+    pub(crate) owned_bytes: u64,
+    pub(crate) mutations: Vec<AclMutation>,
+    pub(crate) leases: BTreeSet<String>,
+    pub(crate) recovery_error: Option<String>,
+    pub(crate) window_objects: Vec<WindowObject>,
+    pub(crate) object_ids: BTreeMap<String, String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct RegistryFile {
+    schema: u32,
+    entries: BTreeMap<String, Entry>,
+}
+
+/// A caller lease backed by a kernel object on Windows.  The event disappears when
+/// its owning process dies, unlike a disk refcount or a saved PID.
+pub(crate) struct Lease {
+    name: String,
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the event handle is solely owned, immutable while shared, and has no
+// thread affinity. Closing occurs only after the last resource Arc is dropped.
+#[cfg(windows)]
+unsafe impl Send for Lease {}
+#[cfg(windows)]
+unsafe impl Sync for Lease {}
+
+impl Lease {
+    fn create(identity: &str) -> io::Result<Self> {
+        let nonce = format!("{:x}", now_nanos());
+        let name = format!(
+            "Global\\nub-sbx-lease-{}-{}-{nonce}",
+            &identity[..16],
+            std::process::id()
+        );
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::HANDLE;
+            unsafe extern "system" {
+                fn CreateEventW(
+                    attributes: *const std::ffi::c_void,
+                    manual_reset: i32,
+                    initial_state: i32,
+                    name: *const u16,
+                ) -> HANDLE;
+            }
+            let wide = wide(&name);
+            // A caller keeps this handle open for its whole acquired-resource lifetime.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { name, handle })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self { name })
+        }
+    }
+
+    fn live(name: &str) -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe extern "system" {
+                fn OpenEventW(
+                    access: u32,
+                    inherit: i32,
+                    name: *const u16,
+                ) -> windows_sys::Win32::Foundation::HANDLE;
+            }
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            let wide = wide(name);
+            let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, wide.as_ptr()) };
+            if handle.is_null() {
+                // Only "not found" proves death; access denial or resource pressure
+                // must retain the lease rather than evict a live caller's grants.
+                return io::Error::last_os_error().raw_os_error() != Some(2);
+            }
+            unsafe { CloseHandle(handle) };
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            // Host tests inject the liveness decision through `prune_with`; no host PID
+            // heuristic is allowed to stand in for the Windows kernel lease contract.
+            let _ = name;
+            false
+        }
+    }
+
+    fn close(&mut self) {
+        #[cfg(windows)]
+        if !self.handle.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+pub(crate) struct Acquired {
+    pub(crate) entry: Entry,
+    pub(crate) fresh: bool,
+    lease: Lease,
+    root: PathBuf,
+}
+
+impl Acquired {
+    pub(crate) fn record_window_object(&mut self, object: WindowObject) -> io::Result<()> {
+        let _lock = MutationLock::acquire(&self.root)?;
+        let mut file = load(&self.root)?;
+        let entry = file
+            .entries
+            .get_mut(&self.entry.identity)
+            .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+        if !entry.window_objects.contains(&object) {
+            entry.window_objects.push(object);
+            save(&self.root, &file)?;
+        }
+        self.entry = file.entries[&self.entry.identity].clone();
+        Ok(())
+    }
+
+    pub(crate) fn record_mutation(&mut self, mutation: AclMutation) -> io::Result<()> {
+        let mutation = AclMutation {
+            path: canonical_path_or_lexical(Path::new(&mutation.path))?,
+            ..mutation
+        };
+        let _lock = MutationLock::acquire(&self.root)?;
+        let mut file = load(&self.root)?;
+        let changed = {
+            let entry = file
+                .entries
+                .get_mut(&self.entry.identity)
+                .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+            if !entry.mutations.contains(&mutation) {
+                entry.mutations.push(mutation);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            save(&self.root, &file)?;
+        }
+        self.entry = file.entries[&self.entry.identity].clone();
+        Ok(())
+    }
+
+    pub(crate) fn record_private_path(&mut self, path: &Path) -> io::Result<()> {
+        let path = canonical_path_or_lexical(path)?;
+        let _lock = MutationLock::acquire(&self.root)?;
+        let mut file = load(&self.root)?;
+        let changed = {
+            let entry = file
+                .entries
+                .get_mut(&self.entry.identity)
+                .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+            if !entry
+                .private_paths
+                .iter()
+                .any(|parent| Path::new(&path).starts_with(parent))
+            {
+                entry
+                    .private_paths
+                    .retain(|child| !Path::new(child).starts_with(&path));
+                entry.private_paths.push(path);
+                entry.owned_bytes = owned_bytes(&entry.private_paths)?;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            save(&self.root, &file)?;
+        }
+        self.entry = file.entries[&self.entry.identity].clone();
+        Ok(())
+    }
+
+    /// The setup caller writes `Preparing` before mutating Windows state, then makes
+    /// this transition only after profile and all planned grants are usable.
+    pub(crate) fn ready(&mut self) -> io::Result<()> {
+        let _lock = MutationLock::acquire(&self.root)?;
+        let mut file = load(&self.root)?;
+        let entry = file
+            .entries
+            .get_mut(&self.entry.identity)
+            .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+        for mutation in &entry.mutations {
+            if let Some(id) = object_id(Path::new(&mutation.path))? {
+                entry.object_ids.insert(mutation.path.clone(), id);
+            }
+        }
+        save(&self.root, &file)?;
+        drop(_lock);
+        self.transition(EntryState::Ready, None)
+    }
+
+    fn transition(&mut self, state: EntryState, error: Option<String>) -> io::Result<()> {
+        let _lock = MutationLock::acquire(&self.root)?;
+        let mut file = load(&self.root)?;
+        {
+            let entry = file
+                .entries
+                .get_mut(&self.entry.identity)
+                .ok_or_else(|| io::Error::other("sandbox registry lost an acquired entry"))?;
+            entry.state = state;
+            entry.recovery_error = error;
+            entry.last_used_at = now_secs();
+        }
+        save(&self.root, &file)?;
+        self.entry = file.entries[&self.entry.identity].clone();
+        Ok(())
+    }
+}
+
+/// Reject reuse when a recorded object no longer resolves to the identity Nub
+/// originally mutated.  The native launcher additionally re-checks the ACE before
+/// spawning; a missing/replaced object is recovery work, never a reason to grant a
+/// SID onto a newly discovered path.
+pub(crate) fn validate_entry(entry: &Entry) -> io::Result<()> {
+    for mutation in &entry.mutations {
+        validate_object(entry, Path::new(&mutation.path))?;
+        let observed = canonical_path(Path::new(&mutation.path)).map_err(|error| {
+            io::Error::other(format!(
+                "sandbox resource {} requires recovery: recorded ACL object {} is unavailable: {error}",
+                entry.profile_name, mutation.path
+            ))
+        })?;
+        if observed != mutation.path {
+            return Err(io::Error::other(format!(
+                "sandbox resource {} requires recovery: recorded ACL object was replaced",
+                entry.profile_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_object(entry: &Entry, path: &Path) -> io::Result<()> {
+    let path_text = normalize(path);
+    if let Some(expected) = entry.object_ids.get(&path_text)
+        && object_id(path)?
+            .as_ref()
+            .is_some_and(|actual| actual != expected)
+    {
+        return Err(io::Error::other(format!(
+            "sandbox resource {} requires recovery: ACL object {} was replaced",
+            entry.profile_name,
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn object_id(path: &Path) -> io::Result<Option<String>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+        };
+        let file = match std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(format!(
+            "{}:{}:{}",
+            info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+        )))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some(format!("{}:{}", meta.dev(), meta.ino()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for Acquired {
+    fn drop(&mut self) {
+        // Releasing one caller never tears down a shared identity.  Event liveness is
+        // rechecked under the registry lock on the next acquisition/cleanup.
+        // Close this caller's kernel lease first: otherwise `prune_with` would see
+        // the still-live handle owned by this very Drop frame and retain a phantom
+        // active entry forever.
+        self.lease.close();
+        let _ = release(&self.root, &self.entry.identity, &self.lease.name);
+    }
+}
+
+pub(crate) fn acquire(identity: PolicyIdentity) -> io::Result<Acquired> {
+    acquire_at(registry_root()?, identity)
+}
+
+fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
+    let _lock = MutationLock::acquire(&root)?;
+    let mut file = load(&root)?;
+    prune_with(&mut file, Lease::live);
+    let lease = Lease::create(&identity.hash)?;
+    let now = now_secs();
+    let (entry, fresh) = match file.entries.get_mut(&identity.hash) {
+        Some(entry) => {
+            if entry.canonical_policy != identity.canonical {
+                return Err(io::Error::other("sandbox registry fingerprint collision"));
+            }
+            match entry.state {
+                EntryState::Ready | EntryState::Idle => {
+                    entry.state = EntryState::Ready;
+                    entry.last_used_at = now;
+                    entry.leases.insert(lease.name.clone());
+                    (entry.clone(), false)
+                }
+                EntryState::Preparing | EntryState::Closing | EntryState::RecoveryNeeded => {
+                    return Err(io::Error::other(format!(
+                        "sandbox resource {} is awaiting recovery ({:?})",
+                        entry.profile_name, entry.state
+                    )));
+                }
+            }
+        }
+        None => {
+            // Admission is bounded even when all existing entries need recovery: never
+            // overwrite an ownership record merely to make cache space.
+            let idle = file
+                .entries
+                .values()
+                .filter(|e| e.leases.is_empty())
+                .count();
+            let bytes = file.entries.values().map(|e| e.owned_bytes).sum::<u64>();
+            if idle >= MAX_IDLE_ENTRIES || bytes > MAX_OWNED_BYTES {
+                return Err(io::Error::other(
+                    "sandbox reusable-resource cache is full; cleanup is required before admitting another profile",
+                ));
+            }
+            let entry = Entry {
+                identity: identity.hash.clone(),
+                profile_name: identity.profile_name(),
+                canonical_policy: identity.canonical,
+                state: EntryState::Preparing,
+                created_at: now,
+                last_used_at: now,
+                private_paths: Vec::new(),
+                owned_bytes: 0,
+                mutations: Vec::new(),
+                leases: BTreeSet::from([lease.name.clone()]),
+                recovery_error: None,
+                window_objects: Vec::new(),
+                object_ids: BTreeMap::new(),
+            };
+            file.entries.insert(entry.identity.clone(), entry.clone());
+            (entry, true)
+        }
+    };
+    save(&root, &file)?;
+    Ok(Acquired {
+        entry,
+        fresh,
+        lease,
+        root,
+    })
+}
+
+/// Mark idle/dead entries that have crossed the retention bounds as `Closing`.
+/// The Windows launcher owns the actual ACE/profile removal because it can verify
+/// object identity at the mutation boundary.  A failed removal is left journaled as
+/// `RecoveryNeeded`, never silently discarded.
+pub(crate) fn begin_recovery(all: bool) -> io::Result<Vec<Entry>> {
+    let root = registry_root()?;
+    begin_recovery_at(&root, all)
+}
+
+fn begin_recovery_at(root: &Path, all: bool) -> io::Result<Vec<Entry>> {
+    let _lock = MutationLock::acquire(root)?;
+    let mut file = load(root)?;
+    prune_with(&mut file, Lease::live);
+    let now = now_secs();
+    for entry in file.entries.values_mut() {
+        entry.owned_bytes = owned_bytes(&entry.private_paths)?;
+    }
+    let mut selected = Vec::new();
+    let mut idle: Vec<(String, u64, u64)> = file
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.leases.is_empty())
+        .map(|(identity, entry)| (identity.clone(), entry.last_used_at, entry.owned_bytes))
+        .collect();
+    idle.sort_by_key(|(_, last_used, _)| *last_used);
+    // Reserve one idle slot for a cache miss.  Active entries are never candidates;
+    // if cleanup cannot reclaim an idle record, admission remains explicitly bounded.
+    let mut over_count = idle
+        .len()
+        .saturating_sub(MAX_IDLE_ENTRIES.saturating_sub(1));
+    let mut bytes = idle.iter().map(|(_, _, bytes)| *bytes).sum::<u64>();
+    let mut pressure = BTreeSet::new();
+    for (identity, _, owned) in &idle {
+        if over_count == 0 && bytes <= MAX_OWNED_BYTES {
+            break;
+        }
+        pressure.insert(identity.clone());
+        over_count = over_count.saturating_sub(1);
+        bytes = bytes.saturating_sub(*owned);
+    }
+    for entry in file.entries.values_mut() {
+        let expired = now.saturating_sub(entry.last_used_at) >= MAX_IDLE_AGE.as_secs();
+        let recover = matches!(
+            entry.state,
+            EntryState::Preparing | EntryState::Closing | EntryState::RecoveryNeeded
+        );
+        if entry.leases.is_empty()
+            && (all || expired || recover || pressure.contains(&entry.identity))
+        {
+            entry.state = EntryState::Closing;
+            selected.push(entry.clone());
+        }
+    }
+    save(root, &file)?;
+    Ok(selected)
+}
+
+pub(crate) fn finish_recovery(entry: &Entry, result: io::Result<()>) -> io::Result<()> {
+    let root = registry_root()?;
+    let _lock = MutationLock::acquire(&root)?;
+    let mut file = load(&root)?;
+    let Some(current) = file.entries.get_mut(&entry.identity) else {
+        return Ok(());
+    };
+    if !current.leases.is_empty() {
+        return Err(io::Error::other("refusing to clean a live sandbox lease"));
+    }
+    match result {
+        Ok(()) => {
+            file.entries.remove(&entry.identity);
+        }
+        Err(error) => {
+            current.state = EntryState::RecoveryNeeded;
+            current.recovery_error = Some(error.to_string());
+        }
+    }
+    save(&root, &file)
+}
+
+fn release(root: &Path, identity: &str, lease: &str) -> io::Result<()> {
+    let _lock = MutationLock::acquire(root)?;
+    let mut file = load(root)?;
+    if file.entries.contains_key(identity) {
+        let entry = file.entries.get_mut(identity).expect("checked");
+        entry.leases.remove(lease);
+        prune_with(&mut file, Lease::live);
+        if let Some(entry) = file.entries.get_mut(identity)
+            && entry.leases.is_empty()
+            && matches!(entry.state, EntryState::Ready)
+        {
+            entry.state = EntryState::Idle;
+            entry.last_used_at = now_secs();
+        }
+        save(root, &file)?;
+    }
+    Ok(())
+}
+
+fn prune_with(file: &mut RegistryFile, live: impl Fn(&str) -> bool) {
+    for entry in file.entries.values_mut() {
+        entry.leases.retain(|lease| live(lease));
+        if entry.leases.is_empty() && matches!(entry.state, EntryState::Ready) {
+            entry.state = EntryState::Idle;
+        }
+    }
+}
+
+fn registry_root() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        // A protected leaf below writable home is insufficient: a confined caller
+        // could rename an ancestor and replace the path. ProgramData's OS-owned
+        // parent is outside home/tool grants; the user creates only its own leaf.
+        let parent = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                io::Error::other("ProgramData is required for the Windows sandbox registry")
+            })?;
+        let parent = std::fs::canonicalize(parent)?;
+        let (name, sid) = current_user_sid()?;
+        let root = parent.join(format!("nub-sandbox-{name}"));
+        let created = match std::fs::create_dir(&root) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error),
+        };
+        protect_registry_root(&root, sid.as_ptr().cast_mut().cast(), created)?;
+        return Ok(root);
+    }
+    #[cfg(not(windows))]
+    {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                io::Error::other("LOCALAPPDATA is required for the Windows sandbox registry")
+            })?;
+        Ok(root.join("nub").join("sandbox-registry"))
+    }
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<(String, Vec<u32>)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = 0;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut bytes);
+    }
+    let mut buffer = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    let error = io::Error::last_os_error();
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        return Err(error);
+    }
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    let mut owned = vec![0u32; len.div_ceil(4)];
+    unsafe {
+        std::ptr::copy_nonoverlapping(sid.cast::<u8>(), owned.as_mut_ptr().cast(), len);
+    }
+    let mut text = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    unsafe {
+        LocalFree(text.cast());
+    }
+    Ok((name, owned))
+}
+
+#[cfg(windows)]
+fn protect_registry_root(
+    root: &Path,
+    user: windows_sys::Win32::Security::PSID,
+    created: bool,
+) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, EqualSid, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    if std::fs::symlink_metadata(root)?.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::other(
+            "sandbox registry root must not be a reparse point",
+        ));
+    }
+    let path = wide(&root.to_string_lossy());
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    let owned = unsafe { EqualSid(owner, user) } != 0;
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if !owned && !created {
+        return Err(io::Error::other(
+            "sandbox registry root belongs to another principal",
+        ));
+    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: 0x001f_01ff,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 3,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user.cast(),
+        },
+    };
+    let mut acl = std::ptr::null_mut();
+    let result = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION
+                | if created {
+                    OWNER_SECURITY_INFORMATION
+                } else {
+                    0
+                },
+            if created { user } else { std::ptr::null_mut() },
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    unsafe {
+        LocalFree(acl.cast());
+    }
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_registry_grant(path: &Path) -> io::Result<()> {
+    let registry = registry_root()?;
+    let path = PathBuf::from(canonical_path_or_lexical(path)?);
+    let registry = PathBuf::from(normalize(&registry));
+    if registry.starts_with(&path) || path.starts_with(&registry) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "sandbox grants cannot include the host ownership registry",
+        ));
+    }
+    Ok(())
+}
+
+fn load(root: &Path) -> io::Result<RegistryFile> {
+    std::fs::create_dir_all(root)?;
+    let path = root.join("registry.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let file: RegistryFile = serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::other(format!(
+                    "invalid sandbox registry {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if file.schema != SCHEMA_VERSION {
+                return Err(io::Error::other(format!(
+                    "unsupported sandbox registry schema {}",
+                    file.schema
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RegistryFile {
+            schema: SCHEMA_VERSION,
+            ..Default::default()
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn save(root: &Path, file: &RegistryFile) -> io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let bytes = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
+    let tmp = root.join(format!("registry-{}.tmp", now_nanos()));
+    use std::io::Write as _;
+    let mut journal = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    journal.write_all(&bytes)?;
+    journal.sync_all()?;
+    drop(journal);
+    let destination = root.join("registry.json");
+    #[cfg(windows)]
+    {
+        // `std::fs::rename` does not replace an existing destination on Windows.
+        // Never emulate replacement with remove+rename: a power loss in that gap
+        // would erase the very journal needed to recover persistent ACL mutations.
+        unsafe extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let from = wide(&tmp.to_string_lossy());
+        let to = wide(&destination.to_string_lossy());
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, destination)
+    }
+}
+
+fn canonical_path(path: &Path) -> io::Result<String> {
+    Ok(normalize(std::fs::canonicalize(path)?.as_path()))
+}
+
+fn canonical_path_or_lexical(path: &Path) -> io::Result<String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(normalize(&path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => Ok(normalize(
+                    &PathBuf::from(canonical_path_or_lexical(parent)?).join(name),
+                )),
+                _ => Ok(normalize(path)),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn normalize(path: &Path) -> String {
+    #[cfg(not(windows))]
+    return path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_start_matches("\\\\?\\")
+        .to_ascii_lowercase()
+}
+
+fn owned_bytes(paths: &[String]) -> io::Result<u64> {
+    fn size(path: &Path) -> io::Result<u64> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        // Reparse/symlink targets are caller data, never owned cache bytes.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Ok(0);
+            }
+        }
+        if metadata.is_symlink() {
+            return Ok(0);
+        }
+        if !metadata.is_dir() {
+            return Ok(metadata.len());
+        }
+        let mut bytes = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            bytes = bytes.saturating_add(size(&entry?.path())?);
+        }
+        Ok(bytes)
+    }
+    let mut total = 0u64;
+    for path in paths {
+        total = total.saturating_add(size(Path::new(path))?);
+    }
+    Ok(total)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(windows)]
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// File locks coordinate even independent logon sessions; kernel release on
+/// process death makes a stale lock file harmless. Separate locks keep journal
+/// updates possible while one resource setup or DACL operation is in progress.
+pub(crate) struct OperationLock {
+    _file: std::fs::File,
+}
+
+impl OperationLock {
+    pub(crate) fn acquire(kind: &str) -> io::Result<Self> {
+        Self::at(&registry_root()?, kind)
+    }
+
+    fn at(root: &Path, kind: &str) -> io::Result<Self> {
+        std::fs::create_dir_all(root)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(format!("{kind}.lock")))?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+}
+
+struct MutationLock {
+    _lock: OperationLock,
+}
+impl MutationLock {
+    fn acquire(root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            _lock: OperationLock::at(root, "journal")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(root: &Path) -> PolicyIdentity {
+        let read = root.join("read");
+        let node = root.join("node");
+        let write = root.join("write");
+        std::fs::create_dir_all(&read).unwrap();
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::create_dir_all(&write).unwrap();
+        PolicyIdentity::new([read], [node], [write], None, false, false).unwrap()
+    }
+
+    #[test]
+    fn identity_is_order_independent_and_changes_with_positive_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let first =
+            PolicyIdentity::new([a.clone(), b.clone()], [], [], None, false, false).unwrap();
+        let second = PolicyIdentity::new([b, a.clone()], [], [], None, false, false).unwrap();
+        let changed = PolicyIdentity::new([a], [], [], None, false, false).unwrap();
+        assert_eq!(first.hash, second.hash);
+        assert_ne!(first.hash, changed.hash);
+        assert!(!first.canonical.contains("TOKEN"));
+    }
+
+    #[test]
+    fn acquisition_persists_intent_before_ready_and_reuses_only_ready_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = id(dir.path());
+        let mut first = acquire_at(dir.path().join("registry"), identity.clone()).unwrap();
+        assert!(first.fresh);
+        assert_eq!(first.entry.state, EntryState::Preparing);
+        first.ready().unwrap();
+        drop(first);
+        let second = acquire_at(dir.path().join("registry"), identity).unwrap();
+        assert!(!second.fresh);
+        assert_eq!(second.entry.state, EntryState::Ready);
+    }
+
+    #[test]
+    fn stale_leases_are_pruned_but_live_leases_are_not_evicted() {
+        let mut file = RegistryFile {
+            schema: SCHEMA_VERSION,
+            ..Default::default()
+        };
+        file.entries.insert(
+            "x".to_string(),
+            Entry {
+                identity: "x".to_string(),
+                canonical_policy: "p".to_string(),
+                profile_name: "n".to_string(),
+                state: EntryState::Ready,
+                created_at: 0,
+                last_used_at: 0,
+                private_paths: Vec::new(),
+                owned_bytes: 0,
+                mutations: Vec::new(),
+                leases: BTreeSet::from(["live".to_string(), "dead".to_string()]),
+                recovery_error: None,
+                window_objects: Vec::new(),
+                object_ids: BTreeMap::new(),
+            },
+        );
+        prune_with(&mut file, |name| name == "live");
+        let entry = &file.entries["x"];
+        assert_eq!(entry.leases, BTreeSet::from(["live".to_string()]));
+        assert_eq!(entry.state, EntryState::Ready);
+        prune_with(&mut file, |_| false);
+        assert_eq!(file.entries["x"].state, EntryState::Idle);
+    }
+
+    #[test]
+    fn network_policies_do_not_share_package_loopback_identity() {
+        use crate::policy::{Effect, NetPolicy, NetRule, NetTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let identity = id(dir.path());
+        let network = |host: &str| NetPolicy {
+            enforce: true,
+            rules: vec![NetRule {
+                target: NetTarget::Host(host.to_string()),
+                effect: Effect::Allow,
+            }],
+            ..Default::default()
+        };
+        assert_ne!(
+            identity
+                .clone()
+                .with_network(Some(&network("one.example")))
+                .unwrap()
+                .hash,
+            identity
+                .with_network(Some(&network("two.example")))
+                .unwrap()
+                .hash
+        );
+    }
+
+    #[test]
+    fn owned_budget_counts_nested_files_not_directory_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/data"), vec![0; 16384]).unwrap();
+        assert_eq!(
+            owned_bytes(&[dir.path().display().to_string()]).unwrap(),
+            16384
+        );
+    }
+
+    #[test]
+    fn replaced_acl_object_refuses_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut acquired = acquire_at(dir.path().join("registry"), id(dir.path())).unwrap();
+        let path = dir.path().join("read");
+        acquired
+            .record_mutation(AclMutation {
+                path: path.display().to_string(),
+                kind: AclKind::Subtree,
+                access: 1,
+            })
+            .unwrap();
+        acquired.ready().unwrap();
+        std::fs::rename(&path, dir.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(validate_entry(&acquired.entry).is_err());
+    }
+
+    #[test]
+    fn abandoned_closing_record_is_selected_for_recovery_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let mut acquired = acquire_at(root.clone(), id(dir.path())).unwrap();
+        acquired.ready().unwrap();
+        drop(acquired);
+        let first = begin_recovery_at(&root, true).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = begin_recovery_at(&root, false).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].identity, first[0].identity);
+    }
+}

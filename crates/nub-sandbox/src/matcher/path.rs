@@ -237,9 +237,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// A compiled last-match-wins matcher over an [`FsRuleSet`]. Compiles every glob
-/// once at construction; `decide()` walks the entries and returns the LAST match
-/// (or the ruleset's `default_effect`).
+/// Compiled filesystem grants. Positive-only sets union access, matching native backends;
+/// legacy internal sets containing an actual deny retain ordered effect resolution.
 pub struct PathMatcher {
     /// One per COMPILABLE ruleset entry: (compiled glob, effect, access, source index).
     /// The source index is the position in the original `FsRuleSet`, which a malformed
@@ -247,6 +246,7 @@ pub struct PathMatcher {
     /// mount operations by that authored position, so it must be the ruleset's.
     entries: Vec<(GlobMatcher, Effect, FsAccess, usize)>,
     default_effect: Effect,
+    positive_only: bool,
 }
 
 /// A decision for a candidate path: the winning effect and, when allowed, the
@@ -254,13 +254,7 @@ pub struct PathMatcher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsDecision {
     pub effect: Effect,
-    /// LAST-MATCH-WINS, which models the EFFECT axis and NOT the write axis —
-    /// no production code reads this field, and a test that treats it as the
-    /// access a backend would grant is asserting a model none of them share.
-    /// Since `f43aab575f` an Allow never subtracts: every backend UNIONS write
-    /// (Seatbelt was the last holdout, synthesizing a `(deny file-write*)` out
-    /// of an allow). Kept last-match because `tests/compiler.rs` uses it as a
-    /// strict IR-ordering check, which a union would silently weaken.
+    /// Union of matching positive grants; read-only access never subtracts a write grant.
     pub access: FsAccess,
 }
 
@@ -281,6 +275,7 @@ impl PathMatcher {
         Self {
             entries,
             default_effect: set.default_effect,
+            positive_only: set.entries.iter().all(|rule| rule.effect == Effect::Allow),
         }
     }
 
@@ -319,9 +314,13 @@ impl PathMatcher {
     }
 
     fn decide_normalized(&self, first: &str, second: Option<&str>) -> FsDecision {
-        let mut winner: Option<(Effect, FsAccess)> = None;
+        let mut winner = (self.positive_only && self.default_effect == Effect::Allow)
+            .then_some((Effect::Allow, FsAccess::ReadWrite));
         for (glob, effect, access, _) in &self.entries {
             if glob.is_match(first) || second.is_some_and(|path| glob.is_match(path)) {
+                if self.positive_only && winner == Some((Effect::Allow, FsAccess::ReadWrite)) {
+                    continue;
+                }
                 winner = Some((*effect, *access));
             }
         }
@@ -329,8 +328,11 @@ impl PathMatcher {
             Some((effect, access)) => FsDecision { effect, access },
             None => FsDecision {
                 effect: self.default_effect,
-                // Access is meaningless on a Deny; report Read as a neutral value.
-                access: FsAccess::Read,
+                access: if self.default_effect == Effect::Allow {
+                    FsAccess::ReadWrite
+                } else {
+                    FsAccess::Read
+                },
             },
         }
     }
@@ -349,6 +351,34 @@ pub fn compile_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_read_grants_never_subtract_write_access() {
+        use crate::policy::{CanonGlob, FsOrigin, FsRule};
+        let read = FsRule {
+            matcher: CanonGlob("**".into()),
+            effect: Effect::Allow,
+            access: FsAccess::Read,
+            origin: FsOrigin::Authored,
+        };
+        let write = FsRule {
+            access: FsAccess::ReadWrite,
+            ..read.clone()
+        };
+        for entries in [vec![read.clone(), write.clone()], vec![write, read]] {
+            let matcher = PathMatcher::new(&FsRuleSet {
+                entries,
+                default_effect: Effect::Deny,
+            });
+            assert_eq!(
+                matcher.decide_normalized("/example", None),
+                FsDecision {
+                    effect: Effect::Allow,
+                    access: FsAccess::ReadWrite
+                }
+            );
+        }
+    }
 
     #[test]
     fn verbatim_prefix_is_stripped_so_the_ir_path_has_no_bogus_glob_char() {

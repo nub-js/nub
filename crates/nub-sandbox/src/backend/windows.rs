@@ -10,7 +10,7 @@
 //! other path fails closed with no per-file deny-ACE. The deny-ACE denylist is
 //! ABANDONED — it is defeated whenever a secret sits under a dir carrying an
 //! inherited `ALL APPLICATION PACKAGES` read grant (the AAP grant satisfies the
-//! lowbox check before the file deny is reached). We grant a UNIQUE per-run
+//! lowbox check before the file deny is reached). We grant a policy-specific
 //! AppContainer SID and never grant AAP, so no inherited AAP can widen the allow-set.
 //!
 //! AXES:
@@ -44,10 +44,9 @@
 //!
 //! THE LAUNCH SEAM: unlike mac/linux, this backend cannot hand the caller a pre-built
 //! `std::process::Command` — the AppContainer launch needs a custom CreateProcess, a
-//! Job assigned at creation, and per-run ACL grants TORN DOWN after the child exits.
-//! So [`apply`] returns a [`WindowsLaunch`] plan on [`Prepared::launch`], and
-//! `Prepared::status()` calls [`WindowsLaunch::run`], which owns setup → spawn → wait
-//! → RAII teardown.
+//! Job assigned at creation, and durable policy-scoped ACL grants. Acquisition
+//! returns a reusable resource; each spawn returns its own native process, Job and
+//! streams. A command owns a resource lease through final tree reaping.
 
 use crate::policy::{Effect, FsAccess, FsOrigin, FsPolicy, FsRule, Inspection, NetPolicy};
 // Referenced only by the Windows-gated `apply`; the host build (module-under-test)
@@ -57,6 +56,14 @@ use crate::policy::SandboxPolicy;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+// Kept beside the native launcher rather than exported through `backend`: this is
+// Windows host-state ownership, not a cross-platform policy surface.  The pure
+// identity/journal half is also compiled by host tests.
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "windows_registry.rs"]
+pub(super) mod windows_registry;
 
 /// Normalize an environment entry sequence into Windows's case-insensitive key
 /// space. The last entry wins when a direct caller supplies aliases; compiler
@@ -76,6 +83,7 @@ fn dedupe_windows_env_pairs<'a>(
 /// IR→plan derivation is unit-tested on the dev host; [`AppContainerLaunch::run`] (the FFI)
 /// is `#[cfg(windows)]`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone)]
 pub(crate) struct AppContainerLaunch {
     program: OsString,
     args: super::CommandArgs,
@@ -106,7 +114,24 @@ pub(crate) struct AppContainerLaunch {
     /// [`plan_net`] chose [`WinNetPlan::Funnel`]; the proxy's port/token are known only at launch,
     /// so [`AppContainerLaunch::run`] injects the proxy env then rather than `apply` baking it in.
     egress_funnel: Option<NetPolicy>,
+    stdout: WindowsStdio,
+    stderr: WindowsStdio,
 }
+
+/// Native command stream configuration; pipes remain owned by the submitting caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) enum WindowsStdio {
+    Inherit,
+    Piped,
+    Null,
+}
+
+#[cfg(windows)]
+pub(super) use launch::{WindowsChild, WindowsLease, WindowsResource};
+
+#[cfg(windows)]
+pub(crate) use launch::cleanup_resources;
 
 /// The AppContainer launch plan and its owned enforcement resources.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -116,6 +141,7 @@ pub(crate) enum WindowsLaunch {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // Retained synchronous adapters; Prepared uses the native spawn path.
 impl WindowsLaunch {
     pub(crate) fn run(self) -> std::io::Result<std::process::ExitStatus> {
         self.run_cancellable(&std::sync::atomic::AtomicBool::new(false))
@@ -125,8 +151,32 @@ impl WindowsLaunch {
         self,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> std::io::Result<std::process::ExitStatus> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "sandbox launch cancelled",
+            ));
+        }
+        let resource = self.acquire()?;
+        let mut child = resource.spawn()?;
+        loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                child.kill()?;
+                child.wait()?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "sandbox launch cancelled",
+                ));
+            }
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    pub(super) fn acquire(self) -> std::io::Result<WindowsResource> {
         match self {
-            WindowsLaunch::AppContainer(l) => l.run_cancellable(cancelled),
+            Self::AppContainer(plan) => plan.acquire(),
         }
     }
 }
@@ -690,45 +740,6 @@ pub(crate) fn apply(
         // one started in the wrong directory and could not find its own package's files.
         spec.cwd = Some(strip_verbatim_prefix(effective_cwd));
     }
-
-    // ── the catalog's full-disk tier ─────────────────────────────────────────────
-    // A build-jail policy whose fs axis confines NOTHING is what a `fullDisk` catalog grant
-    // compiles to, and Windows is the platform that cannot render it inside the sandbox.
-    //
-    // THERE IS NO CHEAP ACE FOR "EVERYTHING", and no expensive one either. A LowBox token
-    // reaches an object only where that object's own ACL names its AppContainer SID, so a
-    // whole-disk grant means an ACE on each drive root — which `is_dangerous_write_root`
-    // refuses outright (an inheritable modify ACE on `C:\` is a filesystem-wide write hole
-    // for the SID it names, outliving this launch's teardown if anything goes wrong — one
-    // derivable per-run container, NOT every AppContainer on the machine, since nub never
-    // grants `ALL APPLICATION PACKAGES`; see this module's doc), and which `set_ace` would
-    // pay for by re-propagating inheritance across
-    // the entire volume on a launch whose ACEs are written and revoked EVERY TIME. Nor does
-    // the non-propagating variant help: Windows inheritance is static, copied into a child's
-    // DACL when the child is created, so an inheritable ACE written without propagation
-    // grants nothing to a single file that already exists. The cheapest correct form is
-    // therefore not an ACE at all — it is not taking the LowBox token, which costs zero.
-    //
-    // WHAT THAT COSTS, and the loss is the OS-LEVEL half only. Egress is an AppContainer
-    // CAPABILITY here (`internetClient`), so declining the token declines OS egress
-    // confinement with it. What survives is the USERLAND gate: `net_gate_shim.js` rides
-    // `NODE_OPTIONS`, which this path preserves by construction — `plain_command` replays
-    // `policy.env.constructed`, and the env allowlist admits `NODE_OPTIONS` on Windows
-    // precisely because the jail stamps it (`build_jail_env_allowed`). So a full-disk package
-    // the catalog does not admit to the network still has its `net`/`dns`/`dgram` and
-    // `child_process` seams patched. TRACED, NOT MEASURED: no one has executed this path on
-    // Windows, and the stamp is skipped outright when the interpreter predates `--import`
-    // (Node 20.6), which leaves no gate at all.
-    //
-    // THE RESIDUAL IS THE MODAL PACKAGE HERE, not an edge case, and that is why the loss is
-    // still reported rather than talked down. The gate is userland: a native addon opening a
-    // raw socket walks past it, and full-disk is overwhelmingly what native-addon and
-    // download-a-binary packages ask for. The proxy blackhole below covers the one case the
-    // preload can never reach — a non-Node top-level lifecycle script — opportunistically, on
-    // the same terms the shim states: additive, not a boundary.
-    //
-    // The env axis is unaffected — it is enforced by constructing the child's environment,
-    // which needs no token — so the credential scrub and the `HOME` redirect still hold.
     if policy.build_jail && !confine_fs {
         let mut deg = Degradation::full();
         let mut command = plain_command(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir);
@@ -760,6 +771,7 @@ pub(crate) fn apply(
             proxy: None,
             launch: None,
             _private_tmp: None,
+            session: None,
             redact_stdout: false,
             redact_stderr: false,
         });
@@ -789,6 +801,7 @@ pub(crate) fn apply(
             proxy: None,
             launch: None,
             _private_tmp: None,
+            session: None,
             redact_stdout: false,
             redact_stderr: false,
         });
@@ -902,6 +915,16 @@ pub(crate) fn apply(
         allow_internet: !policy.net.enforce,
         // `run()` launches the co-package helper over this policy and injects its proxy env.
         egress_funnel: funnel.then(|| policy.net.clone()),
+        stdout: if spec.redact_stdout {
+            WindowsStdio::Piped
+        } else {
+            WindowsStdio::Inherit
+        },
+        stderr: if spec.redact_stderr {
+            WindowsStdio::Piped
+        } else {
+            WindowsStdio::Inherit
+        },
     };
 
     // The `command` field is unused on the launch path (status() runs `launch`); it
@@ -912,6 +935,7 @@ pub(crate) fn apply(
         proxy: None,
         launch: Some(WindowsLaunch::AppContainer(launch)),
         _private_tmp: None,
+        session: None,
         redact_stdout: false,
         redact_stderr: false,
     })
@@ -1155,16 +1179,15 @@ pub fn windows_publish_appcontainer_read(dir: &std::path::Path) -> std::io::Resu
 
 #[cfg(target_os = "windows")]
 pub(super) mod launch {
-    use super::{AppContainerLaunch, dedupe_windows_env_pairs};
+    use super::{AppContainerLaunch, WindowsStdio, dedupe_windows_env_pairs};
     use std::io;
     use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::os::windows::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::Arc;
     use windows_sys::Win32::Foundation::{
         CloseHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
         SetHandleInformation, WAIT_OBJECT_0,
@@ -1176,6 +1199,7 @@ pub(super) mod launch {
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
+        DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
         ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, FreeSid, GetLengthSid,
@@ -1184,20 +1208,20 @@ pub(super) mod launch {
     };
     use windows_sys::Win32::System::Console::{CONSOLE_MODE, GetConsoleMode};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
         GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
-        WaitForSingleObject,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     // Generic access rights (avoid a Storage_FileSystem feature dep for FILE_GENERIC_*).
@@ -1262,15 +1286,10 @@ pub(super) mod launch {
     // AppContainer assumption for that path.
     const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
 
-    /// Monotonic per-process counter so concurrent launches never collide on the
-    /// AppContainer profile name (combined with pid + a time nonce).
-    static LAUNCH_CTR: AtomicU64 = AtomicU64::new(0);
-
     /// Serializes the per-path DACL read-modify-write in [`set_ace`]. Concurrent launches
     /// can grant/revoke on a SHARED leaf (two runs granting a common toolchain/program
     /// dir); without this, two non-atomic RMWs race and one run's ACE is lost (its grant
     /// then missing). A single global lock is ample — ACL edits are brief and rare.
-    static ACL_LOCK: Mutex<()> = Mutex::new(());
 
     /// Verify that `cwd` is rooted beneath a protected DACL and that neither it nor any
     /// ancestor up to that boundary grants ALL APPLICATION PACKAGES access. Inherited AAP
@@ -1318,7 +1337,7 @@ pub(super) mod launch {
     /// any AAP ace outside one. A genuinely dirty root therefore fails closed exactly as before
     /// — the posture 5c8d168833 settled on when it rejected re-authoring the user's DACL and
     /// corrected the predicate instead.
-    pub(super) fn verify_clean_root(cwd: &Path, published: &[PathBuf]) -> io::Result<()> {
+    pub(crate) fn verify_clean_root(cwd: &Path, published: &[PathBuf]) -> io::Result<()> {
         // Canonicalized ONCE, outside the ancestor walk, into the same `\\?\`-verbatim form the
         // caller resolved `cwd` into — a raw policy path (`C:\…`) never component-matches a
         // canonical one. An unresolvable entry drops out, which excuses nothing: fail-closed.
@@ -1542,7 +1561,7 @@ pub(super) mod launch {
 
     /// See [`super::windows_object_traverse_ace`].
     #[doc(hidden)]
-    pub(super) fn object_traverse_ace(dir: &Path, sddl: &str, grant: bool) -> io::Result<()> {
+    pub(crate) fn object_traverse_ace(dir: &Path, sddl: &str, grant: bool) -> io::Result<()> {
         let sid = CapSid::new(sddl)?;
         let mode = if grant { GRANT_ACCESS } else { REVOKE_ACCESS };
         set_ace_on_object(dir, sid.0, TRAVERSE_MASK, mode)
@@ -1550,13 +1569,13 @@ pub(super) mod launch {
 
     /// See [`super::windows_leaf_grant_redundant`].
     #[doc(hidden)]
-    pub(super) fn leaf_read_grant_redundant(dir: &Path) -> bool {
+    pub(crate) fn leaf_read_grant_redundant(dir: &Path) -> bool {
         already_granted_to_appcontainers(dir, GENERIC_READ | GENERIC_EXECUTE)
     }
 
     /// See [`super::windows_publish_appcontainer_read`].
     #[doc(hidden)]
-    pub(super) fn publish_appcontainer_read(dir: &Path) -> io::Result<()> {
+    pub(crate) fn publish_appcontainer_read(dir: &Path) -> io::Result<()> {
         let sid = CapSid::new(ALL_APPLICATION_PACKAGES_SID)?;
         set_ace(
             dir,
@@ -1666,7 +1685,7 @@ pub(super) mod launch {
         const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
         const CARRIED_CONTROL: u16 = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
 
-        let _lock: MutexGuard<'_, ()> = ACL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::windows_registry::OperationLock::acquire("acl")?;
         let wpath = to_wide_path(path);
         // SAFETY: `wpath` is a NUL-terminated wide path; `HandleGuard` closes the handle.
         let handle = unsafe {
@@ -1902,402 +1921,170 @@ pub(super) mod launch {
         sa == sb
     }
 
+    struct ResourceState {
+        // The command keeps this Arc alive through final Job reaping, including when
+        // the caller closes its WindowsResource while commands are still running.
+        _lease: super::windows_registry::Acquired,
+        sid: SidGuard,
+    }
+
+    pub(crate) struct WindowsResource {
+        plan: AppContainerLaunch,
+        state: Arc<ResourceState>,
+    }
+
+    /// Shared identity ownership without a command, arguments or environment.
+    #[derive(Clone)]
+    pub(crate) struct WindowsLease {
+        _state: Arc<ResourceState>,
+    }
+
     impl AppContainerLaunch {
-        /// Own the full spawn lifecycle: create a per-run AppContainer profile, grant
-        /// the inheritable allow-ACEs, launch the child under the LowBox token inside a
-        /// kill-on-close Job, wait, then tear everything down (RAII).
-        pub(crate) fn run_cancellable(
-            mut self,
-            cancelled: &std::sync::atomic::AtomicBool,
-        ) -> io::Result<ExitStatus> {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "sandbox launch cancelled",
-                ));
+        pub(crate) fn acquire(self) -> io::Result<WindowsResource> {
+            let _operation = super::windows_registry::OperationLock::acquire("resources")?;
+            for path in self.read_grants.iter().chain(&self.write_grants) {
+                super::windows_registry::reject_registry_grant(path)?;
             }
-            // 1. Per-run AppContainer profile → AC SID. `_profile` deletes it on drop
-            //    (declared FIRST ⇒ dropped LAST, after the ACEs are revoked).
-            let name = unique_profile_name();
-            let ac_sid = timed("create_appcontainer", || create_appcontainer(&name))?;
-            let _profile = ProfileGuard {
-                name: to_wide(&name),
-                sid: ac_sid,
-            };
-            // An owned copy of the SID bytes, so ACE revoke doesn't depend on the
-            // profile-owned SID pointer surviving.
-            let sid_copy = copy_sid(ac_sid)?;
-
-            // 1b. ⛔ WINDOW STATION + DESKTOP ACE — WITHOUT IT, ANY CHILD THAT IMPORTS `USER32`
-            //     DIES BEFORE `main`, AND THE JAIL LOOKS LIKE IT BROKE THE PACKAGE.
-            //
-            // `USER32`'s init attaches the process to a window station and desktop. A LowBox
-            // token reaches neither unless its container SID is in their DACLs, and a DllMain
-            // that fails is reported by the loader as `STATUS_DLL_INIT_FAILED` (0xC0000142) —
-            // an exit code with nothing in it to suggest a sandbox, which is why this cost a
-            // day to find. MEASURED 2026-08-04 over SSH (a non-interactive station): `node.exe`,
-            // `git.exe` and `nub.exe` all died 0xC0000142 while a std-only crt-static probe and
-            // System32's `hostname.exe` — neither of which imports USER32 — ran fine.
-            //
-            // ⛔ ON AN INTERACTIVE `WinSta0` THIS IS REDUNDANT: seclogon already auto-grants it,
-            // which is why CI and ordinary desktop installs never saw the failure and only a
-            // remoted/service session does. It is cheap and it makes the jail behave the same
-            // way in both, so it is unconditional rather than gated on detecting the station.
-            //
-            // FAILS FORWARD deliberately: a station whose DACL cannot be rewritten still
-            // launches, rather than losing a run that worked before this existed; and it strips
-            // exactly its own ace on drop (`windows_ace`, resurrected from the dropped tier).
-            let window = match unsafe { crate::backend::windows_ace::sid_to_string(ac_sid) } {
-                Ok(sid_str) => Some(crate::backend::windows_ace::WindowAceGuard::grant(&sid_str)),
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        "sandbox: could not stringify the container SID for the window-station \
-                         ace — a USER32-importing child on a non-interactive station may fail \
-                         loader init"
-                    );
-                    None
-                }
-            };
-            // Under NUB_JAIL_DUMP_POLICY, report whether the ace actually landed on THIS station:
-            // `station_ace=false` printed next to a child `code=3221225794` (0xC0000142) names the
-            // fault outright, where the bare exit code says only "the child could not start".
-            if let Some(guard) = &window
-                && std::env::var_os("NUB_JAIL_DUMP_POLICY").is_some()
-            {
-                eprintln!("JAILDUMP window-station {}", guard.probe());
+            recover_idle_resources(false)?;
+            let mut resource = super::windows_registry::acquire(reusable_identity(&self)?)?;
+            if !resource.fresh {
+                super::windows_registry::validate_entry(&resource.entry)?;
             }
-
-            // 1a. ⛔ THE CHILD RESOLVES ITS PROFILE FROM `%LOCALAPPDATA%`; THE PARENT DOES NOT.
-            //
-            // `CreateAppContainerProfile` above runs HERE, unsandboxed, and Windows places the real
-            // profile via the PARENT's known-folder location. But `defaults::OS_ESSENTIAL_ENV` hands
-            // the CHILD a `LOCALAPPDATA` value, and the enforcing path resolves the per-container
-            // profile dir from THAT. When the two disagree the child looks somewhere the profile was
-            // never created and has no ACE to create it, so every launch dies before running:
-            //
-            //     npm error syscall mkdir
-            //     npm error path ...\home\AppData\Local\Packages\nub_sbx_4412_18c8788d58963f90_0
-            //
-            // ⛔ NOTE THE PATH ENDS IN THE PROFILE NAME, NOT `Packages`. Pre-creating `Packages`
-            // externally does NOT help — measured, run 30869760855, grants byte-identical to
-            // baseline — because the leaf is `unique_profile_name()`, generated per launch. Only
-            // this function knows it, which is why the fix has to live here.
-            //
-            // Reproduces wherever the child's `%LOCALAPPDATA%` differs from the parent's known
-            // folder: redirected folders, enterprise profiles, anything that sets the var
-            // explicitly. The measurement harness hits it on every single run, which is how it was
-            // found — it drove ~17 packages to a whole-disk grant that they do not need.
-            //
-            // Creating it here is not a widening: it is one per-launch directory, named after this
-            // container, carrying only this container's ACE, and removed on drop.
-            let _child_profile = self
-                .env
-                .as_ref()
-                .and_then(|e| {
-                    e.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("LOCALAPPDATA"))
-                })
-                .map(|(_, v)| PathBuf::from(v).join("Packages").join(&name))
-                .filter(|dir| !dir.exists())
-                .and_then(|dir| {
-                    // Best effort by design. A failure here is not fatal: when the parent's known
-                    // folder DOES agree with the child's env the profile already exists (filtered
-                    // out above), and if the directory cannot be made the launch fails exactly as
-                    // it does today rather than differently.
-                    std::fs::create_dir_all(&dir).ok()?;
-                    // ⛔ `DELETE` FOR THE SAME REASON ITS `AC`/`AC\Temp` CHILDREN NEED IT, and this
-                    // line is FALLOUT FROM THE COMMIT THAT ADDED IT THERE: that fix granted DELETE on
-                    // the two leaves and left the PROFILE ROOT on READ|WRITE, so a file written
-                    // directly here could be created and never removed. Windows governs unlink by
-                    // DELETE on the FILE, where POSIX governs it by write permission on the
-                    // DIRECTORY, so an inherited ACE carrying only GENERIC_READ|GENERIC_WRITE grants
-                    // everything the write needs except removing it — the same EPERM-on-unlink the
-                    // leaf grant produced for electron-chromedriver and playwright-chromium.
-                    //
-                    // ⛔ NOT MEASURED AGAINST A WITNESS, unlike the leaf fix. No corpus record is
-                    // known to write a file directly into the profile ROOT rather than under `AC`,
-                    // so this lands as CONSISTENCY with the write-grant mask used elsewhere in this
-                    // file, NOT as a claimed fix. Do not credit it with any metric movement.
-                    //
-                    // ⛔ `GENERIC_EXECUTE` ADDED 2026-09-03, AND THIS ONE HAS A WITNESS. A package
-                    // that stages an executable under the container profile could write it, read it
-                    // and delete it, but not RUN it: measured jailed, `spawnSync` of a valid PE
-                    // copied into `AC\Temp` returned EPERM, while the identical file launched from
-                    // an ordinary write-granted directory. The mask now matches `self.write_grants`
-                    // below, which has always carried execute. Download-then-exec installers are a
-                    // large family, so an under-grant here is far worse than the over-grant.
-                    let _ = grant_leaf_ace(
-                        &dir,
-                        ac_sid,
-                        GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                    );
-                    // ⛔ `AC` MUST EXIST TOO, AND CREATING THE PROFILE DIR ALONE DOES NOT MAKE IT.
-                    // When Windows creates an AppContainer profile it also lays down the `AC`
-                    // subtree, which is where it VIRTUALIZES the container's `%LOCALAPPDATA%`. We
-                    // are making this directory by hand, so nothing creates `AC` and the child
-                    // dies on a path INSIDE the profile it can otherwise reach:
-                    //
-                    //     Error: ENOENT: no such file or directory, lstat
-                    //       '…\Packages\nub_sbx_1404_18c8868173b7d0c0_0\AC'
-                    //
-                    // MEASURED, run 30882019778: that is gifsicle@5.3.0's ENTIRE remaining blocker
-                    // once the npm-prefix redirect removed the other one — its 56 cell logs mention
-                    // `npm` zero times and carry this instead. The same shape appears one level
-                    // deeper as `AC\npm-cache\_cacache\tmp\…` (impit) and `AC\Temp\…`
-                    // (electron-chromedriver, playwright-chromium), so it is the family, not a case.
-                    //
-                    // Granted at the leaf like its parent rather than recursively: the child creates
-                    // its own subtree beneath `AC`, and files it creates inherit from the directory
-                    // it created them in — a recursive walk would cost a DACL propagation per
-                    // lifecycle spawn for nothing.
-                    // ⛔⛔ `AC` ALONE LEFT THIS ENTIRELY UNFIXED — `AC\Temp` IS WHERE THE FAILURES LAND.
-                    // The comment above already named `AC\Temp\…` as part of the family, and the
-                    // first version of this block still stopped at `AC`.
-                    //
-                    // MEASURED on the fixed binary (nub 8a49b39413, run 30893326426): ALL THREE
-                    // witnesses — electron-chromedriver@43.2.0, playwright-chromium@0.13.0,
-                    // gifsicle@5.3.0 — were UNCHANGED at 55 cells write:"disk", and 130 of their
-                    // cell logs carry the same shape ONE LEVEL DEEPER:
-                    //
-                    //     ENOENT: no such file or directory, open
-                    //       '…\Packages\nub_sbx_…_0\AC\Temp\playwright-download-chromium-win64-…zip'
-                    //
-                    // `AC\Temp` is where an AppContainer virtualizes the container's TEMP, so every
-                    // installer that downloads to a temp file — which is most of the browser and
-                    // driver family — dies there.
-                    //
-                    // ⛔ THE THREE-WITNESS NEGATIVE IS WHAT FORCED READING THE LOG, and the log
-                    // carried an answer neither reading of "still 55 cells" allowed for: not "the fix
-                    // did nothing" and not "the fix worked, something else blocks", but the SAME
-                    // failure at a deeper path. A grant is only as good as the deepest path the
-                    // child actually opens.
-                    // ⛔⛔ `DELETE` IS LOAD-BEARING AND THIS GRANT OMITTED IT — the third level of
-                    // the same family. With `AC\Temp` created and read-write granted, the child
-                    // CREATES its download fine and then cannot REMOVE it:
-                    //
-                    //     [Error: EPERM: operation not permitted, unlink
-                    //       '…\AC\Temp\electron-download-Oiubht\chromedriver-v43.2.0-win32-x64.zip']
-                    //     errno: -4048
-                    //
-                    // MEASURED on the FIXED binary (nub 8f7d5adb67, run 30898968818): 32 cell logs
-                    // for electron-chromedriver@43.2.0 and 12 for playwright-chromium@0.13.0 carry
-                    // that line, with ZERO ENOENT — the directory now exists, so the failure moved
-                    // from "cannot open" to "cannot unlink". gifsicle@5.3.0 narrowed 55c -> 6c in the
-                    // same run because it does not unlink its download; that is the whole difference.
-                    //
-                    // ⛔ POSIX DOES NOT NEED THIS, which is why it was easy to miss: unlink there is
-                    // governed by write permission on the DIRECTORY, so a writable temp dir is enough.
-                    // Windows requires DELETE on the FILE, and an inherited ACE carrying only
-                    // GENERIC_READ|GENERIC_WRITE grants everything the download needs except removing
-                    // it. The ordinary write-grant path already knew this — `self.write_grants` below
-                    // uses `GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE` — and this leaf
-                    // grant did not match it. It does now: the missing `GENERIC_EXECUTE` was its own
-                    // defect, measured 2026-09-03, and the two masks are deliberately identical.
-                    //
-                    // Every download-then-move installer cleans up its staging file, so this blocks
-                    // the same family `AC\Temp` itself did.
-                    for leaf in ["AC", "AC/Temp"] {
-                        let p = dir.join(leaf);
-                        if std::fs::create_dir_all(&p).is_ok() {
-                            let _ = grant_leaf_ace(
-                                &p,
-                                ac_sid,
-                                GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                            );
-                        }
-                    }
-                    Some(ChildProfileGuard { dir })
-                });
-
-            // 1c. PUBLISH nub's OWN PUBLIC CACHES ONCE, BEFORE the per-run grant loop — the single
-            //     largest cost in a jailed launch, removed rather than optimised.
-            //
-            //     A per-run AC SID means the store grant is an inheritable ACE written and revoked
-            //     EVERY launch, and Windows inheritance is STATIC: setting it rewrites every
-            //     existing child's DACL right then. Measured in-product, that pair is 10,553 ms of
-            //     a 13,845 ms fixed per-launch cost across 25,526 store entries — 76% of it — and
-            //     it scales linearly. Published to `ALL APPLICATION PACKAGES` instead, the very
-            //     next `grant_leaf_ace` sees `already_granted_to_appcontainers` and SKIPS the path,
-            //     so it is never granted or revoked again on this machine. Exactly the reason
-            //     `%ProgramFiles%\nodejs` costs nothing today.
-            //
-            //     ⛔ BEST-EFFORT ON PURPOSE. A failure here is a MISSED OPTIMISATION, never a
-            //     confinement change: the path stays in `read_grants`, so the loop below grants it
-            //     per-run as before and the launch is slow rather than wrong. Erroring out would
-            //     turn an unwritable cache DACL into "no package can build on this machine".
-            //
-            //     The one-time cost lands on whoever publishes first, on an already-populated
-            //     store (~39 s measured for 25,526 entries). Publishing at store CREATION, while
-            //     it is empty, avoids even that — the trick `stage_appcontainer_readable_copy`
-            //     already uses — but that belongs to the code that makes the store, not here.
-            for dir in &self.publishable_grants {
-                if !dir.exists() || leaf_read_grant_redundant(dir) {
-                    continue;
-                }
-                let _ = timed(&format!("publish.once {}", dir.display()), || {
-                    publish_appcontainer_read(dir)
-                });
-            }
-
-            // 2. Grant the leaf allow-ACEs; `_aces` revokes them on drop (declared before
-            //    the job ⇒ revoked after the tree is reaped, before profile delete). Leaf
-            //    read/write grants are INHERITABLE (cover the subtree). Ancestors are
-            //    handled separately, in step 2b. A REVOKE_ACCESS teardown on the unique SID
-            //    removes exactly our ACEs from every path, whatever the access mask.
-            //
-            //    Both kinds run through ONE loop so the teardown list is populated from a
-            //    single decision — see [`grant_leaf_ace`], which may report that the path
-            //    already grants AppContainers what we were about to add.
-            let mut _aces = AceGuard {
-                paths: Vec::new(),
-                objects: Vec::new(),
-                sid: sid_copy,
-            };
-            let leaves = self
-                .read_grants
-                .iter()
-                .map(|d| ("read", d, GENERIC_READ | GENERIC_EXECUTE))
-                .chain(self.write_grants.iter().map(|d| {
-                    (
-                        "write",
-                        d,
-                        GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                    )
-                }));
-            //    A REFUSED **READ** GRANT IS SKIPPED, NOT FATAL — same reasoning as the
-            //    ancestor chain in 2b, which the read grants share a failure mode with.
-            //    Writing a DACL needs `WRITE_DAC`, and a read grant may legitimately name a
-            //    path the user does not hold it on: a toolchain outside their profile
-            //    (`C:\hostedtoolcache`, an all-users Python) is granted read, and taking `?`
-            //    there aborted EVERY lifecycle script on the machine over one unreachable
-            //    toolchain — the loudest possible failure for the mildest cause. Skipping
-            //    cannot open the jail: a grant is a REDUCTION from the unconfined lifecycle
-            //    spawn's complete access, so a grant not installed leaves the child with
-            //    LESS, and the worst outcome is one package failing to find one tool. The
-            //    interpreter no longer relies on this — nub stages a copy it owns (see
-            //    `pm_engine::jail_bin`) — which is what makes it a genuine safety net rather
-            //    than the mechanism.
-            //
-            //    WRITE grants stay FATAL. Every one of them is nub's own private tmp or the
-            //    package directory being built, both under the user's own tree, so a refusal
-            //    there is not a reachable configuration — it is a broken assumption, and
-            //    continuing would launch a build that silently cannot write its output.
-            // THE SEAM. It was added because the fail-closed behaviour this replaced was the prime
-            // suspect for a sibling lane's finding that `cmd.exe` cannot run confined at all
-            // de-elevated: `resolve_program` auto-grants the program FILE (above), so a System32
-            // program's own leaf grant is attempted, and if de-elevated refusal aborted the launch
-            // under `?`, that would be indistinguishable from cmd misbehaving.
-            //
-            // ⛔ THAT SUSPICION IS NOW REFUTED, BY THE ARM ITSELF — do not re-open it from this
-            // comment. Corpus run 30918296299 set this variable and re-measured bs-platform@9.0.2
-            // (the witness — `spawnSync C:\Windows\system32\cmd.exe EPERM` in 51 of 54 cell logs)
-            // beside optipng-bin@8.1.0 as a negative control. Fail-closed produced **ZERO**
-            // `installing read grant ACE ... failed` aborts across 61 logs while the EPERM stayed at
-            // 51/54. So no read-grant ACE is being skipped here, silently or otherwise: they install
-            // fine and the refusal is somewhere else entirely.
-            //
-            // What that corpus DID establish is that the remaining Windows failures are TWO distinct
-            // causes, separated by ERRNO rather than by which grants they need — grouping them by the
-            // rung signature merged them twice. bs-platform is refused `cmd.exe`
-            // (EPERM = ERROR_ACCESS_DENIED); jpegtran-bin@5.0.2 cannot spawn its OWN downloaded
-            // vendor exe (`spawn UNKNOWN`, 26/56). UNKNOWN is libuv's `default:` arm — an error it has
-            // no mapping for — which rules out ENOENT and EPERM alike (`deps/uv/src/win/error.c`
-            // maps ERROR_MOD_NOT_FOUND -> ENOENT and ERROR_ACCESS_DENIED -> EPERM). Each signature is
-            // ABSENT from the sibling that works, measured in the same arm.
-            //
-            // The seam stays: it is the only way to tell an uninstallable ACE from a live refusal, it
-            // answered its question once, and it can only ever make the jail STRICTER — so it is not a
-            // lever anything can be widened with.
-            let fail_closed = std::env::var_os("NUB_SANDBOX_WIN_FAIL_CLOSED_READ_GRANTS").is_some();
-            for (kind, dir, access) in leaves {
-                let installed = match timed(&format!("grant.{kind} {}", dir.display()), || {
-                    grant_leaf_ace(dir, ac_sid, access)
-                }) {
-                    Ok(installed) => installed,
-                    Err(_) if kind == "read" && !fail_closed => continue,
-                    Err(error) => {
-                        return Err(io::Error::new(
-                            error.kind(),
-                            format!(
-                                "sandbox: installing {kind} grant ACE on {} failed: {error}",
-                                dir.display()
-                            ),
-                        ));
-                    }
-                };
-                if installed && !_aces.paths.contains(dir) {
-                    _aces.paths.push(dir.clone());
-                }
-            }
-
-            // 2a'. NODE-ONLY READS — the directory object, never its subtree. Same writer and
-            //      same mask as the ancestor chain below, so this grant propagates nothing and
-            //      tears down through the existing `objects` path. Best-effort for the same
-            //      reason a read leaf is: a grant not installed leaves the child with LESS.
-            for dir in &self.read_node_grants {
-                if timed(&format!("grant.node {}", dir.display()), || {
-                    set_ace_on_object(dir, ac_sid, TRAVERSE_MASK, GRANT_ACCESS)
-                })
-                .is_ok()
-                {
-                    _aces.objects.push(dir.clone());
-                }
-            }
-
-            // 2b. THE ANCESTOR CHAIN, which the leaf grants alone do not cover.
-            //
-            // Traverse-bypass exempts INTERMEDIATE components of one open; it does not make
-            // an ancestor openable as a TARGET, and Node's `realpathSync` opens every prefix
-            // of a path in turn — starting at the volume root. Measured, that is where an
-            // absolute `require()` dies: `EPERM: lstat 'C:\'`, with `C:\Users` and the user
-            // profile refused right behind it (run 30464397422).
-            //
-            // Two mechanisms are attempted, and ONLY THE FIRST IS MEASURED TO WORK. Writing an
-            // ACE needs `WRITE_DAC`, which a standard user holds on their own profile and below
-            // but not on `C:\` or `C:\Users` (measured de-elevated, same run). So:
-            //
-            //  - Where nub CAN write, it writes a NON-INHERITED ACE carrying exactly
-            //    traverse + read-attributes. Non-inherited is not a detail: it grants the
-            //    directory OBJECT and nothing under it (so an ancestor grant never becomes a
-            //    subtree read), and it costs no DACL propagation, which is what keeps this
-            //    affordable per lifecycle spawn. THIS is the half that holds unprivileged.
-            //  - Where it cannot — `C:\` is owned by TrustedInstaller and `C:\Users` by SYSTEM,
-            //    and neither grants a standard group `WRITE_DAC` — NOTHING repairs those two
-            //    roots. A second mechanism was tried and is DEAD: the capability SIDs Windows
-            //    already places on them are `S-1-15-3-65536-…`, and the kernel refuses that
-            //    AppSilo RID class outright (`0xc000000d` from `NtCreateLowBoxToken`), measured
-            //    in BOTH principals. See `wiki/design/build-jail-windows.md`.
-            //
-            // Both are best-effort by design. This jail is defence in depth, not a watertight
-            // boundary; a package that cannot start is a worse outcome than a residual, and
-            // every grant here is a REDUCTION from the unconfined lifecycle spawn's complete
-            // access. A refused ACE write is therefore skipped, not fatal.
-            //
-            // The seam exists so the branch-scoped Windows probe can measure BOTH directions
-            // in ONE run: without an arm where the defect still reproduces, a green repaired
-            // arm is measuring nothing. It can only ever REMOVE grants, so it is not a lever
-            // anything can be widened with.
-            let ancestors = if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_some() {
-                Vec::new()
+            let name = resource.entry.profile_name.clone();
+            let sid = SidGuard(if resource.fresh {
+                create_appcontainer(&name)?
             } else {
-                // The container profile created in 1a rides along as a leaf, so `Packages` and
-                // everything above it take the same traverse ACE the grant chain gets. `None` when
-                // the parent's known folder already agreed with the child's env (1a filtered it
-                // out): Windows created the profile itself and the chain is already walkable.
-                ancestor_chain(&self, _child_profile.as_ref().map(|g| g.dir.as_path()))
-            };
-            for dir in &ancestors {
-                if set_ace_on_object(dir, ac_sid, TRAVERSE_MASK, GRANT_ACCESS).is_ok() {
-                    _aces.objects.push(dir.clone());
-                }
+                derive_appcontainer(&name)?
+            });
+            let ac_sid = sid.0;
+            if resource.fresh {
+                resource.record_private_path(&appcontainer_folder(ac_sid)?)?;
+            }
+            // Window objects are session-local, whereas profiles are user-global.
+            // Journal each session's station/desktop before changing either DACL.
+            for object in crate::backend::windows_ace::current_objects()? {
+                resource.record_window_object(object.clone())?;
+                crate::backend::windows_ace::grant_persistent(&object, ac_sid)?;
             }
 
+            if resource.fresh {
+                let private = self.env.as_ref().and_then(|env| {
+                    env.iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case("LOCALAPPDATA"))
+                        .map(|(_, value)| PathBuf::from(value).join("Packages").join(&name))
+                });
+                if let Some(dir) = &private {
+                    // This profile name is exclusively owned by this registry entry.
+                    resource.record_private_path(dir)?;
+                    for path in [dir.clone(), dir.join("AC"), dir.join("AC/Temp")] {
+                        resource.record_mutation(super::windows_registry::AclMutation {
+                            path: path.to_string_lossy().into_owned(),
+                            kind: super::windows_registry::AclKind::PrivateProfile,
+                            access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                        })?;
+                        std::fs::create_dir_all(&path)?;
+                        grant_leaf_ace(
+                            &path,
+                            ac_sid,
+                            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                        )?;
+                    }
+                }
+                for dir in &self.publishable_grants {
+                    if dir.exists() && !leaf_read_grant_redundant(dir) {
+                        let _ = publish_appcontainer_read(dir);
+                    }
+                }
+                let fail_closed =
+                    std::env::var_os("NUB_SANDBOX_WIN_FAIL_CLOSED_READ_GRANTS").is_some();
+                for (dir, access, required) in self
+                    .read_grants
+                    .iter()
+                    .map(|dir| (dir, GENERIC_READ | GENERIC_EXECUTE, false))
+                    .chain(self.write_grants.iter().map(|dir| {
+                        (
+                            dir,
+                            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                            true,
+                        )
+                    }))
+                {
+                    if !dir.exists() && !required {
+                        continue;
+                    }
+                    resource.record_mutation(super::windows_registry::AclMutation {
+                        path: dir.to_string_lossy().into_owned(),
+                        kind: super::windows_registry::AclKind::Subtree,
+                        access,
+                    })?;
+                    if let Err(error) = grant_leaf_ace(dir, ac_sid, access)
+                        && (required || fail_closed)
+                    {
+                        return Err(error);
+                    }
+                }
+                let ancestors = if std::env::var_os("NUB_SANDBOX_WIN_NO_ANCESTOR_REPAIR").is_some()
+                {
+                    Vec::new()
+                } else {
+                    ancestor_chain(&self, private.as_deref())
+                };
+                for dir in self.read_node_grants.iter().chain(&ancestors) {
+                    if !dir.exists() {
+                        continue;
+                    }
+                    resource.record_mutation(super::windows_registry::AclMutation {
+                        path: dir.to_string_lossy().into_owned(),
+                        kind: super::windows_registry::AclKind::Object,
+                        access: TRAVERSE_MASK,
+                    })?;
+                    // Missing optional read/traverse rights can only over-confine.
+                    let _ = set_ace_on_object(dir, ac_sid, TRAVERSE_MASK, GRANT_ACCESS);
+                }
+                resource.ready()?;
+            }
+            Ok(WindowsResource {
+                plan: self,
+                state: Arc::new(ResourceState {
+                    _lease: resource,
+                    sid,
+                }),
+            })
+        }
+    }
+
+    impl WindowsResource {
+        pub(crate) fn identity(&self) -> &str {
+            &self.state._lease.entry.identity
+        }
+
+        pub(crate) fn lease(&self) -> WindowsLease {
+            WindowsLease {
+                _state: self.state.clone(),
+            }
+        }
+        #[cfg(test)]
+        pub(crate) fn profile_name(&self) -> &str {
+            &self.state._lease.entry.profile_name
+        }
+
+        pub(crate) fn spawn(&self) -> io::Result<WindowsChild> {
+            self.spawn_with_stdio(WindowsStdio::Inherit, self.plan.stdout, self.plan.stderr)
+        }
+
+        pub(crate) fn spawn_with_stdio(
+            &self,
+            stdin: WindowsStdio,
+            stdout: WindowsStdio,
+            stderr: WindowsStdio,
+        ) -> io::Result<WindowsChild> {
+            let mut plan = self.plan.clone();
+            let ac_sid = self.state.sid.0;
             // 3. Capabilities: internetClient iff egress allowed, and nothing else. The
             //    ancestor chain contributes none — see the DEAD note in 2b.
             let mut cap_sid_owned: Option<CapSid> = None;
             let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-            if self.allow_internet {
+            if plan.allow_internet {
                 let cs = CapSid::new(INTERNET_CLIENT_SID)?;
                 caps.push(SID_AND_ATTRIBUTES {
                     Sid: cs.0,
@@ -2319,19 +2106,17 @@ pub(super) mod launch {
             // 4. Job with KILL_ON_JOB_CLOSE; `_job` closes the handle on drop (declared
             //    LAST ⇒ dropped FIRST ⇒ reaps any lingering tree before ACE revoke).
             let job = create_confinement_job()?;
-            let _job = HandleGuard(job);
+            let job_guard = HandleGuard(job);
 
             // 5. Proc-thread attribute list: SECURITY_CAPABILITIES, plus a HANDLE_LIST
             //    scoping inheritance to EXACTLY the std handles (see `bInheritHandles`
             //    below). The list must be alive across CreateProcessW (it stores the
             //    pointer); `inherit_handles` outlives the call.
-            let ChildStdio {
-                triple: std_triple,
-                list: inherit_handles,
-                writers: relay_writers,
-                relays,
-            } = child_stdio();
-            let n_attrs = 1 + u32::from(!inherit_handles.is_empty());
+            let mut stdio = NativeStdio::new([stdin, stdout, stderr])?;
+            let std_triple = stdio.triple;
+            let inherit_handles = &stdio.child_handles;
+            let n_attrs = 2 + u32::from(!inherit_handles.is_empty());
+            let jobs = [job];
             let mut attr = ProcThreadAttrList::new(n_attrs)?;
             // The attribute list stores a POINTER to `sec_caps` rather than a copy, so it must
             // stay live until CreateProcessW returns.
@@ -2340,17 +2125,22 @@ pub(super) mod launch {
                 std::ptr::from_mut(&mut sec_caps).cast(),
                 std::mem::size_of::<SECURITY_CAPABILITIES>(),
             )?;
+            attr.update(
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast_mut().cast(),
+                std::mem::size_of_val(&jobs),
+            )?;
             if !inherit_handles.is_empty() {
                 attr.update(
                     PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    inherit_handles.as_ptr().cast_mut().cast(),
+                    stdio.inherit_list.as_ptr().cast_mut().cast(),
                     std::mem::size_of::<HANDLE>() * inherit_handles.len(),
                 )?;
             }
 
             // 5c. THE ZERO-PRIVILEGE EGRESS FUNNEL. Launch a CO-PACKAGE helper process — SAME
             //     AppContainer SID (`ac_sid`), holding `internetClient` — that runs nub's egress
-            //     proxy over `self.egress_funnel`'s policy, then point THIS (capability-free) child
+            //     proxy over `plan.egress_funnel`'s policy, then point THIS (capability-free) child
             //     at it via `HTTP_PROXY`. The child reaches the helper by SAME-PACKAGE loopback,
             //     which needs NO admin loopback exemption (the `IsAppContainerLoopback` kernel
             //     permit), so no machine-wide firewall mutation is needed.
@@ -2362,11 +2152,11 @@ pub(super) mod launch {
             //     holds the helper in a KILL_ON_JOB_CLOSE job dropped when `run` returns (after the
             //     child is waited + reaped below), so the helper lives exactly the child's lifetime
             //     and dies with nub even on a crash.
-            let _egress_helper = if let Some(policy) = self.egress_funnel.take() {
+            let _egress_helper = if let Some(policy) = plan.egress_funnel.take() {
                 let (port, token, guard) = timed("egress_funnel_helper", || {
-                    launch_egress_helper(ac_sid, &policy)
+                    launch_egress_helper(ac_sid, &policy, plan.env.as_ref())
                 })?;
-                if let Some(env) = self.env.as_mut() {
+                if let Some(env) = plan.env.as_mut() {
                     let url = format!("http://{token}@127.0.0.1:{port}");
                     for key in [
                         "HTTP_PROXY",
@@ -2393,9 +2183,9 @@ pub(super) mod launch {
             };
 
             // 6. Build the command line + env block + cwd (kept alive across the call).
-            let mut cmdline = build_command_line(&self.program, &self.args);
-            let env_block = self.env.as_ref().map(build_env_block);
-            let cwd_wide = self.cwd.as_ref().map(|c| to_wide(&c.to_string_lossy()));
+            let mut cmdline = build_command_line(&plan.program, &plan.args);
+            let env_block = plan.env.as_ref().map(build_env_block);
+            let cwd_wide = plan.cwd.as_ref().map(|c| to_wide(&c.to_string_lossy()));
 
             let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -2479,99 +2269,34 @@ pub(super) mod launch {
             if ok == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let _ = cap_sid_owned; // backs `sec_caps` — held alive until here
+            let _ = &cap_sid_owned; // backs `sec_caps` through attribute-list destruction
 
-            // 6a. The child now owns the inherited write end of every relay pipe, so nub drops its
-            //     copy: while nub holds one, the reader never sees EOF. Then start the readers —
-            //     BEFORE the resume below, so no output can be produced with nothing draining it.
-            drop(relay_writers);
-            let relay_threads = spawn_relays(relays);
-
-            // 7. Assign to the job while the child is still SUSPENDED, and only resume
-            //    once it is contained — so a child that spawns a descendant can never do
-            //    so outside the Job. On assign failure, terminate the still-suspended
-            //    child (it never ran) and fail closed.
-            let assign_ok = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
-            if assign_ok == 0 {
-                unsafe {
-                    windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                }
-                return Err(io::Error::other("AssignProcessToJobObject failed"));
-            }
-            unsafe { ResumeThread(pi.hThread) };
-
-            let code = unsafe {
-                loop {
-                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                        windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
-                    }
-                    match WaitForSingleObject(pi.hProcess, 50) {
-                        WAIT_OBJECT_0 => break,
-                        windows_sys::Win32::Foundation::WAIT_TIMEOUT => continue,
-                        _ => {
-                            let e = io::Error::last_os_error();
-                            CloseHandle(pi.hThread);
-                            CloseHandle(pi.hProcess);
-                            return Err(e);
-                        }
-                    }
-                }
-                // ⛔⛔ THE DIRECT CHILD EXITING IS NOT THE SCRIPT FINISHING, AND RETURNING HERE
-                // TRUNCATED THE BUILD. Waiting only on `pi.hProcess` waits on the SHELL that runs
-                // the lifecycle script. When that shell hands off to a trailing external process —
-                // `node-gyp rebuild`, i.e. the overwhelmingly common shape — it can exit as soon as
-                // the handoff is made, and this wait then returns while the real work is still
-                // running. `_job` drops moments later, and the job carries KILL_ON_JOB_CLOSE, so the
-                // build is KILLED mid-flight and its exit status is whatever the shell reported.
-                //
-                // MEASURED on nub-win3, one fixture, one variable: a script that is
-                // `node -e "setTimeout(()=>process.exit(42), 20000)"` took 20s and reported exit 1
-                // with the jail OFF, and **3-4 seconds reporting SUCCESS** with the jail ON. A
-                // twenty-second script was declared successful in three. That is the mechanism
-                // behind every symptom filed against this path: lost stdout (nothing had flushed),
-                // a lost exit code (the shell's 0 is what got read), and Windows corpus records
-                // whose artifact gate failed for no attributable reason — which is how a ladder cell
-                // passes with no artifact and the search climbs to `write:"disk"`.
-                //
-                // So drain the JOB before letting it close. Polled rather than event-driven because
-                // a completion port needs `Win32_System_IO`, which this crate does not enable, and
-                // widening the feature set to avoid a short poll would buy nothing.
-                let handed_off = timed("drain_job", || {
-                    drain_job_and_status(job, pi.dwProcessId, cancelled)
-                });
-                let mut code: u32 = 0;
-                GetExitCodeProcess(pi.hProcess, &mut code);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                // The direct child's status WINS WHEN IT IS NON-ZERO — a shell that reports its own
-                // failure is authoritative and must not be overwritten. Only when it says success do
-                // we consult what it handed off to, which is the case that was silently passing.
-                if code == 0 {
-                    handed_off.unwrap_or(0)
-                } else {
-                    code
-                }
+            // Handles become owned before the first fallible operation after spawn.
+            // JOB_LIST already attached the suspended process inside CreateProcessW.
+            let process = HandleGuard(pi.hProcess);
+            let thread = HandleGuard(pi.hThread);
+            stdio.child_handles.clear();
+            let relay_threads = spawn_relays(std::mem::take(&mut stdio.relays));
+            let mut child = WindowsChild {
+                process,
+                job: job_guard,
+                pid: pi.dwProcessId,
+                stdin: stdio.stdin.take(),
+                stdout: stdio.stdout.take(),
+                stderr: stdio.stderr.take(),
+                relays: relay_threads,
+                helper: _egress_helper,
+                _resource: self.state.clone(),
+                status: None,
+                tracked: Vec::new(),
+                last_exit: None,
             };
-
-            // Join the relays before reporting the status, so the caller never prints its own
-            // "done" line ahead of output the script already produced. `drain_job_and_status`
-            // above has already waited for the whole tree, so every write end is closed and each
-            // reader is at EOF — this cannot block on a live descendant.
-            for thread in relay_threads {
-                let _ = thread.join();
+            if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                let error = io::Error::last_os_error();
+                let _ = child.kill();
+                return Err(error);
             }
-
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "sandbox launch cancelled",
-                ));
-            }
-
-            Ok(ExitStatus::from_raw(code))
-            // `_job` (reap) → `_aces` (revoke) → `_profile` (delete) drop here, reverse.
+            Ok(child)
         }
     }
 
@@ -2594,73 +2319,13 @@ pub(super) mod launch {
         }
     }
 
-    /// Deletes the per-run AppContainer profile and frees the AC SID on drop.
-    /// Removes the child-visible AppContainer profile directory created in `run()` step 1a.
-    ///
-    /// Separate from [`ProfileGuard`] because they clean up DIFFERENT things: that one calls
-    /// `DeleteAppContainerProfile`, which removes the profile Windows registered at the PARENT's
-    /// known-folder location. This one removes the mirror created under the CHILD's
-    /// `%LOCALAPPDATA%`, which Windows knows nothing about and would otherwise leak one directory
-    /// per launch.
-    struct ChildProfileGuard {
-        dir: PathBuf,
-    }
-    impl Drop for ChildProfileGuard {
-        fn drop(&mut self) {
-            // Best effort: the child may still hold a handle under it, and a leaked temp dir is
-            // not worth failing a completed run over.
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    struct ProfileGuard {
-        name: Vec<u16>,
-        sid: PSID,
-    }
-    impl Drop for ProfileGuard {
-        fn drop(&mut self) {
-            // DeleteAppContainerProfile removes the profile (registry/on-disk state) but
-            // does NOT free the SID buffer; per MSDN the SID from
-            // CreateAppContainerProfile must be released with FreeSid. Independent calls,
-            // no double-free.
-            unsafe {
-                DeleteAppContainerProfile(self.name.as_ptr());
-                FreeSid(self.sid);
-            }
-        }
-    }
-
-    /// Revokes the per-run allow-ACEs on drop. Uses an owned SID copy so it does not
-    /// depend on the profile SID pointer. REVOKE_ACCESS removes every ACE for the SID;
-    /// since the SID is unique per run and appears nowhere else, exactly our ACE goes.
-    struct AceGuard {
-        paths: Vec<std::path::PathBuf>,
-        /// Ancestor directories carrying a non-inherited traverse ace. Kept apart from
-        /// `paths` because they must be revoked through the OBJECT-scoped writer: the named
-        /// one would re-propagate inheritance across each ancestor's whole subtree on the way
-        /// out, which is the cost the grant side goes out of its way to avoid.
-        objects: Vec<std::path::PathBuf>,
-        sid: Vec<u8>,
-    }
-    impl Drop for AceGuard {
-        fn drop(&mut self) {
-            let sid = self.sid.as_ptr() as PSID;
-            for p in &self.paths {
-                let _ = timed(&format!("revoke.leaf {}", p.display()), || {
-                    revoke_ace(p, sid)
-                });
-            }
-            for p in &self.objects {
-                let _ = timed(&format!("revoke.object {}", p.display()), || {
-                    set_ace_on_object(p, sid, TRAVERSE_MASK, REVOKE_ACCESS)
-                });
-            }
-        }
-    }
-
     /// Closes a raw handle on drop. For the Job handle this triggers
     /// KILL_ON_JOB_CLOSE — reaping any process still in the tree.
     struct HandleGuard(HANDLE);
+    // SAFETY: an owned kernel handle has no thread affinity. Closing it requires
+    // exclusive ownership; all shared operations are kernel-synchronized queries.
+    unsafe impl Send for HandleGuard {}
+    unsafe impl Sync for HandleGuard {}
     impl Drop for HandleGuard {
         fn drop(&mut self) {
             unsafe { CloseHandle(self.0) };
@@ -2727,108 +2392,286 @@ pub(super) mod launch {
         Stderr,
     }
 
-    /// The stdio to hand the confined child, plus everything nub must hold to keep it flowing.
-    ///
-    /// ⛔ THE CHILD RUNS ON ITS OWN CONSOLE (`CREATE_NO_WINDOW`), SO A CONSOLE HANDLE IS NOT A
-    /// USABLE STDOUT FOR IT — WriteFile SUCCEEDS AND THE BYTES ARE DISCARDED. That silent drop is
-    /// why a console std handle is replaced by a pipe nub relays here, rather than passed through:
-    /// see the console note at the `CREATE_NO_WINDOW` flag for the measurement and for why the
-    /// child cannot stay on nub's console in the first place.
-    struct ChildStdio {
-        /// hStdInput / hStdOutput / hStdError, in that order. Null ⇒ the child gets no handle
-        /// for that stream, which is what an unusable parent handle produced before this existed.
+    struct NativeStdio {
         triple: [HANDLE; 3],
-        /// `triple` deduplicated — the PROC_THREAD_ATTRIBUTE_HANDLE_LIST contents. Empty ⇒ the
-        /// caller inherits nothing (bInheritHandles FALSE).
-        list: Vec<HANDLE>,
-        /// nub's own copy of each relay pipe's WRITE end. Dropped immediately after
-        /// CreateProcessW: while nub still holds one, the matching reader never sees EOF and
-        /// the relay thread never finishes.
-        writers: Vec<std::io::PipeWriter>,
-        /// One relay per pipe: read what the child wrote, write it to nub's real stream.
+        inherit_list: Vec<HANDLE>,
+        child_handles: Vec<OwnedHandle>,
+        stdin: Option<std::process::ChildStdin>,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
         relays: Vec<(std::io::PipeReader, RelayTarget)>,
     }
 
-    /// True only for a real console screen/input buffer. `GetConsoleMode` is the precise test —
-    /// it fails for a pipe, a file and `NUL`, which are exactly the pass-through cases.
-    /// `GetFileType == FILE_TYPE_CHAR` would not do: it also matches `NUL`.
     fn is_console_handle(h: HANDLE) -> bool {
         let mut mode: CONSOLE_MODE = 0;
         unsafe { GetConsoleMode(h, &mut mode) != 0 }
     }
 
-    /// Builds [`ChildStdio`]. A non-console handle is passed straight through and marked
-    /// inheritable, which is what `std`'s own inherited-stdio spawn does and widens nothing the
-    /// child can reach beyond its stdio.
-    fn child_stdio() -> ChildStdio {
-        let raws = [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-            std::io::stderr().as_raw_handle(),
-        ];
-        let mut triple: [HANDLE; 3] = [std::ptr::null_mut(); 3];
-        let mut writers: Vec<std::io::PipeWriter> = Vec::new();
-        let mut relays: Vec<(std::io::PipeReader, RelayTarget)> = Vec::new();
-        // stdout and stderr are usually THE SAME console handle. One shared pipe for both keeps
-        // the child's own interleaving byte-exact and costs one relay instead of two; two pipes
-        // copied by two threads would tear each other's lines.
-        let mut reused: Vec<(HANDLE, HANDLE)> = Vec::new();
-        for (i, raw) in raws.into_iter().enumerate() {
-            let h: HANDLE = raw.cast();
-            if h.is_null() || h == INVALID_HANDLE_VALUE {
-                continue;
-            }
-            let target = match i {
-                1 => Some(RelayTarget::Stdout),
-                2 => Some(RelayTarget::Stderr),
-                // stdin is passed through as-is, console or not. A confined lifecycle script that
-                // waits on the user's console is a hang either way, so there is no behaviour a
-                // relay would buy — a console stdin simply stops answering once the child is on
-                // its own console, which turns that hang into an EOF.
-                _ => None,
+    fn inheritable_duplicate(handle: HANDLE) -> io::Result<OwnedHandle> {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut duplicate = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe {
+            DuplicateHandle(
+                current,
+                handle,
+                current,
+                &mut duplicate,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle returns a new uniquely owned handle.
+        Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+    }
+
+    impl NativeStdio {
+        fn new(modes: [WindowsStdio; 3]) -> io::Result<Self> {
+            use std::os::windows::io::IntoRawHandle;
+            let mut result = Self {
+                triple: [std::ptr::null_mut(); 3],
+                inherit_list: Vec::new(),
+                child_handles: Vec::new(),
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                relays: Vec::new(),
             };
-            if let Some(target) = target
-                && is_console_handle(h)
+            let parent = [
+                std::io::stdin().as_raw_handle(),
+                std::io::stdout().as_raw_handle(),
+                std::io::stderr().as_raw_handle(),
+            ];
+            for (index, mode) in modes.into_iter().enumerate() {
+                let raw = parent[index];
+                let relay = mode == WindowsStdio::Inherit && index > 0 && is_console_handle(raw);
+                let handle = if mode == WindowsStdio::Piped || relay {
+                    let (reader, writer) = std::io::pipe()?;
+                    if index == 0 {
+                        let child = inheritable_duplicate(reader.as_raw_handle())?;
+                        // SAFETY: ownership transfers from the pipe into the public std stream.
+                        result.stdin = Some(std::process::ChildStdin::from(unsafe {
+                            OwnedHandle::from_raw_handle(writer.into_raw_handle())
+                        }));
+                        child
+                    } else {
+                        let child = inheritable_duplicate(writer.as_raw_handle())?;
+                        if relay {
+                            result.relays.push((
+                                reader,
+                                if index == 1 {
+                                    RelayTarget::Stdout
+                                } else {
+                                    RelayTarget::Stderr
+                                },
+                            ));
+                        } else {
+                            // SAFETY: the reader's unique handle transfers to the std stream.
+                            let reader =
+                                unsafe { OwnedHandle::from_raw_handle(reader.into_raw_handle()) };
+                            if index == 1 {
+                                result.stdout = Some(reader.into());
+                            } else {
+                                result.stderr = Some(reader.into());
+                            }
+                        }
+                        child
+                    }
+                } else if mode == WindowsStdio::Null || raw.is_null() || raw == INVALID_HANDLE_VALUE
+                {
+                    let file = std::fs::OpenOptions::new()
+                        .read(index == 0)
+                        .write(index != 0)
+                        .open("NUL")?;
+                    inheritable_duplicate(file.as_raw_handle())?
+                } else {
+                    // Never toggle inheritance on a process-global standard handle.
+                    inheritable_duplicate(raw)?
+                };
+                let raw = handle.as_raw_handle();
+                result.triple[index] = raw;
+                result.inherit_list.push(raw);
+                result.child_handles.push(handle);
+            }
+            Ok(result)
+        }
+    }
+
+    pub(crate) struct WindowsChild {
+        process: HandleGuard,
+        job: HandleGuard,
+        pid: u32,
+        stdin: Option<std::process::ChildStdin>,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+        relays: Vec<std::thread::JoinHandle<()>>,
+        helper: Option<HelperGuard>,
+        _resource: Arc<ResourceState>,
+        status: Option<ExitStatus>,
+        tracked: Vec<(u32, HandleGuard)>,
+        last_exit: Option<(u64, u32)>,
+    }
+
+    impl WindowsChild {
+        pub(crate) fn id(&self) -> u32 {
+            self.pid
+        }
+        pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+            self.stdin.take()
+        }
+        pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+            self.stdout.take()
+        }
+        pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+            self.stderr.take()
+        }
+
+        pub(crate) fn kill(&mut self) -> io::Result<()> {
+            if self.status.is_some() {
+                return Ok(());
+            }
+            if let Some(helper) = &self.helper {
+                helper.terminate();
+            }
+            if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job.0, 1) }
+                == 0
             {
-                if let Some(&(_, w)) = reused.iter().find(|(dest, _)| *dest == h) {
-                    triple[i] = w;
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            if let Some(status) = self.status {
+                return Ok(Some(status));
+            }
+            match unsafe { WaitForSingleObject(self.process.0, 0) } {
+                WAIT_OBJECT_0 => {}
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT => return Ok(None),
+                _ => return Err(io::Error::last_os_error()),
+            }
+            // A lifecycle shell may exit before its trailing command. Sample and
+            // retain those process handles until the whole Job drains; no blocking
+            // thread impersonates this native nonblocking status operation.
+            const MAX_TRACKED: usize = 4096;
+            let mut ids = vec![0usize; 2 + MAX_TRACKED];
+            let listed = unsafe {
+                QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicProcessIdList,
+                    ids.as_mut_ptr().cast(),
+                    std::mem::size_of_val(ids.as_slice()) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if listed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let list = ids.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            let members = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*list).ProcessIdList).cast::<usize>(),
+                    ((*list).NumberOfProcessIdsInList as usize).min(MAX_TRACKED),
+                )
+            };
+            for &pid in members {
+                let pid = pid as u32;
+                if pid == self.pid || self.tracked.iter().any(|(seen, _)| *seen == pid) {
                     continue;
                 }
-                if let Ok((reader, writer)) = std::io::pipe() {
-                    let w: HANDLE = writer.as_raw_handle().cast();
-                    // Only a handle nub can mark inheritable may go in the HANDLE_LIST — a
-                    // non-inheritable member makes CreateProcessW fail the whole spawn.
-                    if unsafe { SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
-                        != 0
-                    {
-                        triple[i] = w;
-                        reused.push((h, w));
-                        relays.push((reader, target));
-                        writers.push(writer);
-                        continue;
-                    }
+                let handle =
+                    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+                if !handle.is_null() {
+                    self.tracked.push((pid, HandleGuard(handle)));
                 }
-                // Pipe creation or the inherit mark failed. Fall through to the console handle:
-                // the child's output is then dropped, but a script that cannot START is a worse
-                // outcome than one whose output is lost, which is this jail's standing rule.
             }
-            let marked =
-                unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
-            if marked != 0 {
-                triple[i] = h;
+            let mut error = None;
+            self.tracked.retain(|(_, process)| {
+                if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
+                    return true;
+                }
+                let mut code = 0;
+                let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+                let mut exit = creation;
+                let mut kernel = creation;
+                let mut user = creation;
+                if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0
+                    || unsafe {
+                        GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user)
+                    } == 0
+                {
+                    error = Some(io::Error::last_os_error());
+                    return false;
+                }
+                let stamp = (u64::from(exit.dwHighDateTime) << 32) | u64::from(exit.dwLowDateTime);
+                if self.last_exit.is_none_or(|(latest, _)| stamp > latest) {
+                    self.last_exit = Some((stamp, code));
+                }
+                false
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                unsafe { std::mem::zeroed() };
+            if unsafe {
+                QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    std::mem::size_of_val(&accounting) as u32,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if accounting.ActiveProcesses != 0 {
+                return Ok(None);
+            }
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if code == 0 {
+                code = self.last_exit.map_or(0, |(_, code)| code);
+            }
+            if let Some(helper) = &self.helper {
+                helper.terminate();
+            }
+            let status = ExitStatus::from_raw(code);
+            self.status = Some(status);
+            Ok(Some(status))
+        }
+
+        pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.stdin.take();
+            loop {
+                if let Some(status) = self.try_wait()? {
+                    self.helper.take();
+                    for relay in self.relays.drain(..) {
+                        let _ = relay.join();
+                    }
+                    return Ok(status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        let mut list: Vec<HANDLE> = Vec::new();
-        for h in triple {
-            if !h.is_null() && !list.contains(&h) {
-                list.push(h);
+    }
+
+    impl Drop for WindowsChild {
+        fn drop(&mut self) {
+            self.stdin.take();
+            // The command's lease cannot be released before all its processes die.
+            if self.status.is_none() {
+                let _ = self.kill();
             }
-        }
-        ChildStdio {
-            triple,
-            list,
-            writers,
-            relays,
+            let _ = self.wait();
         }
     }
 
@@ -2857,15 +2700,137 @@ pub(super) mod launch {
             .collect()
     }
 
-    fn unique_profile_name() -> String {
-        let pid = std::process::id();
-        let ctr = LAUNCH_CTR.fetch_add(1, Ordering::Relaxed);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        // AppContainer names are <= 64 chars, alnum/underscore.
-        format!("nub_sbx_{pid}_{nonce:x}_{ctr}")
+    fn reusable_identity(
+        launch: &AppContainerLaunch,
+    ) -> io::Result<super::windows_registry::PolicyIdentity> {
+        let managed_profile = launch.env.as_ref().and_then(|env| {
+            env.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("LOCALAPPDATA"))
+                .map(|(_, value)| PathBuf::from(value).join("Packages"))
+        });
+        super::windows_registry::PolicyIdentity::new(
+            launch.read_grants.clone(),
+            launch.read_node_grants.clone(),
+            launch.write_grants.clone(),
+            managed_profile,
+            launch.allow_internet,
+            launch.egress_funnel.is_some(),
+        )?
+        .with_network(launch.egress_funnel.as_ref())
+    }
+
+    /// Derive the stable SID for an already-created policy-named profile.  This is
+    /// the documented AppContainer reopen path (and Chromium uses the same split);
+    /// profile existence itself remains backed by the durable ownership journal.
+    fn derive_appcontainer(name: &str) -> io::Result<PSID> {
+        let name = to_wide(name);
+        let mut sid: PSID = std::ptr::null_mut();
+        let hr = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+        if hr != 0 {
+            return Err(io::Error::other(format!(
+                "DeriveAppContainerSidFromAppContainerName failed hr=0x{hr:08x}"
+            )));
+        }
+        Ok(sid)
+    }
+
+    fn appcontainer_folder(sid: PSID) -> io::Result<PathBuf> {
+        use windows_sys::Win32::Security::Isolation::GetAppContainerFolderPath;
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        let sid = unsafe { crate::backend::windows_ace::sid_to_string(sid) }?;
+        let wide = to_wide(&sid);
+        let mut path = std::ptr::null_mut();
+        let hr = unsafe { GetAppContainerFolderPath(wide.as_ptr(), &mut path) };
+        if hr != 0 {
+            return Err(io::Error::other(format!(
+                "GetAppContainerFolderPath failed hr=0x{hr:08x}"
+            )));
+        }
+        let mut len = 0;
+        unsafe {
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let folder = PathBuf::from(String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(path, len)
+        }));
+        unsafe { CoTaskMemFree(path.cast()) };
+        Ok(folder)
+    }
+
+    /// A profile SID returned by create/derive is separately allocated from the
+    /// persistent profile registration.  Closing this guard therefore cannot remove
+    /// an identity another nub process is actively using.
+    struct SidGuard(PSID);
+    // SAFETY: the SID allocation is immutable until its sole owner's Drop.
+    unsafe impl Send for SidGuard {}
+    unsafe impl Sync for SidGuard {}
+    impl Drop for SidGuard {
+        fn drop(&mut self) {
+            unsafe { FreeSid(self.0) };
+        }
+    }
+
+    /// Registry transitions intentionally happen before new work.  The concrete
+    /// profile/ACL cleanup is kept here, where a SID can be derived and only the
+    /// journaled Nub ACEs are removed; no whole-DACL snapshot is ever restored.
+    pub(crate) fn cleanup_resources() -> io::Result<()> {
+        let _operation = super::windows_registry::OperationLock::acquire("resources")?;
+        recover_idle_resources(true)
+    }
+
+    fn recover_idle_resources(all: bool) -> io::Result<()> {
+        let mut first_error = None;
+        for entry in super::windows_registry::begin_recovery(all)? {
+            let result = (|| {
+                let sid = derive_appcontainer(&entry.profile_name)?;
+                let _sid = SidGuard(sid);
+                for object in &entry.window_objects {
+                    crate::backend::windows_ace::revoke_persistent(object, sid)?;
+                }
+                for mutation in &entry.mutations {
+                    let path = PathBuf::from(&mutation.path);
+                    if !path.try_exists()? {
+                        continue;
+                    }
+                    super::windows_registry::validate_object(&entry, &path)?;
+                    if !path_has_sid(&path, sid)? {
+                        continue;
+                    }
+                    match mutation.kind {
+                        super::windows_registry::AclKind::Subtree
+                        | super::windows_registry::AclKind::PrivateProfile => {
+                            revoke_ace(&path, sid)?;
+                        }
+                        super::windows_registry::AclKind::Object => {
+                            set_ace_on_object(&path, sid, mutation.access, REVOKE_ACCESS)?;
+                        }
+                    }
+                }
+                for path in &entry.private_paths {
+                    if Path::new(path).exists() {
+                        std::fs::remove_dir_all(path)?;
+                    }
+                }
+                let name = to_wide(&entry.profile_name);
+                let hr = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
+                if hr != 0 && !matches!(hr as u32, 0x8007_0002 | 0x8007_0003 | 0x8007_0490) {
+                    return Err(io::Error::other(format!(
+                        "DeleteAppContainerProfile failed hr=0x{hr:08x}"
+                    )));
+                }
+                Ok(())
+            })();
+            if let Err(error) = &result {
+                first_error.get_or_insert_with(|| io::Error::other(error.to_string()));
+            }
+            super::windows_registry::finish_recovery(&entry, result)?;
+        }
+        if all && let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn create_appcontainer(name: &str) -> io::Result<PSID> {
@@ -2888,262 +2853,6 @@ pub(super) mod launch {
             )));
         }
         Ok(sid)
-    }
-
-    /// Copy a PSID's bytes into an owned buffer (GetLengthSid).
-    fn copy_sid(sid: PSID) -> io::Result<Vec<u8>> {
-        let len = unsafe { GetLengthSid(sid) } as usize;
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buf = vec![0u8; len];
-        unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), buf.as_mut_ptr(), len) };
-        Ok(buf)
-    }
-
-    /// Wait until the confinement Job holds no live process, so a lifecycle script that handed its
-    /// work to a trailing process is not killed by `KILL_ON_JOB_CLOSE` the instant its shell exits.
-    ///
-    /// ⛔⛔ THE BOUND IS 90 SECONDS BECAUSE 30 MINUTES BROKE THE CORPUS — MEASURED, NOT FEARED.
-    ///
-    /// A script that leaves a daemon behind never drains, so this has to be bounded. The first version
-    /// picked 30 minutes on the reasoning that a cold `node-gyp` build is minutes, not seconds. That
-    /// reasoning was wrong about WHO WAITS: the corpus harness gives each arm a 600 000 ms deadline, so
-    /// a 30-minute drain does not produce a slow measurement, it produces NO measurement. Observed on
-    /// `nub-win3` immediately after the fix landed — `measure-windows.mjs` on `@posthog/cli@0.7.34`
-    /// reached `VERIFY[fb1] TIMED-OUT in 'approve-builds' after 600000 ms -- no verdict; check for
-    /// surviving children`, and abandoned the ladder. The `synth` and `fb0` arms had passed rc=0; only
-    /// the NARROWER rung hung, which is the tell that the survivor is a process STUCK against a denied
-    /// operation rather than useful work still running.
-    ///
-    /// 90s is chosen against that: comfortably longer than any trailing process that is actually going
-    /// to finish (the shell normally waits for its own build, so this path is reached only when it
-    /// handed off and left), and far enough inside every harness deadline that a stuck child costs a
-    /// measurement its precision rather than its existence. Hitting the cap falls through to the
-    /// pre-existing reap, which is exactly the old behaviour.
-    ///
-    /// BEST-EFFORT ON QUERY FAILURE, deliberately: if the job cannot be interrogated, the honest
-    /// response is to stop waiting rather than to spin on a call that will keep failing. The caller's
-    /// status handling is unchanged either way.
-    /// ⛔ AND RECOVER THE STATUS THE DIRECT CHILD CANNOT REPORT. Sampling the live tree 10s into a
-    /// jailed 30s script shows what nub is actually waiting on:
-    ///
-    /// ```text
-    ///   5376 2780 nub.exe      <- nub itself
-    ///   2636 4104 node.exe     <- the script's node, PPID 4104
-    ///   (no sh.exe present)
-    /// ```
-    ///
-    /// `node`'s parent is neither nub nor any live process and no shell remains, so the shell
-    /// SPAWNED NODE AND EXITED — the shape is nub → `sh` (exits early) → `node` (orphan, still in the
-    /// job). That is why draining is necessary, and why `GetExitCodeProcess(pi.hProcess)` answers
-    /// with the departed shell's 0 for a script whose work exited 42.
-    ///
-    /// The shell is not at fault and was checked rather than assumed: both arms report `SHELL0=sh`,
-    /// jail-OFF reports `exited with code 42` correctly, and an explicit `node …; RC=$?; exit $RC`
-    /// propagates 42 under the jail too. `sh` simply does not wait when the node invocation is the
-    /// script's LAST command.
-    ///
-    /// So handles are opened for every non-direct-child job member WHILE IT IS STILL ALIVE. That
-    /// ordering is load-bearing: an exit code is unreadable once the last handle to the process
-    /// closes, so a status recovered after the drain must have been opened during it.
-    ///
-    /// ANY NON-ZERO WINS, and that is the safe direction rather than a guess at npm's semantics. A
-    /// build that failed must not read as success — that is the whole reason the Windows records
-    /// could not be trusted. The cost is that a script deliberately backgrounding a failing process
-    /// now surfaces as a failure; for a build jail that is the right way to be wrong.
-    fn drain_job_and_status(
-        job: HANDLE,
-        direct_child_pid: u32,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Option<u32> {
-        // 5 ms, not 50. The loop breaks as soon as the job reports no active processes, so
-        // the poll interval is pure over-wait added to EVERY confined spawn — and the direct
-        // child is itself a job member, which makes this the wait for the script rather than
-        // something that runs after it. A tenth of the interval costs ten cheap
-        // `QueryInformationJobObject` calls per 50 ms of a build that already runs for
-        // seconds, and removes the tail latency from the short scripts that dominate an
-        // install's fixed cost.
-        const POLL: std::time::Duration = std::time::Duration::from_millis(5);
-        const CAP: std::time::Duration = std::time::Duration::from_secs(90);
-        // Bounded so a runaway script cannot make this allocate without limit. Far above any real
-        // lifecycle script's process count; anything beyond it is simply not tracked.
-        const MAX_TRACKED: usize = 64;
-
-        let mut tracked: Vec<(HANDLE, u32, String)> = Vec::new();
-        let mut seen: Vec<u32> = Vec::new();
-        let start = std::time::Instant::now();
-        loop {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                unsafe {
-                    windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
-                }
-            }
-            let mut buf = vec![
-                0u8;
-                std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
-                    + MAX_TRACKED * std::mem::size_of::<usize>()
-            ];
-            let listed = unsafe {
-                QueryInformationJobObject(
-                    job,
-                    JobObjectBasicProcessIdList,
-                    buf.as_mut_ptr().cast(),
-                    buf.len() as u32,
-                    std::ptr::null_mut(),
-                )
-            };
-            if listed != 0 {
-                let list = buf.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
-                // SAFETY: `buf` is sized for MAX_TRACKED ids past the header, and the count is
-                // clamped to that; the ids follow the header contiguously.
-                let ids = unsafe {
-                    let n = ((*list).NumberOfProcessIdsInList as usize).min(MAX_TRACKED);
-                    std::slice::from_raw_parts(
-                        std::ptr::addr_of!((*list).ProcessIdList).cast::<usize>(),
-                        n,
-                    )
-                };
-                for &raw in ids {
-                    let pid = raw as u32;
-                    if pid == 0 || pid == direct_child_pid || seen.contains(&pid) {
-                        continue;
-                    }
-                    seen.push(pid);
-                    // SYNCHRONIZE is needed as well as the query right: the status read below decides whether a
-                    // handle is SIGNALED before trusting its exit code, and `WaitForSingleObject` fails on a
-                    // handle opened for query alone.
-                    let h = unsafe {
-                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid)
-                    };
-                    if !h.is_null() {
-                        // The name has to be read HERE, while the member is alive: by the time the
-                        // ordering loop below reads its exit code the process is gone and only the
-                        // handle remains. Diagnostic only — it is never consulted by the rule.
-                        let mut nbuf = [0u16; 260];
-                        let mut nlen = nbuf.len() as u32;
-                        let name = if unsafe {
-                            QueryFullProcessImageNameW(h, 0, nbuf.as_mut_ptr(), &mut nlen)
-                        } != 0
-                        {
-                            String::from_utf16_lossy(&nbuf[..nlen as usize])
-                        } else {
-                            String::from("<unknown>")
-                        };
-                        tracked.push((h, pid, name));
-                    }
-                }
-            }
-
-            let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-            let ok = unsafe {
-                QueryInformationJobObject(
-                    job,
-                    JobObjectBasicAccountingInformation,
-                    std::ptr::from_mut(&mut acct).cast(),
-                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || acct.ActiveProcesses == 0 || start.elapsed() >= CAP {
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-
-        // ⛔⛔ THE LAST MEMBER TO EXIT IS THE OUTCOME, and neither simpler rule survived measurement.
-        //
-        // "ANY NON-ZERO WINS" (the original) fabricates failures: a jailed `cypress@15.20.1` install
-        // printed `✔ Finished Installation` and was reported failed, because of its eight trailing
-        // members four exited 1 as ordinary helpers it never waits on.
-        //
-        // "override only if NO member succeeded" (tried next) breaks the case the rule exists for: a
-        // fixture that detaches a single failing process still has a sibling exiting 0, so the override
-        // stopped firing and a failed hand-off read as SUCCESS. Measured, both arms, on nub-win3.
-        //
-        // Exit ORDER separates them. Where the trailing tree IS the work — `node-gyp rebuild` as the
-        // script's last command, where `sh` does not wait — the work is what the shell handed off to and
-        // therefore what finishes last. Where the tree is a fan of helpers, the helpers drain while the
-        // real work has already completed. Polling the handles each round is what the drain loop is
-        // already doing for the job accounting, so this costs one wait per member per round.
-        // (exit time in 100ns ticks, exit code) of the LATEST member to actually exit.
-        let mut last_exit: Option<(u64, u32)> = None;
-        let mut pending: Vec<(HANDLE, u32, String)> = tracked.clone();
-        let order_deadline = std::time::Instant::now() + CAP;
-        while !pending.is_empty() && std::time::Instant::now() < order_deadline {
-            let mut still = Vec::with_capacity(pending.len());
-            for (h, pid, name) in pending {
-                if unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0 {
-                    let mut code: u32 = 0;
-                    if unsafe { GetExitCodeProcess(h, &mut code) } != 0 {
-                        // ⛔⛔ THE ORDER MUST COME FROM THE KERNEL, NOT FROM WHEN THIS LOOP NOTICED.
-                        // The poll is 50ms and a process tree tears down in far less, so several
-                        // members routinely land in ONE window and the loop then "orders" them by the
-                        // job's pid-list order — an arbitrary tiebreak the rule below reads as fact.
-                        // That is not a small effect: `puppeteer` produced OPPOSITE verdicts on two
-                        // runs whose work completed identically, and `nx`/`@mui/x-telemetry` reported
-                        // a dead git helper's 128 over a postinstall that had already exited 0.
-                        // `GetProcessTimes` gives the real exit instant at 100ns resolution.
-                        let exit_at = {
-                            let mut c: FILETIME = unsafe { std::mem::zeroed() };
-                            let mut e: FILETIME = unsafe { std::mem::zeroed() };
-                            let mut k: FILETIME = unsafe { std::mem::zeroed() };
-                            let mut u: FILETIME = unsafe { std::mem::zeroed() };
-                            if unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) } != 0 {
-                                (u64::from(e.dwHighDateTime) << 32) | u64::from(e.dwLowDateTime)
-                            } else {
-                                0
-                            }
-                        };
-                        if std::env::var_os("NUB_JAIL_DUMP_POLICY").is_some() {
-                            eprintln!(
-                                "JAILDUMP drain exited code={code} pid={pid} direct={} exit_at={exit_at} image={name}",
-                                pid == direct_child_pid
-                            );
-                        }
-                        // ⛔⛔ STATUS_BREAKPOINT IS TEARDOWN NOISE, NOT AN OUTCOME, AND LETTING IT WIN
-                        // MADE THE HIGHEST-WEIGHT PACKAGE ON WINDOWS FAIL AT RANDOM. Measured on
-                        // `puppeteer@25.8.0` (~11.9M installs/week) with two runs that differ in
-                        // nothing but scheduling. Its postinstall COMPLETES in both — chrome and
-                        // chrome-headless-shell are both downloaded — and `0x80000003` appears in
-                        // both drains. Only the ORDER differs:
-                        //
-                        //   failed: 0, 0, 0, 0, 2147483651   <- breakpoint exits LAST, so it wins
-                        //   passed: 0, 0, 0, 2147483651, 0   <- a member follows it, so it does not
-                        //
-                        // The exit-ORDER rule above is unchanged and still right; this only removes a
-                        // member that was never a candidate for "the outcome". A debug break is what a
-                        // process reports when it is broken into or torn down abnormally, so it says
-                        // nothing about whether the script's work succeeded — unlike `0xC0000142`
-                        // (loader init), which IS a real failure and must keep counting.
-                        //
-                        // Deliberately narrow. The two rules this loop already rejected both failed by
-                        // being general, and the note above records what each one broke.
-                        const STATUS_BREAKPOINT: u32 = 0x8000_0003;
-                        if code != STATUS_BREAKPOINT
-                            && last_exit.is_none_or(|(prev, _)| exit_at >= prev)
-                        {
-                            // `>=` keeps the previous observation-order tiebreak for the degenerate
-                            // case where the kernel time is unavailable (0) for every member.
-                            last_exit = Some((exit_at, code));
-                        }
-                    }
-                } else {
-                    still.push((h, pid, name));
-                }
-            }
-            pending = still;
-            if pending.is_empty() {
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-        // A member still running at the cap contributes nothing: it has no exit code, and inventing
-        // one is the STILL_ACTIVE defect this path already paid for once.
-        match last_exit.map(|(_, code)| code) {
-            Some(0) | None => None,
-            other => other,
-        }
     }
 
     /// The confinement Job: whole-tree reap on handle close, plus the active-process
@@ -3182,15 +2891,21 @@ pub(super) mod launch {
     /// and dies with nub even on a crash. The explicit `TerminateProcess` is belt-and-suspenders
     /// for an immediate teardown; the job close is the guarantee.
     struct HelperGuard {
-        job: HANDLE,
-        process: HANDLE,
+        job: HandleGuard,
+        process: HandleGuard,
+    }
+    impl HelperGuard {
+        fn terminate(&self) {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job.0, 0);
+            }
+        }
     }
     impl Drop for HelperGuard {
         fn drop(&mut self) {
+            self.terminate();
             unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(self.process, 0);
-                CloseHandle(self.job);
-                CloseHandle(self.process);
+                WaitForSingleObject(self.process.0, u32::MAX);
             }
         }
     }
@@ -3212,6 +2927,7 @@ pub(super) mod launch {
     fn launch_egress_helper(
         ac_sid: PSID,
         policy: &crate::policy::NetPolicy,
+        command_env: Option<&std::collections::BTreeMap<String, String>>,
     ) -> io::Result<(u16, String, HelperGuard)> {
         use base64::Engine as _;
         use std::os::windows::io::AsRawHandle as _;
@@ -3265,7 +2981,14 @@ pub(super) mod launch {
         // 4. Proc-thread attribute list: SECURITY_CAPABILITIES + a HANDLE_LIST scoping inheritance
         //    to exactly the stdout write end.
         let inherit = [w];
-        let mut attr = ProcThreadAttrList::new(2)?;
+        let job_guard = HandleGuard(create_confinement_job()?);
+        let jobs = [job_guard.0];
+        let mut attr = ProcThreadAttrList::new(3)?;
+        attr.update(
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            jobs.as_ptr().cast_mut().cast(),
+            std::mem::size_of_val(&jobs),
+        )?;
         attr.update(
             PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
             std::ptr::from_mut(&mut sec_caps).cast(),
@@ -3289,7 +3012,27 @@ pub(super) mod launch {
         si.StartupInfo.hStdOutput = w;
         si.StartupInfo.hStdError = w;
 
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        // Only OS startup roots, never ambient or injected credential values.
+        let helper_env: std::collections::BTreeMap<String, String> = [
+            "SystemRoot",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            command_env
+                .and_then(|env| env.iter().find(|(name, _)| name.eq_ignore_ascii_case(key)))
+                .map(|(_, value)| (key.to_string(), value.clone()))
+        })
+        .collect();
+        let env_block = build_env_block(&helper_env);
+        let flags = EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_SUSPENDED
+            | CREATE_NO_WINDOW
+            | CREATE_UNICODE_ENVIRONMENT;
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: cmdline/cwd_wide/attr/sec_caps/caps all outlive this call; lpCommandLine is a
         // writable UTF-16 buffer; bInheritHandles TRUE so the scoped handle list takes effect.
@@ -3301,7 +3044,7 @@ pub(super) mod launch {
                 std::ptr::null(),
                 1,
                 flags,
-                std::ptr::null(),
+                env_block.as_ptr().cast(),
                 cwd_wide.as_ptr(),
                 std::ptr::from_mut(&mut si).cast(),
                 &mut pi,
@@ -3312,45 +3055,22 @@ pub(super) mod launch {
         }
         let _ = &cap_owned; // backs `sec_caps` — held alive until here
 
-        // 6. Contain the helper in its own KILL_ON_JOB_CLOSE job (assigned while suspended) so it
-        //    cannot outlive nub, then resume it.
-        let job = match create_confinement_job() {
-            Ok(job) => job,
-            Err(e) => {
-                unsafe {
-                    windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                }
-                return Err(e);
-            }
-        };
-        if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
-            let e = io::Error::last_os_error();
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                CloseHandle(job);
-            }
-            return Err(e);
-        }
-        unsafe {
-            ResumeThread(pi.hThread);
-            CloseHandle(pi.hThread);
-        }
+        let process = HandleGuard(pi.hProcess);
+        let thread = HandleGuard(pi.hThread);
         let guard = HelperGuard {
-            job,
-            process: pi.hProcess,
+            job: job_guard,
+            process,
         };
-
+        if unsafe { ResumeThread(thread.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
         // 7. nub drops its own copy of the write end (else the reader never sees EOF), then reads
         //    PROXY_READY off the pipe on a worker thread, bounded by a deadline. The worker RETURNS
         //    as soon as it has the line (closing nub's read end), so it does not linger; on the
         //    helper's death the read end sees EOF and the worker exits too.
         drop(writer);
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let reader_thread = std::thread::spawn(move || {
             use std::io::BufRead as _;
             let mut buf = std::io::BufReader::new(reader);
             let mut line = String::new();
@@ -3393,7 +3113,16 @@ pub(super) mod launch {
             }
         });
 
-        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        let ready = rx.recv_timeout(std::time::Duration::from_secs(20));
+        if !matches!(&ready, Ok(Some((port, token))) if *port != 0 && !token.is_empty()) {
+            drop(guard);
+            let _ = reader_thread.join();
+            return Err(io::Error::other(
+                "the co-package egress-funnel helper did not report a ready proxy",
+            ));
+        }
+        let _ = reader_thread.join();
+        match ready {
             Ok(Some((port, token))) if port != 0 && !token.is_empty() => Ok((port, token, guard)),
             _ => {
                 // guard drops here → helper reaped.
@@ -3411,6 +3140,31 @@ pub(super) mod launch {
         set_ace(path, sid, 0, REVOKE_ACCESS, false)
     }
 
+    fn path_has_sid(path: &Path, sid: PSID) -> io::Result<bool> {
+        let wide = to_wide_path(path);
+        let mut acl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        let _descriptor = LocalFreeGuard(descriptor);
+        let mut found = false;
+        for_each_ace_of_sid(acl, sid, path, |_, _, _| found = true)?;
+        Ok(found)
+    }
+
     /// Per-step wall-clock for the jailed launch, emitted only when `NUB_SANDBOX_WIN_TIMING`
     /// is set. Diagnostic seam, never a behaviour switch.
     ///
@@ -3426,7 +3180,7 @@ pub(super) mod launch {
     ///
     /// The cost is PER PACKAGE, so a project with 20 install-script packages pays ~280 s on a
     /// default-on feature. That is what this seam exists to attribute and then delete.
-    pub(super) fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
         if std::env::var_os("NUB_SANDBOX_WIN_TIMING").is_none() {
             return f();
         }
@@ -3444,7 +3198,7 @@ pub(super) mod launch {
     fn set_ace(path: &Path, sid: PSID, access: u32, mode: i32, inherit: bool) -> io::Result<()> {
         // Serialize the DACL RMW across concurrent launches (see ACL_LOCK). Poison-
         // tolerant: a prior panicked holder left no invariant broken here.
-        let _lock: MutexGuard<'_, ()> = ACL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::windows_registry::OperationLock::acquire("acl")?;
         let wpath = to_wide_path(path);
         let mut old_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -4231,3 +3985,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "windows_native_child_tests.rs"]
+mod native_child_tests;

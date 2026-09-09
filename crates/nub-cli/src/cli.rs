@@ -1870,6 +1870,7 @@ const SUBCOMMANDS: &[&str] = &[
     "node",
     "pm",
     "agent",
+    "sandbox",
     "global",
     "install",
     "i",
@@ -2850,6 +2851,30 @@ Commands:\n\
     crate::pm_engine::dispatch_verb(spec, "global config", &args, &pm)
 }
 
+fn run_sandbox(args: &[String]) -> Result<i32> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        println!(
+            "Usage: nub sandbox cleanup\n\nRemove idle Windows sandbox profiles and owned grants; recover interrupted cleanup.\nActive sandboxes and caller-owned files are retained. Unix has no persistent OS grants."
+        );
+        return Ok(0);
+    }
+    if args.len() != 1 || args[0] != "cleanup" {
+        bail!("nub sandbox expects `cleanup` — see `nub sandbox --help`");
+    }
+    nub_sandbox::cleanup()
+        .context("sandbox cleanup failed; ownership records retained for retry")?;
+    if cfg!(windows) {
+        println!("Idle sandbox cleanup completed. Active sandboxes were retained.");
+    } else {
+        println!("No persistent sandbox OS grants on this platform.");
+    }
+    Ok(0)
+}
+
 fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
     let subcommand = rest[0].clone();
 
@@ -2884,6 +2909,11 @@ fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
     // in some ancestor must not silence the offline docs.
     if subcommand == "agent" {
         return crate::agent::run(&rest[1..]);
+    }
+
+    // Recovery must work even when the current project's configuration is broken.
+    if subcommand == "sandbox" {
+        return run_sandbox(&rest[1..]);
     }
 
     // `global config ...` is Nub's prefix spelling for the same user-config
@@ -9060,7 +9090,7 @@ const CLAP_HELP_COMMANDS: &[&str] = &[
 /// of exiting silently — the routing inconsistency the help-router fix addresses.
 fn is_help_routable(word: &str) -> bool {
     CLAP_HELP_COMMANDS.contains(&word)
-        || matches!(word, "node" | "pm" | "agent" | "global")
+        || matches!(word, "node" | "pm" | "agent" | "sandbox" | "global")
         || crate::pm_engine::lookup_verb(word).is_some()
 }
 
@@ -9120,6 +9150,10 @@ fn run_help(command: Option<&str>, verbose: bool) {
         }
         "agent" => {
             let _ = crate::agent::run(&["--help".to_string()]);
+            return;
+        }
+        "sandbox" => {
+            let _ = run_sandbox(&["--help".to_string()]);
             return;
         }
         "global" => {
@@ -9337,6 +9371,7 @@ nub {v} — the all-in-one Node.js toolkit
   Store and config:
     store / cache            manage the content-addressable store
     config / get / set       manage configuration
+    sandbox cleanup          remove idle sandbox resources
 
 {nubopts}
   --cwd <dir>          run as if started in <dir>

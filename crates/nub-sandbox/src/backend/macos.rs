@@ -185,6 +185,7 @@ pub fn apply(
             command: base_command(&spec, policy),
             degradation: Degradation::full(),
             proxy: None,
+            session: None,
             signal_process_group: false,
             _private_tmp: None,
             redact_stdout: false,
@@ -230,7 +231,7 @@ pub fn apply(
     if let Some(bundle) = ca_bundle {
         super::set_ca_env(&mut wrapped, bundle);
     }
-    // Private tmp: point the child's TMPDIR/TMP/TEMP at the fresh per-run dir (the SBPL
+    // Private tmp: point the child's TMPDIR/TMP/TEMP at the session-managed dir (the SBPL
     // profile grants it rw + denies the shared system tmp). Set after env_clear so it
     // survives the scrub. `Deny` sets nothing — the child inherits no usable tmp.
     if let Some(dir) = tmp_dir {
@@ -241,6 +242,7 @@ pub fn apply(
         command: wrapped,
         degradation: degradation(policy, proxy_port, tmp_dir),
         proxy: None,
+        session: None,
         signal_process_group: spec.reap_descendants,
         _private_tmp: None,
         redact_stdout: false,
@@ -682,72 +684,84 @@ fn emit_tmp(policy: &SandboxPolicy, tmp_dir: Option<&std::path::Path>, out: &mut
     if policy.fs.tmp == TmpMode::Shared {
         return;
     }
-    // Both modes hide the WHOLE shared tmp; they differ only in what is granted back below
-    // (Private: the policy's own grants + the compiler cache + the per-run dir; Deny: only
-    // the policy's own grants).
-    let roots = shared_tmp_dirs();
-    for dir in &roots {
-        let term = format!("(subpath \"{}\")", sbpl_escape(dir));
-        out.push_str(&format!("(deny file-read* {term})\n"));
-        out.push_str(&format!("(deny file-write* {term})\n"));
-    }
-    // Re-open the policy's OWN explicit grants that happen to live inside the shared tmp.
-    // The deny above targets the AMBIENT scratch, not a tree someone deliberately put there
-    // — CI checkouts, `npm pack`, and nub's own dlx staging all run under `$TMPDIR`. Because
-    // the deny is emitted after `emit_fs` (so it can override a generous base read), without
-    // this it would also silently nuke the build jail's package-dir write grant and every
-    // read it depends on: the documented `/private/tmp` footgun, generalized to the whole
-    // per-user scratch.
-    //
-    // ORDER IS THE WHOLE PROBLEM HERE. Re-emitting the same rule SET is not order-neutral:
-    // these allows land after everything `emit_fs` wrote, so a naive replay would out-rank
-    // the policy's own denies and re-open, say, `$TMPDIR/work/.env` on a policy that still
-    // carries the secret floor. So each re-grant is followed by a replay of every deny that
-    // matches at or under the same root, restoring last-match-wins, and the write arm
-    // re-applies `is_dangerous_write_root` — `emit_fs` guards its write grants with it, and
-    // skipping it here would hand out `(allow file-write* (subpath "/private/tmp"))`.
-    let mut regranted = false;
-    for rule in &policy.fs.rules.entries {
-        if rule.effect != Effect::Allow || !grant_is_under(rule.matcher.as_str(), &roots) {
-            continue;
-        }
-        let m = to_match_term(rule.matcher.as_str());
-        let term = emit_term(&m);
-        out.push_str(&format!("(allow file-read* {term})\n"));
-        out.push_str(&format!("(allow file-map-executable {term})\n"));
-        if rule.access == FsAccess::ReadWrite && !is_dangerous_write_root(&m) {
-            out.push_str(&format!("(allow file-write* {term})\n"));
-        }
-        regranted = true;
-    }
-    if regranted {
-        for rule in &policy.fs.rules.entries {
-            if rule.effect != Effect::Deny {
-                continue;
-            }
-            let term = emit_term(&to_match_term(rule.matcher.as_str()));
+    // Legacy policies carrying an actual deny still need a Seatbelt subtraction to preserve
+    // that carve-out. Positive-only policies do not: the deny-default profile already leaves
+    // shared tmp unreachable unless it was explicitly granted, and adding a backend deny would
+    // silently cancel that positive grant.
+    let has_explicit_deny = policy
+        .fs
+        .rules
+        .entries
+        .iter()
+        .any(|rule| rule.effect == Effect::Deny);
+    if has_explicit_deny {
+        // Both modes hide the WHOLE shared tmp; they differ only in what is granted back below
+        // (Private: the policy's own grants + the compiler cache + the per-run dir; Deny: only
+        // the policy's own grants).
+        let roots = shared_tmp_dirs();
+        for dir in &roots {
+            let term = format!("(subpath \"{}\")", sbpl_escape(dir));
             out.push_str(&format!("(deny file-read* {term})\n"));
             out.push_str(&format!("(deny file-write* {term})\n"));
         }
-    }
-    if policy.fs.tmp == TmpMode::Private {
-        // xcrun WRITES the db, not merely reads it, so this re-grant must clear BOTH denies.
+        // Re-open the policy's OWN explicit grants that happen to live inside the shared tmp.
+        // The deny above targets the AMBIENT scratch, not a tree someone deliberately put there
+        // — CI checkouts, `npm pack`, and nub's own dlx staging all run under `$TMPDIR`. Because
+        // the deny is emitted after `emit_fs` (so it can override a generous base read), without
+        // this it would also silently nuke the build jail's package-dir write grant and every
+        // read it depends on: the documented `/private/tmp` footgun, generalized to the whole
+        // per-user scratch.
         //
-        // AND IT NEVER WRITES THE NAME IN PLACE — the trailing `*` is what makes this grant
-        // do anything at all. The toolchain stages through an `mkstemp`-suffixed sibling
-        // (`xcrun_db-pH2r2bhb`) and renames it over the real name, so a bare `(literal
-        // ".../xcrun_db")` denies the only write that ever happens. Measured on the macOS
-        // corpus break shard: 40 denials in ONE run — `c++: error: couldn't create cache file
-        // '/var/folders/<uid>/T/xcrun_db-XXXXXX' (errno=Operation not permitted)`, from `c++`,
-        // `make` and `libtool` — and every from-source native build behind them failed.
-        //
-        // Still FILE-level, which is the property this carve-out exists to hold: `*` does not
-        // span a path component, so the pattern reaches the cache and its own staging
-        // siblings and nothing else in the ~7.5k-entry shared scratch. Routed through
-        // `to_match_term` rather than a hand-written regex so it uses the same translator
-        // (and the same globset oracle tests) as every other matcher here.
-        for file in darwin_compiler_cache_files() {
-            regrant_over_tmp_deny(&emit_term(&to_match_term(&format!("{file}*"))), out);
+        // ORDER IS THE WHOLE PROBLEM HERE. Re-emitting the same rule SET is not order-neutral:
+        // these allows land after everything `emit_fs` wrote, so a naive replay would out-rank
+        // the policy's own denies and re-open, say, `$TMPDIR/work/.env` on a policy that still
+        // carries the secret floor. So each re-grant is followed by a replay of every deny that
+        // matches at or under the same root, restoring last-match-wins, and the write arm
+        // re-applies `is_dangerous_write_root` — `emit_fs` guards its write grants with it, and
+        // skipping it here would hand out `(allow file-write* (subpath "/private/tmp"))`.
+        let mut regranted = false;
+        for rule in &policy.fs.rules.entries {
+            if rule.effect != Effect::Allow || !grant_is_under(rule.matcher.as_str(), &roots) {
+                continue;
+            }
+            let m = to_match_term(rule.matcher.as_str());
+            let term = emit_term(&m);
+            out.push_str(&format!("(allow file-read* {term})\n"));
+            out.push_str(&format!("(allow file-map-executable {term})\n"));
+            if rule.access == FsAccess::ReadWrite && !is_dangerous_write_root(&m) {
+                out.push_str(&format!("(allow file-write* {term})\n"));
+            }
+            regranted = true;
+        }
+        if regranted {
+            for rule in &policy.fs.rules.entries {
+                if rule.effect != Effect::Deny {
+                    continue;
+                }
+                let term = emit_term(&to_match_term(rule.matcher.as_str()));
+                out.push_str(&format!("(deny file-read* {term})\n"));
+                out.push_str(&format!("(deny file-write* {term})\n"));
+            }
+        }
+        if policy.fs.tmp == TmpMode::Private {
+            // xcrun WRITES the db, not merely reads it, so this re-grant must clear BOTH denies.
+            //
+            // AND IT NEVER WRITES THE NAME IN PLACE — the trailing `*` is what makes this grant
+            // do anything at all. The toolchain stages through an `mkstemp`-suffixed sibling
+            // (`xcrun_db-pH2r2bhb`) and renames it over the real name, so a bare `(literal
+            // ".../xcrun_db")` denies the only write that ever happens. Measured on the macOS
+            // corpus break shard: 40 denials in ONE run — `c++: error: couldn't create cache file
+            // '/var/folders/<uid>/T/xcrun_db-XXXXXX' (errno=Operation not permitted)`, from `c++`,
+            // `make` and `libtool` — and every from-source native build behind them failed.
+            //
+            // Still FILE-level, which is the property this carve-out exists to hold: `*` does not
+            // span a path component, so the pattern reaches the cache and its own staging
+            // siblings and nothing else in the ~7.5k-entry shared scratch. Routed through
+            // `to_match_term` rather than a hand-written regex so it uses the same translator
+            // (and the same globset oracle tests) as every other matcher here.
+            for file in darwin_compiler_cache_files() {
+                regrant_over_tmp_deny(&emit_term(&to_match_term(&format!("{file}*"))), out);
+            }
         }
     }
     if policy.fs.tmp == TmpMode::Private
@@ -2489,6 +2503,51 @@ mod tests {
         assert!(
             !prof.contains("(allow file-write* (subpath \"/proj/node_modules\"))"),
             "and must not become a write grant:\n{prof}"
+        );
+    }
+
+    /// Positive grants compose by their maximum access, not authored order. This is the
+    /// opposite containment/order from the preceding regression: an enclosing read grant
+    /// is followed by a nested read-write grant, with no explicit deny anywhere in the IR.
+    #[test]
+    fn positive_read_parent_and_readwrite_child_compose() {
+        let p = fs_policy(
+            Effect::Deny,
+            vec![
+                rule("/proj", Effect::Allow, FsAccess::Read),
+                rule("/proj/**", Effect::Allow, FsAccess::Read),
+                rule("/proj/out", Effect::Allow, FsAccess::ReadWrite),
+                rule("/proj/out/**", Effect::Allow, FsAccess::ReadWrite),
+            ],
+        );
+        let prof = build_profile(&p, &spec(), None, None, None);
+        assert!(prof.contains("(allow file-write* (subpath \"/proj/out\"))"));
+        assert!(
+            !prof.contains("(deny file-write* (subpath \"/proj\"))"),
+            "a positive read grant must not synthesize a write subtraction:\n{prof}"
+        );
+    }
+
+    #[test]
+    fn private_tmp_does_not_subtract_an_explicit_positive_shared_tmp_grant() {
+        let mut p = fs_policy(
+            Effect::Deny,
+            vec![
+                rule("/private/tmp/allowed", Effect::Allow, FsAccess::ReadWrite),
+                rule(
+                    "/private/tmp/allowed/**",
+                    Effect::Allow,
+                    FsAccess::ReadWrite,
+                ),
+            ],
+        );
+        p.fs.tmp = TmpMode::Private;
+        let tmp = tempfile::tempdir().expect("managed tmp");
+        let prof = build_profile(&p, &spec(), None, None, Some(tmp.path()));
+        assert!(prof.contains("(allow file-write* (subpath \"/private/tmp/allowed\"))"));
+        assert!(
+            !prof.contains("(deny file-write* (subpath \"/private/tmp\"))"),
+            "positive-only tmp policy must rely on deny-default, not subtract its own grant:\n{prof}"
         );
     }
 

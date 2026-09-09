@@ -1,0 +1,63 @@
+name: Reusable sandbox native gates
+
+on:
+  push:
+    branches: [sandbox-reuse-epic]
+    paths:
+      - crates/nub-sandbox/**
+      - .github/workflows/sandbox-reuse-probe.yml
+      - Cargo.lock
+      - Cargo.toml
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      SANDBOX_PARENT_SECRET: synthetic-parent-canary
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: sandbox-reuse-native
+      - name: Recording the native environment
+        run: |
+          mkdir -p reports
+          { git rev-parse HEAD; rustc -Vv; uname -a; id; } > reports/environment.txt
+      - name: Checking all sandbox targets
+        run: |
+          set -o pipefail
+          cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings 2>&1 | tee reports/clippy.log
+      - name: Exercising native sandbox contracts
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast -- --nocapture 2>&1 | tee reports/tests.log
+      - name: Exercising Linux notification lifecycle
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast native_supervised_streams_status_and_repeated_launches -- --ignored --nocapture 2>&1 | tee reports/linux-notification.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sandbox-reuse-${{ matrix.os }}
+          path: reports
+          retention-days: 30

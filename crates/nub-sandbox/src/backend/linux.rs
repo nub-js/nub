@@ -249,12 +249,14 @@ pub fn apply(
         // ride the USER_NOTIF broker. Private tmp is the per-run scratch dir `make_private_tmp`
         // created (threaded in as `tmp_dir`), granted rw by the ruleset + broker with `TMPDIR`
         // pointed at it; Deny tmp grants nothing, so the shared `/tmp` is simply never in the
-        // allow-set. (Env is enforced by construction — `base_command`/`envp` — always.)
+        // allow-set. The managed tmp root is stable for one explicit session (Env is enforced
+        // by construction — `base_command`/`envp` — always.)
         let plan = build_supervised_plan(policy, &spec, tmp_dir, proxy_port, proxy_token)?;
         return Ok(Prepared {
             command: base_command(&spec, policy),
             degradation: Degradation::full(),
             proxy: None,
+            session: None,
             _inherited_files: Vec::new(),
             signal_process_group: false,
             _private_tmp: None,
@@ -270,6 +272,7 @@ pub fn apply(
         command: base_command(&spec, policy),
         degradation: Degradation::full(),
         proxy: None,
+        session: None,
         _inherited_files: Vec::new(),
         signal_process_group: false,
         _private_tmp: None,
@@ -374,12 +377,12 @@ fn build_supervised_plan(
     } else {
         None
     };
-    // When fs is confined the write broker becomes THE write-intent authority (it performs opens
-    // outside Landlock), so it carries the write-side of exactly what Landlock grants PLUS the
-    // deny-inside-allow carve-outs — `write_broker_ruleset` derives both from the same grants the
-    // ruleset above is built from. `None` for a pure net/env policy, so no write-intent syscall
-    // is trapped. Armed in lock-step with the ruleset (both gate on `fs_confines`).
-    let write_policy = if ruleset.is_some() {
+    // Landlock's allow-only ruleset is authoritative for a positive policy. The expensive
+    // userspace write broker exists solely for legacy explicit deny-inside-allow carve-outs;
+    // arming it for every positive write would trap ordinary filesystem operations and leave
+    // cancellation vulnerable to a deliberately blocking legacy broker operation.
+    let has_explicit_deny = has_explicit_fs_deny(policy);
+    let write_policy = if ruleset.is_some() && has_explicit_deny {
         Some(
             super::linux_landlock::write_broker_ruleset(policy, tmp_dir, Some(&program_abs))
                 .map_err(|reason| Degradation {
@@ -423,6 +426,15 @@ fn build_supervised_plan(
         })?,
         setsid: true,
     })
+}
+
+fn has_explicit_fs_deny(policy: &SandboxPolicy) -> bool {
+    policy
+        .fs
+        .rules
+        .entries
+        .iter()
+        .any(|rule| rule.effect == Effect::Deny)
 }
 
 pub(super) fn protects_ambient_credentials(policy: &SandboxPolicy) -> bool {
@@ -876,6 +888,7 @@ fn apply_landlock(
         // every one of the 181 granted packages would be noise asserting something false.
         degradation: Degradation::full(),
         proxy: None,
+        session: None,
         // Holds the ruleset descriptor open until the child is spawned; `pre_exec` consumes
         // it after fork, so dropping it any earlier would leave the hook restricting nothing.
         _inherited_files: vec![std::fs::File::from(ruleset.into_fd())],
@@ -952,6 +965,7 @@ fn resolve_program(program: &OsStr, child_cwd: &Path, path: Option<&OsStr>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{CanonGlob, FsAccess, FsOrigin, FsRule};
     use std::os::unix::ffi::OsStringExt;
     use tempfile::tempdir;
 
@@ -997,6 +1011,19 @@ mod tests {
         ] {
             assert!(!covered(withheld), "the floor must not mount {withheld}");
         }
+    }
+
+    #[test]
+    fn only_actual_deny_entries_arm_the_legacy_write_broker() {
+        let mut policy = SandboxPolicy::default();
+        assert!(!has_explicit_fs_deny(&policy));
+        policy.fs.rules.entries.push(FsRule {
+            matcher: CanonGlob("/project/secret".to_string()),
+            effect: Effect::Deny,
+            access: FsAccess::Read,
+            origin: FsOrigin::Authored,
+        });
+        assert!(has_explicit_fs_deny(&policy));
     }
 
     fn seccomp_data_arg1(

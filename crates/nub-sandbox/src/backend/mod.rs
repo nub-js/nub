@@ -111,6 +111,9 @@ pub fn serve_windows_egress_helper() -> ! {
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+mod unix_guardian;
+
 // NOT macOS-gated, unlike its siblings: only the `log show` call inside is, and compiling the
 // module everywhere keeps its record parser under test on every platform's CI leg rather than the
 // one runner that can also enforce Seatbelt.
@@ -414,6 +417,10 @@ pub struct Prepared {
     /// value stops the listener. `None` when net is unconfined or coarse-deny (no
     /// proxy needed). Set by [`apply`], not the per-OS backends.
     pub(crate) proxy: Option<EgressProxy>,
+    /// Shared session state for reusable launches. Unlike the compatibility fields above,
+    /// this is reference counted: closing a [`Sandbox`] does not tear down resources while
+    /// one of its submitted commands is still running.
+    pub(crate) session: Option<Arc<SessionResources>>,
     /// Files whose descriptors the Landlock backend consumes after fork (the ruleset fd its
     /// `pre_exec` hook restricts against). Keeping them here guarantees they remain open until
     /// `command` is spawned.
@@ -439,10 +446,8 @@ pub struct Prepared {
     /// path, retaining process-tree ownership without a LowBox token.
     #[cfg(target_os = "windows")]
     pub(crate) launch: Option<windows::WindowsLaunch>,
-    /// The fresh per-run PRIVATE tmp dir (`TmpMode::Private`), owned here so it lives for
-    /// the child's whole run and is removed when `Prepared` drops (after the child exits).
-    /// `None` for `Shared`/`Deny`. Held only for its Drop — the backends read its PATH via
-    /// the value threaded into their `apply` before it moves here.
+    /// Compatibility owner for a one-shot private tmp directory. Reusable sessions retain
+    /// their stable managed tmp root in [`SessionResources`] instead.
     pub(crate) _private_tmp: Option<tempfile::TempDir>,
     /// Pipe stdout/stderr at spawn so the host can drain them through an output redactor.
     /// Copied from [`CommandSpec`] in [`apply`], applied in
@@ -478,8 +483,13 @@ pub(crate) struct SupervisedPlan {
 
 #[cfg(target_os = "linux")]
 impl SupervisedPlan {
-    /// Fork the confined child, run it under its supervisor, and return its exit status.
-    fn run(self) -> std::io::Result<std::process::ExitStatus> {
+    /// Fork the confined child and return its owned supervisor/stdio handle.
+    fn spawn(
+        self,
+        stdin: linux_supervisor::SupervisedStdio,
+        stdout: linux_supervisor::SupervisedStdio,
+        stderr: linux_supervisor::SupervisedStdio,
+    ) -> std::io::Result<linux_supervisor::SupervisedChild> {
         let SupervisedPlan {
             egress,
             argv,
@@ -498,13 +508,25 @@ impl SupervisedPlan {
                 .map_or(-1, linux_landlock::LandlockRuleset::as_raw_fd),
             seccomp_ceiling: seccomp_ceiling.as_deref(),
             setsid,
+            stdin,
+            stdout,
+            stderr,
         };
-        let mut child = linux_supervisor::spawn_supervised(egress, launch)?;
+        let child = linux_supervisor::spawn_supervised(egress, launch);
         // Keep the ruleset alive across the fork+exec, exactly as the `Command` path keeps
         // `_inherited_files`: the child's `restrict_self` consumes the fd after fork.
-        let status = child.wait();
         drop(ruleset);
-        status
+        child
+    }
+
+    /// Compatibility adapter for synchronous callers.
+    fn run(self) -> std::io::Result<std::process::ExitStatus> {
+        self.spawn(
+            linux_supervisor::SupervisedStdio::Inherit,
+            linux_supervisor::SupervisedStdio::Inherit,
+            linux_supervisor::SupervisedStdio::Inherit,
+        )?
+        .wait()
     }
 }
 
@@ -512,15 +534,100 @@ impl SupervisedPlan {
 /// Dropping the handle kills and reaps the child before releasing those resources.
 pub struct PreparedChild {
     child: Option<std::process::Child>,
+    #[cfg(target_os = "linux")]
+    supervised_child: Option<linux_supervisor::SupervisedChild>,
+    #[cfg(target_os = "windows")]
+    windows_child: Option<windows::WindowsChild>,
     child_id: u32,
+    #[cfg(target_os = "macos")]
+    guardian: Option<unix_guardian::UnixGuardian>,
     #[cfg(windows)]
     windows_job: Option<windows_job::Job>,
     #[cfg(unix)]
     signal_target: Option<i32>,
-    #[cfg(unix)]
-    signal_process_group: bool,
     _proxy: Option<EgressProxy>,
     _private_tmp: Option<tempfile::TempDir>,
+    _session: Option<Arc<SessionResources>>,
+}
+
+/// A reusable, resolved sandbox lifecycle.
+///
+/// Acquisition snapshots any credential-broker environment values, starts the required
+/// egress proxy, and allocates managed private storage once. [`prepare`](Self::prepare)
+/// never reads ambient environment state; it only turns a command description into a
+/// [`Prepared`] launch. Cloning a `Sandbox` creates another lease to the same immutable
+/// policy and resources. Dropping every lease closes those resources after all submitted
+/// [`PreparedChild`] values have ended.
+#[derive(Clone)]
+pub struct Sandbox {
+    resources: Arc<SessionResources>,
+}
+
+/// Session-owned state deliberately kept private: callers can submit commands, not mutate
+/// policy, credentials, proxy identity, or the managed temporary root after acquisition.
+struct SessionResources {
+    policy: SandboxPolicy,
+    proxy: Option<EgressProxy>,
+    private_tmp: Option<tempfile::TempDir>,
+    #[cfg(windows)]
+    windows_leases: std::sync::Mutex<std::collections::BTreeMap<String, windows::WindowsLease>>,
+}
+
+impl Sandbox {
+    /// Acquire a reusable sandbox from an already-resolved policy.
+    ///
+    /// This is the sole compatibility ambient lookup: credential values are captured here
+    /// for the broker session and are never re-read for later command submissions.
+    pub fn new(policy: &SandboxPolicy) -> Result<Self, Degradation> {
+        if !policy.env.resolved {
+            return Err(Degradation {
+                lost: vec!["env-unresolved".to_string()],
+                reason: Some(
+                    "sandbox policy has no resolved target environment; compile it with an ambient snapshot before acquisition"
+                        .to_string(),
+                ),
+            });
+        }
+
+        let mut runtime_policy = policy.clone();
+        let runtime_brokers = capture_runtime_brokers(policy, &mut runtime_policy)?;
+        let proxy = start_session_proxy(&runtime_policy, runtime_brokers)?;
+        let private_tmp = make_private_tmp(&runtime_policy)?;
+        Ok(Self {
+            resources: Arc::new(SessionResources {
+                policy: runtime_policy,
+                proxy,
+                private_tmp,
+                #[cfg(windows)]
+                windows_leases: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            }),
+        })
+    }
+
+    /// Alias for [`Sandbox::new`], spelling the lifecycle operation used by embedders that
+    /// maintain a registry/cache of reusable sandboxes.
+    pub fn acquire(policy: &SandboxPolicy) -> Result<Self, Degradation> {
+        Self::new(policy)
+    }
+
+    /// Prepare one command under this session's immutable policy and retained resources.
+    pub fn prepare(&self, spec: CommandSpec) -> Result<Prepared, Degradation> {
+        prepare_with_resources(&self.resources, spec)
+    }
+
+    /// Release this caller's session lease. Submitted commands retain their own lease until
+    /// they exit, so closing a sandbox never tears down another active command's resources.
+    pub fn close(self) {}
+}
+
+/// Remove idle persistent sandbox resources, recovering interrupted cleanup first.
+/// Active leases are never removed. Unix backends have no persistent OS grants.
+/// Cleanup failures are returned and their ownership records remain available for retry.
+pub fn cleanup() -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    return windows::cleanup_resources();
+    #[cfg(not(target_os = "windows"))]
+    Ok(())
 }
 
 /// The signal destination authenticated during [`Prepared::spawn_with_signal_target`].
@@ -548,22 +655,65 @@ impl PreparedChild {
     /// shares nub's group there and signalling `-pgid` would kill nub and every sibling.
     #[cfg(unix)]
     pub fn process_group_id(&self) -> Option<i32> {
-        self.signal_process_group.then_some(self.child_id as i32)
+        self.signal_target
+            .filter(|target| *target < 0)
+            .map(|target| -target)
     }
 
     /// Take the piped stdout handle (present only when the launch requested
     /// `redact_stdout`). The host drains it through its output redactor. `None` when
     /// stdout was inherited or already taken.
     pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        #[cfg(target_os = "linux")]
+        if let Some(child) = self.supervised_child.as_mut() {
+            return child.take_stdout();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(child) = self.windows_child.as_mut() {
+            return child.take_stdout();
+        }
         self.child.as_mut().and_then(|c| c.stdout.take())
     }
 
     /// Take the piped stderr handle. See [`take_stdout`](Self::take_stdout).
     pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        #[cfg(target_os = "linux")]
+        if let Some(child) = self.supervised_child.as_mut() {
+            return child.take_stderr();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(child) = self.windows_child.as_mut() {
+            return child.take_stderr();
+        }
         self.child.as_mut().and_then(|c| c.stderr.take())
     }
 
+    /// Take the piped stdin handle, if this command was launched with piped input.
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        #[cfg(target_os = "linux")]
+        if let Some(child) = self.supervised_child.as_mut() {
+            return child.take_stdin();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(child) = self.windows_child.as_mut() {
+            return child.take_stdin();
+        }
+        self.child.as_mut().and_then(|c| c.stdin.take())
+    }
+
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut child) = self.supervised_child.take() {
+            let result = child.wait();
+            self.release_resources();
+            return result;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(mut child) = self.windows_child.take() {
+            let result = child.wait();
+            self.release_resources();
+            return result;
+        }
         let child = self
             .child
             .as_mut()
@@ -579,8 +729,8 @@ impl PreparedChild {
             // leak is a script that exits 0 having backgrounded a writer, whose output then keeps
             // landing in a package dir the installer already snapshotted.
             #[cfg(unix)]
-            if self.signal_process_group {
-                unsafe { libc::kill(-(self.child_id as i32), libc::SIGKILL) };
+            if let Some(target) = self.signal_target.filter(|target| *target < 0) {
+                unsafe { libc::kill(target, libc::SIGKILL) };
             }
             self.child.take();
             self.release_resources();
@@ -594,6 +744,46 @@ impl PreparedChild {
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> std::io::Result<std::process::ExitStatus> {
         loop {
+            #[cfg(target_os = "linux")]
+            if let Some(child) = self.supervised_child.as_mut() {
+                if let Some(status) = child.try_wait()? {
+                    self.supervised_child.take();
+                    self.release_resources();
+                    return Ok(status);
+                }
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut child = self.supervised_child.take().expect("checked above");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.release_resources();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "sandbox launch cancelled",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(child) = self.windows_child.as_mut() {
+                if let Some(status) = child.try_wait()? {
+                    self.windows_child.take();
+                    self.release_resources();
+                    return Ok(status);
+                }
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut child = self.windows_child.take().expect("checked above");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.release_resources();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "sandbox launch cancelled",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
             let child = self
                 .child
                 .as_mut()
@@ -621,12 +811,8 @@ impl PreparedChild {
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         use std::io::Read;
 
-        let child = self
-            .child
-            .as_mut()
-            .ok_or_else(|| prepared_child_reaped_error("capture output from"))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = self.take_stdout();
+        let stderr = self.take_stderr();
         let stdout = std::thread::Builder::new()
             .name("nub-sandbox-stdout".into())
             .spawn(move || {
@@ -660,11 +846,14 @@ impl PreparedChild {
     }
 
     fn release_resources(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.guardian.take();
         #[cfg(windows)]
         self.windows_job.take();
         // Drop order matters: the proxy before the private tmp dir it may have written into.
         self._proxy.take();
         self._private_tmp.take();
+        self._session.take();
     }
 }
 
@@ -677,6 +866,16 @@ fn prepared_child_reaped_error(operation: &str) -> std::io::Error {
 
 impl Drop for PreparedChild {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.supervised_child.take().is_some() {
+            self.release_resources();
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if self.windows_child.take().is_some() {
+            self.release_resources();
+            return;
+        }
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -752,7 +951,7 @@ fn kill_and_reap(child: &mut std::process::Child) {
 /// caller still holds the unreaped `Child`, so `-pid` names that child's own group or
 /// nothing. The `getpgrp` check keeps that reasoning from being the only thing between a
 /// pid and nub's own group.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn confirm_group_leader(pid: i32) -> bool {
     // SAFETY: `getpgid` on a child of this process, `getpgrp` on ourselves — plain reads.
     unsafe {
@@ -787,16 +986,25 @@ fn try_wait_child_eintr(
 }
 
 impl Prepared {
+    #[cfg(windows)]
+    fn retain_windows_lease(&self, resource: &windows::WindowsResource) -> std::io::Result<()> {
+        if let Some(session) = &self.session {
+            session
+                .windows_leases
+                .lock()
+                .map_err(|_| std::io::Error::other("sandbox session lease lock poisoned"))?
+                .entry(resource.identity().to_owned())
+                .or_insert_with(|| resource.lease());
+        }
+        Ok(())
+    }
     /// Spawn the child without exposing the backend command. The returned handle
     /// owns every launch resource and kills/reaps on an early drop.
     pub fn spawn(self) -> std::io::Result<PreparedChild> {
         self.spawn_with_signal_target(|_| Ok(()))
     }
 
-    /// Whether this launch confines via the Windows AppContainer path, which owns
-    /// spawn+wait internally ([`status`](Self::status) → `launch.run()`) and cannot
-    /// hand back piped stdio. The host uses this to decide between the piped
-    /// spawn+drain path and the opaque `status()` path when redacting on Windows.
+    /// Whether this launch confines through the Windows AppContainer path.
     #[cfg(target_os = "windows")]
     pub fn will_confine(&self) -> bool {
         self.launch.is_some()
@@ -809,22 +1017,54 @@ impl Prepared {
         ready: impl FnOnce(PreparedSignalTarget) -> std::io::Result<()>,
     ) -> std::io::Result<PreparedChild> {
         #[cfg(target_os = "windows")]
-        if self.launch.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "asynchronous confined Windows launches are not available",
-            ));
+        if let Some(launch) = self.launch.take() {
+            let resource = launch.acquire()?;
+            self.retain_windows_lease(&resource)?;
+            let child = resource.spawn()?;
+            let child_id = child.id();
+            let _ = ready;
+            return Ok(PreparedChild {
+                child: None,
+                windows_child: Some(child),
+                child_id,
+                windows_job: None,
+                _proxy: self.proxy.take(),
+                _private_tmp: self._private_tmp.take(),
+                _session: self.session.take(),
+            });
         }
-        // The supervised launch forks directly (the listener-fd barrier cannot ride
-        // `Command::spawn`), so it has no `std::process::Child` to hand back — it is reachable
-        // only through the synchronous `status()`. Refuse rather than spawn `command`
-        // unsupervised, which would drop the net boundary the policy required.
         #[cfg(target_os = "linux")]
-        if self.supervised.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "asynchronous supervised Linux launches are not yet available; use status()",
-            ));
+        if let Some(plan) = self.supervised.take() {
+            let stdout = if self.redact_stdout {
+                linux_supervisor::SupervisedStdio::Piped
+            } else {
+                linux_supervisor::SupervisedStdio::Inherit
+            };
+            let stderr = if self.redact_stderr {
+                linux_supervisor::SupervisedStdio::Piped
+            } else {
+                linux_supervisor::SupervisedStdio::Inherit
+            };
+            let mut child =
+                plan.spawn(linux_supervisor::SupervisedStdio::Inherit, stdout, stderr)?;
+            let child_id = child.id();
+            let signal_target = child.process_group_id().map(|group| -group);
+            if let Some(target) = signal_target
+                && let Err(error) = ready(PreparedSignalTarget::Direct(target))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            return Ok(PreparedChild {
+                child: None,
+                supervised_child: Some(child),
+                child_id,
+                signal_target,
+                _proxy: self.proxy.take(),
+                _private_tmp: self._private_tmp.take(),
+                _session: self.session.take(),
+            });
         }
         // Pipe the requested fds so the host can drain them through its redactor. stdin is
         // left untouched (interactive input still reaches the child). Both flags off (the
@@ -835,6 +1075,12 @@ impl Prepared {
         if self.redact_stderr {
             self.command.stderr(std::process::Stdio::piped());
         }
+        #[cfg(target_os = "macos")]
+        let guardian = {
+            let guardian = unix_guardian::UnixGuardian::start()?;
+            guardian.join_command(&mut self.command);
+            guardian
+        };
         #[allow(unused_mut)]
         #[cfg(not(windows))]
         let mut child = self.command.spawn()?;
@@ -847,10 +1093,10 @@ impl Prepared {
         // A REQUEST until the kernel confirms it. `confirm_group_leader` is what turns it
         // into a fact, and everything downstream — the negative signal target, the reap in
         // `wait`, the pgid handed to the host — keys on the confirmed value.
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         let signal_process_group =
             self.signal_process_group && confirm_group_leader(child.id() as i32);
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         if self.signal_process_group && !signal_process_group {
             tracing::warn!(
                 "sandbox: the confined child did not become its own process-group leader; \
@@ -863,6 +1109,9 @@ impl Prepared {
         // with `linux_monitor` (epic 1.1); the Landlock path signals its child's group directly.
         #[cfg(unix)]
         let signal_target = {
+            #[cfg(target_os = "macos")]
+            let target = -guardian.process_group_id();
+            #[cfg(not(target_os = "macos"))]
             let target = if signal_process_group {
                 -(child.id() as i32)
             } else {
@@ -879,27 +1128,28 @@ impl Prepared {
         let child_id = child.id();
         Ok(PreparedChild {
             child: Some(child),
+            #[cfg(target_os = "linux")]
+            supervised_child: None,
+            #[cfg(target_os = "windows")]
+            windows_child: None,
             child_id,
+            #[cfg(target_os = "macos")]
+            guardian: Some(guardian),
             #[cfg(windows)]
             windows_job: Some(windows_job),
             #[cfg(unix)]
             signal_target,
-            #[cfg(unix)]
-            signal_process_group,
             _proxy: self.proxy.take(),
             _private_tmp: self._private_tmp.take(),
+            _session: self.session.take(),
         })
     }
 
     /// Launch and wait, retaining the backend's process-tree and resource ownership.
     #[allow(unused_mut)]
     pub fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
-        #[cfg(target_os = "windows")]
-        if let Some(launch) = self.launch.take() {
-            return launch.run();
-        }
         // The Linux supervised launch owns its own fork+wait (the connect-notifier supervisor
-        // runs in this process for the child's whole life), the same way the Windows launch does.
+        // runs in this process for the child's whole life).
         #[cfg(target_os = "linux")]
         if let Some(plan) = self.supervised.take() {
             return plan.run();
@@ -920,26 +1170,55 @@ impl Prepared {
                 "sandbox launch cancelled",
             ));
         }
-        #[cfg(target_os = "windows")]
-        if let Some(launch) = self.launch.take() {
-            return launch.run_cancellable(cancelled);
-        }
         self.spawn()?.wait_cancellable(cancelled)
     }
 
     /// Launch, wait, and capture stdout/stderr through the supervised seam.
     pub fn output(mut self) -> std::io::Result<std::process::Output> {
         #[cfg(target_os = "windows")]
-        if self.launch.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "captured confined Windows output is not available",
-            ));
+        if let Some(launch) = self.launch.take() {
+            let resource = launch.acquire()?;
+            self.retain_windows_lease(&resource)?;
+            let child = resource.spawn_with_stdio(
+                windows::WindowsStdio::Null,
+                windows::WindowsStdio::Piped,
+                windows::WindowsStdio::Piped,
+            )?;
+            let child_id = child.id();
+            return PreparedChild {
+                child: None,
+                windows_child: Some(child),
+                child_id,
+                windows_job: None,
+                _proxy: self.proxy.take(),
+                _private_tmp: self._private_tmp.take(),
+                _session: self.session.take(),
+            }
+            .wait_with_output();
         }
-        self.command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "linux")]
+        if let Some(plan) = self.supervised.take() {
+            let child = plan.spawn(
+                linux_supervisor::SupervisedStdio::Null,
+                linux_supervisor::SupervisedStdio::Piped,
+                linux_supervisor::SupervisedStdio::Piped,
+            )?;
+            let child_id = child.id();
+            let signal_target = child.process_group_id().map(|group| -group);
+            return PreparedChild {
+                child: None,
+                supervised_child: Some(child),
+                child_id,
+                signal_target,
+                _proxy: self.proxy.take(),
+                _private_tmp: self._private_tmp.take(),
+                _session: self.session.take(),
+            }
+            .wait_with_output();
+        }
+        self.command.stdin(std::process::Stdio::null());
+        self.redact_stdout = true;
+        self.redact_stderr = true;
         self.spawn()?.wait_with_output()
     }
 }
@@ -958,6 +1237,58 @@ fn proxy_needed(policy: &SandboxPolicy) -> bool {
                 .iter()
                 .any(|rule| rule.effect == Effect::Allow)
                 && policy.net.mode != ProxyMode::Disabled))
+}
+
+/// Capture credential material exactly once, while acquiring a session. The resulting broker
+/// owns values and marker substitutions; later command preparation uses only the immutable
+/// `SandboxPolicy` stored in [`SessionResources`].
+fn capture_runtime_brokers(
+    policy: &SandboxPolicy,
+    runtime_policy: &mut SandboxPolicy,
+) -> Result<Vec<RuntimeCredentialBroker>, Degradation> {
+    if policy.net.brokers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let session = BrokerSession::from_policy(&policy.net.brokers, |name| {
+        let Some(value) = std::env::var_os(name) else {
+            return Ok(None);
+        };
+        value
+            .into_string()
+            .map(Some)
+            .map_err(|_| "value is not valid Unicode".to_string())
+    })
+    .map_err(|error| Degradation {
+        lost: vec!["credential-broker".to_string()],
+        reason: Some(error.to_string()),
+    })?;
+    session.install_markers(&mut runtime_policy.env.constructed);
+    Ok(session.into_brokers())
+}
+
+/// Start the session's proxy once. Linux build-jail launches intentionally use Landlock's
+/// coarse socket ceiling and never route through a loopback proxy; all other backends retain
+/// the existing fail-closed proxy startup contract.
+fn start_session_proxy(
+    policy: &SandboxPolicy,
+    runtime_brokers: Vec<RuntimeCredentialBroker>,
+) -> Result<Option<EgressProxy>, Degradation> {
+    #[cfg(target_os = "linux")]
+    {
+        if policy.build_jail && policy.net.brokers.is_empty() {
+            return Ok(None);
+        }
+        return start_proxy_if_needed(policy, runtime_brokers);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if windows::uses_egress_funnel(policy) {
+            return Ok(None);
+        }
+        return start_proxy_if_needed(policy, runtime_brokers);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    start_proxy_if_needed(policy, runtime_brokers)
 }
 
 fn start_proxy_if_needed(
@@ -1131,42 +1462,22 @@ fn set_proxy_blackhole(command: &mut Command) {
 /// Environment filtering constructs the child's environment. Unsupported required
 /// guarantees fail closed; best-effort losses remain visible on `Prepared`.
 pub fn apply(policy: &SandboxPolicy, spec: CommandSpec) -> Result<Prepared, Degradation> {
-    if !policy.env.resolved {
-        return Err(Degradation {
-            lost: vec!["env-unresolved".to_string()],
-            reason: Some(
-                "sandbox policy has no resolved target environment; compile it with an ambient snapshot before apply"
-                    .to_string(),
-            ),
-        });
-    }
+    Sandbox::new(policy)?.prepare(spec)
+}
+
+/// Compatibility implementation behind [`Sandbox::prepare`]. The policy and every resource
+/// it refers to were frozen at acquisition, so this function must not consult ambient state.
+fn prepare_with_resources(
+    resources: &Arc<SessionResources>,
+    spec: CommandSpec,
+) -> Result<Prepared, Degradation> {
+    let policy = &resources.policy;
     validate_apply_inputs(policy, &spec)?;
     // Captured before the per-OS backend consumes `spec`; re-applied to the returned
     // `Prepared` below (ONE place) so every backend inherits the stdio-redaction request
     // without threading the boolean through each `apply`.
     let redact_stdout = spec.redact_stdout;
     let redact_stderr = spec.redact_stderr;
-    let mut runtime_policy = policy.clone();
-    let runtime_brokers = if policy.net.brokers.is_empty() {
-        Vec::new()
-    } else {
-        let session = BrokerSession::from_policy(&policy.net.brokers, |name| {
-            let Some(value) = std::env::var_os(name) else {
-                return Ok(None);
-            };
-            value
-                .into_string()
-                .map(Some)
-                .map_err(|_| "value is not valid Unicode".to_string())
-        })
-        .map_err(|error| Degradation {
-            lost: vec!["credential-broker".to_string()],
-            reason: Some(error.to_string()),
-        })?;
-        session.install_markers(&mut runtime_policy.env.constructed);
-        session.into_brokers()
-    };
-    let policy = &runtime_policy;
     #[cfg(target_os = "linux")]
     let linux_preflight = linux::preflight(policy, &spec)?;
     // Start the per-host egress proxy FIRST (if the policy needs it), so its bound port
@@ -1182,32 +1493,11 @@ pub fn apply(policy: &SandboxPolicy, spec: CommandSpec) -> Result<Prepared, Degr
     // marker→secret swap, and skipping it would turn a grant into a silent failure rather than a
     // saved listener. No build-jail policy has brokers (its env axis strips the credential
     // family), so in production this predicate is just "the build jail".
-    #[cfg(target_os = "linux")]
-    let proxy = if linux_preflight.uses_landlock() && policy.net.brokers.is_empty() {
-        None
-    } else {
-        start_proxy_if_needed(policy, runtime_brokers)?
-    };
-    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-    let proxy = start_proxy_if_needed(policy, runtime_brokers)?;
-    // Windows: a Connection-tier per-host policy runs its egress proxy inside a CO-PACKAGE
-    // AppContainer HELPER process (the zero-privilege funnel), not in nub — so nub starts NO
-    // in-process proxy for it. An in-process one would bind a loopback port the confined child
-    // cannot reach (different package), and its bind failure is a HARD apply error, which would
-    // needlessly fail the funnel launch closed. `windows::uses_egress_funnel` is the exact
-    // predicate `windows::apply` uses to select the funnel, so the two never disagree. Every other
-    // Windows net posture still starts the in-process proxy exactly as before.
-    #[cfg(target_os = "windows")]
-    let proxy = if windows::uses_egress_funnel(policy) {
-        None
-    } else {
-        start_proxy_if_needed(policy, runtime_brokers)?
-    };
-    let proxy_port = proxy.as_ref().map(EgressProxy::port);
+    let proxy_port = resources.proxy.as_ref().map(EgressProxy::port);
     // The per-session egress-proxy token, delivered to the child via the proxy URL. Same
     // presence as `proxy_port` (both derive from `proxy`), threaded into each backend so
     // the child authenticates to the loopback proxy.
-    let proxy_token = proxy.as_ref().map(EgressProxy::token);
+    let proxy_token = resources.proxy.as_ref().map(EgressProxy::token);
     // The Linux Landlock build-jail backend takes neither (coarse seccomp family ceiling, no
     // proxy to authenticate to); the SUPERVISED backend takes both, redirecting an allowed connect
     // through the loopback proxy for per-host SNI precision (epic 5.1). `linux::apply` routes each
@@ -1216,19 +1506,16 @@ pub fn apply(policy: &SandboxPolicy, spec: CommandSpec) -> Result<Prepared, Degr
     // mac/win/generic backends. On Linux the only wired backend is the Landlock build jail, which
     // starts no proxy and terminates no TLS, so there is never a CA bundle to hand it or announce.
     #[cfg(not(target_os = "linux"))]
-    let ca_bundle = proxy.as_ref().and_then(|p| p.ca_bundle_path());
+    let ca_bundle = resources.proxy.as_ref().and_then(|p| p.ca_bundle_path());
     #[cfg(not(target_os = "linux"))]
     let ca_bundle_present = ca_bundle.is_some();
     #[cfg(target_os = "linux")]
     let ca_bundle_present = false;
 
-    // Create the fresh per-run PRIVATE tmp dir up front (when the policy asks), so its
-    // path is threaded into the backend BEFORE the child profile is built — the backend
-    // grants it rw + points the child's TMPDIR at it + hides the shared system tmp. The
-    // dir is owned by `Prepared` (moved in below) so it outlives the child and is removed
-    // on drop. `None` for Shared/Deny.
-    let private_tmp = make_private_tmp(policy);
-    let tmp_dir = private_tmp.as_ref().map(|d| d.path());
+    // The acquired session owns the stable managed PRIVATE tmp root (when the policy asks).
+    // Its path is threaded into each backend before its command profile is built; all commands
+    // in this explicit session intentionally share that private state. `None` for Shared/Deny.
+    let tmp_dir = resources.private_tmp.as_ref().map(|d| d.path());
 
     #[cfg(target_os = "macos")]
     let mut prepared = macos::apply(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir)?;
@@ -1262,8 +1549,7 @@ pub fn apply(policy: &SandboxPolicy, spec: CommandSpec) -> Result<Prepared, Degr
         emit_mitm_notice(policy);
     }
 
-    prepared.proxy = proxy;
-    prepared._private_tmp = private_tmp;
+    prepared.session = Some(resources.clone());
     prepared.redact_stdout = redact_stdout;
     prepared.redact_stderr = redact_stderr;
     Ok(prepared)
@@ -1470,16 +1756,22 @@ fn os_str_contains_nul(value: &std::ffi::OsStr) -> bool {
     value.to_string_lossy().contains('\0')
 }
 
-/// Create the fresh per-run private tmp dir for `TmpMode::Private` (else `None`). A
-/// `tempfile::TempDir` under the OS default temp root, removed when it drops (after the
-/// child exits, since `Prepared` owns it). A creation failure yields `None` — the backend
-/// then reports the tmp axis unenforced (fail-safe: it never silently runs the child on
-/// the SHARED tmp while claiming a private one).
-fn make_private_tmp(policy: &SandboxPolicy) -> Option<tempfile::TempDir> {
+/// Create the managed session tmp root for `TmpMode::Private` (else `None`). It lives with
+/// the session lease, so every command submitted through that session sees the same private
+/// location. Creation failure is a hard error: the engine never silently falls back to shared
+/// tmp while claiming a private one.
+fn make_private_tmp(policy: &SandboxPolicy) -> Result<Option<tempfile::TempDir>, Degradation> {
     if policy.fs.tmp != crate::policy::TmpMode::Private {
-        return None;
+        return Ok(None);
     }
-    tempfile::Builder::new().prefix("nub-tmp-").tempdir().ok()
+    tempfile::Builder::new()
+        .prefix("nub-tmp-")
+        .tempdir()
+        .map(Some)
+        .map_err(|error| Degradation {
+            lost: vec!["tmp-private".to_string()],
+            reason: Some(format!("creating required private sandbox tmp: {error}")),
+        })
 }
 
 /// Point a child's temp-dir env at `dir` (all three conventions: POSIX `TMPDIR`, the
@@ -1559,6 +1851,7 @@ fn generic_apply(
         command,
         degradation,
         proxy: None,
+        session: None,
         #[cfg(target_os = "linux")]
         _inherited_files: Vec::new(),
         #[cfg(unix)]

@@ -7,10 +7,11 @@
 //!
 //! [`compile`] resolves a surface and [`CompileCtx`] into a [`SandboxPolicy`].
 //! [`compile_build_jail`] resolves the catalog-driven dependency-build profile.
-//! [`apply`] combines that policy with a [`CommandSpec`] and returns a [`Prepared`]
-//! launch, or a [`Degradation`] error when a required guarantee cannot be enforced.
-//! Launch through [`Prepared::spawn`], [`Prepared::status`], or [`Prepared::output`]
-//! so process cleanup, proxies and temporary directories retain their owners.
+//! [`Sandbox::acquire`] retains resolved policy resources for reusable commands; combine it
+//! with a [`CommandSpec`] through [`Sandbox::prepare`]. [`apply`] remains the one-shot
+//! compatibility adapter returning a [`Prepared`] launch. Launch through [`Prepared::spawn`],
+//! [`Prepared::status`], or [`Prepared::output`] so process cleanup and session resources
+//! retain their owners.
 //!
 //! Linux uses Landlock and seccomp, macOS uses Seatbelt, and Windows uses AppContainer.
 //! None requires an elevated helper, account creation, or an early bootstrap capability.
@@ -84,7 +85,8 @@ pub use backend::macos_denials;
 #[cfg(target_os = "windows")]
 pub use backend::windows_publish_appcontainer_read;
 pub use backend::{
-    CommandArgs, CommandSpec, Degradation, Prepared, PreparedChild, PreparedSignalTarget, apply,
+    CommandArgs, CommandSpec, Degradation, Prepared, PreparedChild, PreparedSignalTarget, Sandbox,
+    apply, cleanup,
 };
 // The Windows zero-privilege per-host egress FUNNEL seam: an embedder registers HOW to launch nub
 // as the co-package egress-proxy helper (`set_...`, OS-agnostic so nub-cli registers with no
@@ -121,20 +123,16 @@ pub use matcher::Homes;
 pub use policy::SandboxPolicy;
 pub use proxy::{Decision, EgressProxy, GrantDecider, Host, StaticDecider};
 
-/// Relax a compiled policy's READ axis to the whole disk MINUS secret subtrees — the
-/// sandbox-sanctioned expression of "read almost everything". A whole-root `/` read grant is
-/// deliberately DROPPED by the Landlock lowering (`backend::linux_grants::compile_mount_plan`) as
-/// an unclawable credential leak, so a raw `{"fs": {"/": "r"}}` surface silently collapses to
-/// system-floor reads. This front-inserts the disk-minus-secrets read allows so pre-existing (more
-/// specific) write grants still win under last-match-wins.
+/// Relax a compiled policy's READ axis to the whole disk. A whole-root `/` read grant is
+/// deliberately DROPPED by the Landlock lowering (`backend::linux_grants::compile_mount_plan`),
+/// so this front-inserts explicit disk-read allows while preserving pre-existing (more specific)
+/// write grants under last-match-wins.
 ///
 /// The build-jail embedder seam uses this to reproduce the generous read posture dependency
 /// lifecycle scripts need — a `node` interpreter must read its own runtime/preload, its module
-/// tree, and system libs — while keeping WRITES allow-only. It is stricter than a bare read-`/`:
-/// `$HOME`-anchored secret SUBTREES are excluded. `.env*` basename reads remain a per-backend
-/// residual on Landlock (which has no deny primitive).
-pub fn relax_reads_to_disk_minus_secrets(policy: &mut SandboxPolicy, homes: &Homes) {
-    compiler::relax_fs_read_to_disk_minus_secrets(policy, homes);
+/// tree, and system libs — while keeping WRITES allow-only.
+pub fn relax_reads_to_disk(policy: &mut SandboxPolicy) {
+    compiler::relax_fs_read_to_disk(policy);
 }
 
 /// Whether applying this policy needs the embedder to supply bounded current-path

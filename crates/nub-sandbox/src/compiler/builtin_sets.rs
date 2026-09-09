@@ -70,8 +70,9 @@
 //! `dependenciesMeta` scope, and a missing tool would hard-fail the compile). True
 //! runtime resolution is deferred to a host-provided `CompileCtx` field, fail-soft.
 
-use crate::matcher::path::{Homes, canonicalize_glob_prefix, expand_symbolic};
+use crate::matcher::path::{Homes, canonicalize_glob_prefix, expand_symbolic, normalize_slashes};
 use crate::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule, NetRule, NetTarget};
+use std::collections::{BTreeMap, BTreeSet};
 
 // ── $trusted (net host set) ────────────────────────────────────────────────────
 
@@ -320,8 +321,8 @@ pub fn download_net_rules(effect: Effect) -> Vec<NetRule> {
 // `$cache` is the platform cache home (XDG_CACHE_HOME else `~/.cache`), which matches
 // aube's own `cache_dir()` base on POSIX; the nub store is anchored at the literal
 // `~/.local/share` per the deferred-runtime-resolution decision (no XDG_DATA_HOME
-// capture in `Homes`). Third-party paths are documented defaults; the override env is
-// intentionally NOT read here (static defaults only — runtime resolution is deferred).
+// capture in `Homes`). Third-party paths are documented defaults. The expansion below also
+// accepts documented, already-approved environment relocations; it never discovers config.
 
 #[cfg(target_os = "macos")]
 const TOOLDIR_PATTERNS: &[&str] = &[
@@ -329,22 +330,29 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.local/share/nub/store",
     "$cache/nub/pm",
     // JS package managers
-    "~/.npm/_cacache",
-    "~/Library/pnpm/store",
-    "~/Library/Caches/pnpm",
+    "~/.npm",
+    "~/Library/pnpm",
+    "~/Library/Preferences/pnpm",
     "~/Library/Caches/Yarn",
-    "~/.yarn/berry/cache",
-    "~/.bun/install/cache",
+    "~/.yarn",
+    "~/.bun/install",
     // Python
     "~/Library/Caches/pip",
     "~/Library/Caches/uv",
+    "~/Library/Application Support/pip",
+    "~/.local/share/uv",
+    "~/.config/uv",
+    "~/.local/bin",
     // Other toolchains
-    "~/.cargo/registry",
-    "~/go/pkg/mod",
-    "~/.gradle/caches",
-    "~/.m2/repository",
-    "~/.nuget/packages",
-    "~/.composer/cache",
+    "~/.cargo",
+    "~/.rustup",
+    "~/go",
+    "~/.gradle",
+    "~/.m2",
+    "~/.nuget",
+    "~/.composer",
+    "~/Library/Application Support/Composer",
+    "~/.config/git",
 ];
 
 #[cfg(target_os = "windows")]
@@ -354,21 +362,30 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/AppData/Local/nub/pm",
     // JS package managers
     "~/AppData/Local/npm-cache",
-    "~/AppData/Local/pnpm/store",
+    "~/AppData/Roaming/npm",
+    "~/AppData/Local/pnpm",
     "~/AppData/Local/pnpm-cache",
-    "~/AppData/Local/Yarn/Cache",
-    "~/AppData/Local/Yarn/Berry/cache",
-    "~/.bun/install/cache",
+    "~/AppData/Local/Yarn",
+    "~/AppData/Roaming/Yarn",
+    "~/.yarn",
+    "~/.bun/install",
     // Python
-    "~/AppData/Local/pip/Cache",
-    "~/AppData/Local/uv/cache",
+    "~/AppData/Local/pip",
+    "~/AppData/Roaming/pip",
+    "~/AppData/Local/uv",
+    "~/AppData/Roaming/uv",
+    "~/.local/bin",
     // Other toolchains
-    "~/.cargo/registry",
-    "~/go/pkg/mod",
-    "~/.gradle/caches",
-    "~/.m2/repository",
-    "~/.nuget/packages",
+    "~/.cargo",
+    "~/.rustup",
+    "~/go",
+    "~/AppData/Local/go-build",
+    "~/.gradle",
+    "~/.m2",
+    "~/.nuget",
+    "~/AppData/Local/NuGet",
     "~/AppData/Local/Composer",
+    "~/AppData/Roaming/Composer",
 ];
 
 // Linux + any other unix (freebsd, …): the XDG layout.
@@ -378,27 +395,180 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.local/share/nub/store",
     "$cache/nub/pm",
     // JS package managers
-    "~/.npm/_cacache",
-    "~/.local/share/pnpm/store",
+    "~/.npm",
+    "~/.local/share/pnpm",
     "~/.cache/pnpm",
+    "~/.config/pnpm",
+    "~/.local/state/pnpm",
     "~/.cache/yarn",
-    "~/.yarn/berry/cache",
-    "~/.bun/install/cache",
+    "~/.yarn",
+    "~/.bun/install",
     // Python
     "~/.cache/pip",
     "~/.cache/uv",
+    "~/.config/pip",
+    "~/.local/share/uv",
+    "~/.config/uv",
+    "~/.local/bin",
     // Other toolchains
-    "~/.cargo/registry",
-    "~/go/pkg/mod",
-    "~/.gradle/caches",
-    "~/.m2/repository",
-    "~/.nuget/packages",
+    "~/.cargo",
+    "~/.rustup",
+    "~/go",
+    "$cache/go-build",
+    "~/.gradle",
+    "~/.m2",
+    "~/.nuget",
+    "~/.local/share/NuGet",
     "~/.cache/composer",
+    "~/.composer",
+    "~/.config/composer",
+    "~/.config/git",
 ];
+
+/// File-shaped state is exact, rather than a subtree root: Git replaces the global config
+/// through its adjacent lock file, so both leaf names are needed without granting `~`.
+const TOOLDIR_FILE_PATTERNS: &[&str] = &["~/.gitconfig", "~/.gitconfig.lock", "~/.git-credentials"];
 
 /// The per-OS `$tooldirs` surface patterns (host OS == target OS).
 pub fn tooldir_patterns() -> &'static [&'static str] {
     TOOLDIR_PATTERNS
+}
+
+/// Add a non-empty documented relocation from the already-approved ambient snapshot.
+/// The compiler never invokes a package manager or parses its configuration to find a path.
+fn env_path(env: &BTreeMap<String, String>, name: &str, out: &mut BTreeSet<String>) {
+    if let Some(value) = env.get(name).filter(|value| !value.is_empty()) {
+        out.insert(value.clone());
+    }
+}
+
+fn env_subpaths(
+    env: &BTreeMap<String, String>,
+    name: &str,
+    suffixes: &[&str],
+    out: &mut BTreeSet<String>,
+) {
+    let Some(root) = env.get(name).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let root = root.trim_end_matches(['/', '\\']);
+    for suffix in suffixes {
+        out.insert(format!("{root}/{suffix}"));
+    }
+}
+
+fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for name in [
+        // JavaScript package managers.
+        "NPM_CONFIG_CACHE",
+        "NPM_CONFIG_PREFIX",
+        "NPM_CONFIG_USERCONFIG",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "PNPM_HOME",
+        "PNPM_CONFIG_STORE_DIR",
+        "PNPM_CONFIG_CACHE_DIR",
+        "PNPM_CONFIG_STATE_DIR",
+        "PNPM_CONFIG_CONFIG_DIR",
+        "YARN_CACHE_FOLDER",
+        "YARN_GLOBAL_FOLDER",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
+        "BUN_INSTALL_GLOBAL_DIR",
+        "BUN_INSTALL_BIN",
+        // Other package-manager families.
+        "PIP_CACHE_DIR",
+        "PIP_CONFIG_FILE",
+        "UV_CACHE_DIR",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+        "UV_PYTHON_INSTALL_DIR",
+        "UV_PYTHON_BIN_DIR",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CARGO_TARGET_DIR",
+        "GOMODCACHE",
+        "GOCACHE",
+        "GOBIN",
+        "GOTMPDIR",
+        "GRADLE_USER_HOME",
+        "NUGET_PACKAGES",
+        "NUGET_HTTP_CACHE_PATH",
+        "NUGET_SCRATCH",
+        "NUGET_PLUGINS_CACHE_PATH",
+        "COMPOSER_HOME",
+        "COMPOSER_CACHE_DIR",
+        "COMPOSER_VENDOR_DIR",
+        "COMPOSER_BIN_DIR",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TEMPLATE_DIR",
+        "GIT_EXEC_PATH",
+    ] {
+        env_path(env, name, &mut paths);
+    }
+    // GOPATH alone is list-valued (colon-separated on Unix, semicolon-separated on
+    // Windows). Each entry is an independent tool root, never one literal path.
+    if let Some(value) = env.get("GOPATH").filter(|value| !value.is_empty()) {
+        for path in std::env::split_paths(value) {
+            if !path.as_os_str().is_empty() {
+                paths.insert(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // npm accepts its documented config environment names in lower case as well.
+    for name in [
+        "npm_config_cache",
+        "npm_config_prefix",
+        "npm_config_userconfig",
+        "npm_config_globalconfig",
+    ] {
+        env_path(env, name, &mut paths);
+    }
+    // `$cache` already follows XDG_CACHE_HOME through Homes. These are the other
+    // documented XDG roots used by the covered package-manager families.
+    env_subpaths(
+        env,
+        "XDG_DATA_HOME",
+        &["pnpm", "yarn/berry", "uv", "NuGet"],
+        &mut paths,
+    );
+    env_subpaths(
+        env,
+        "XDG_CONFIG_HOME",
+        &["pnpm", "pip", "uv", "composer", "git"],
+        &mut paths,
+    );
+    env_subpaths(env, "XDG_STATE_HOME", &["pnpm"], &mut paths);
+    env_path(env, "XDG_BIN_HOME", &mut paths);
+    // A redirected Windows profile is not represented by Homes, so use the
+    // embedder-approved environment rather than assuming ~/AppData defaults.
+    #[cfg(windows)]
+    env_subpaths(
+        env,
+        "LOCALAPPDATA",
+        &[
+            "npm-cache",
+            "pnpm",
+            "pnpm-cache",
+            "Yarn",
+            "pip",
+            "uv",
+            "go-build",
+            "NuGet",
+            "Composer",
+        ],
+        &mut paths,
+    );
+    #[cfg(windows)]
+    env_subpaths(
+        env,
+        "APPDATA",
+        &["npm", "Yarn", "pip", "uv", "Composer"],
+        &mut paths,
+    );
+    paths
 }
 
 /// Expand `$tooldirs` into fs rules under the resolved home anchors — one rule per
@@ -406,12 +576,69 @@ pub fn tooldir_patterns() -> &'static [&'static str] {
 /// [`super::fold::push_fs_rules`] funnel (a Deny normalizes to the inert `FsAccess::DENY`,
 /// so two denies differing only in access don't yield divergent IR — D20).
 pub fn tooldirs_fs_rules(homes: &Homes, effect: Effect, access: FsAccess) -> Vec<FsRule> {
+    tooldirs_fs_rules_with_env(homes, &BTreeMap::new(), effect, access)
+        .expect("the audited static $tooldirs roots are never filesystem roots")
+}
+
+/// Expand an environment-provided root without treating its whitespace as syntax. Unlike a
+/// policy pattern, an environment value is a literal OS path: a relative value is anchored
+/// once to the project, while a leading/trailing space is a valid path character.
+fn expand_environment_root(root: &str, homes: &Homes) -> String {
+    let normalized = normalize_slashes(root);
+    let bytes = normalized.as_bytes();
+    let windows_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    if normalized.starts_with('/') || windows_absolute {
+        normalized
+    } else if root == "~" || root.starts_with("~/") || root.starts_with("~\\") {
+        expand_symbolic(root, homes)
+    } else {
+        format!(
+            "{}/{}",
+            homes
+                .project
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\']),
+            normalized
+        )
+    }
+}
+
+/// Whether an expanded root names an entire filesystem (or a complete UNC share), which
+/// `$tooldirs` must never turn into a convenience-set grant.
+fn is_filesystem_root(path: &str) -> bool {
+    if path == "/" || path == "\\" {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return true;
+    }
+    let mut pieces = path.split('/');
+    path.starts_with("//")
+        && pieces.next() == Some("")
+        && pieces.next() == Some("")
+        && pieces.next().is_some_and(|piece| !piece.is_empty())
+        && pieces.next().is_some_and(|piece| !piece.is_empty())
+        && pieces.next().is_none()
+}
+
+/// Expand `$tooldirs` from per-OS defaults plus documented environment relocations.
+/// Empty variables add no rule. The variables are values the embedder already approved
+/// for this [`CompileCtx`](super::CompileCtx), not tool configuration discovered here.
+pub fn tooldirs_fs_rules_with_env(
+    homes: &Homes,
+    env: &BTreeMap<String, String>,
+    effect: Effect,
+    access: FsAccess,
+) -> Result<Vec<FsRule>, String> {
     let access = if effect == Effect::Deny {
         FsAccess::DENY
     } else {
         access
     };
     let mut out = Vec::new();
+    let environment_patterns = environment_tooldirs(env);
     for pattern in tooldir_patterns() {
         let expanded = expand_symbolic(pattern, homes);
         for g in super::defaults::subtree_globs(&expanded) {
@@ -423,7 +650,32 @@ pub fn tooldirs_fs_rules(homes: &Homes, effect: Effect, access: FsAccess) -> Vec
             });
         }
     }
-    out
+    for pattern in TOOLDIR_FILE_PATTERNS {
+        let expanded = expand_symbolic(pattern, homes);
+        out.push(FsRule {
+            matcher: CanonGlob(canonicalize_glob_prefix(&expanded)),
+            effect,
+            access,
+            origin: FsOrigin::Speculative,
+        });
+    }
+    for pattern in environment_patterns {
+        let expanded = expand_environment_root(&pattern, homes);
+        if is_filesystem_root(&expanded) {
+            return Err(format!(
+                "environment relocation `{pattern}` resolves to a filesystem root, which `$tooldirs` cannot grant"
+            ));
+        }
+        for g in super::defaults::subtree_globs(&expanded) {
+            out.push(FsRule {
+                matcher: CanonGlob(canonicalize_glob_prefix(&g)),
+                effect,
+                access,
+                origin: FsOrigin::Speculative,
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -656,7 +908,7 @@ mod tests {
 
     #[test]
     fn deny_effect_normalizes_access_to_the_inert_value() {
-        // A `!$tooldirs` deny carries the canonical inert access (D20), same as the fs funnel.
+        // An internal deny effect carries the canonical inert access (D20), same as the fs funnel.
         let rules = tooldirs_fs_rules(&homes(), Effect::Deny, FsAccess::ReadWrite);
         assert!(
             rules

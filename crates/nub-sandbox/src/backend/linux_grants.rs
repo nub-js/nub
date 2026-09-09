@@ -1,8 +1,6 @@
-//! Ordered filesystem mount-plan derivation for the stock Bubblewrap backend.
-//!
-//! Bubblewrap applies bind mounts in argv order. Keeping that order is what lets a
-//! policy express a writable parent, a read-only child cap, and a still-narrower
-//! writable reopen without recursively walking the project tree.
+//! Filesystem grant derivation shared by the Linux Landlock launch paths.
+//! Positive grants name literal nodes or subtrees. A whole-root grant is literal too:
+//! it must not silently turn into an enumerated root-minus-credentials policy.
 
 use crate::matcher::path::{PathMatcher, normalize_slashes};
 use crate::policy::{Effect, FsAccess, FsPolicy, SandboxPolicy};
@@ -68,27 +66,26 @@ pub(crate) fn compile_mount_plan(policy: &SandboxPolicy) -> Result<Vec<MountGran
 
     for (rule_index, rule) in policy.fs.rules.entries.iter().enumerate() {
         let pattern = rule.matcher.as_str();
-        // ⛔⛔ A whole-root READ allow lands here and emits NOTHING — no `MountGrant`, and (because
-        // `linux_landlock::derive_grants` builds its rule set from this same plan) no Landlock rule
-        // either. Only the ReadWrite case below is a hard error; the read case is a silent drop.
-        //
-        // ⛔⛔⛔ DO NOT "FIX" THIS BY SYNTHESISING A `/` READ GRANT. It looks like a one-line
-        // omission and it is not. Landlock rules UNION and it has no deny primitive at any ABI, so
-        // a read rule on `/` cannot be narrowed by anything nested under it — VERIFIED on ABI v7:
-        // under a `/` read rule a decoy at `~/.ssh` was read successfully, and adding a rule on the
-        // enclosing directory granting only EXECUTE did not take that back. A `/` read grant is
-        // therefore an unclawable credential leak, not an under-grant to be traded away.
-        //
-        // `read:"disk"` no longer reaches this branch at all: `defaults::disk_minus_secrets_read_-
-        // allows` expresses the exclusion POSITIVELY, naming the disk MINUS the secret subtrees as
-        // concrete allows, because an allowlist cannot subtract. The rung is live on Linux and is
-        // proved end-to-end in `wiki/research/linux-full-disk-read.md`.
         if is_whole_root(pattern) {
-            grants.clear();
-            previous_grant = None;
-            if rule.effect == Effect::Allow && rule.access == FsAccess::ReadWrite {
-                return Err("a writable whole-filesystem mount is not allowed".to_string());
+            if rule.effect != Effect::Allow {
+                continue;
             }
+            if has_denies {
+                return Err(
+                    "a whole-filesystem grant cannot be combined with filesystem denies".into(),
+                );
+            }
+            let grant = MountGrant {
+                path: PathBuf::from("/"),
+                access: if rule.access == FsAccess::ReadWrite {
+                    MountAccess::ReadWrite
+                } else {
+                    MountAccess::ReadOnly
+                },
+                rule_index,
+            };
+            grants.push(grant.clone());
+            previous_grant = Some(grant);
             continue;
         }
         if rule.effect != Effect::Allow {
@@ -525,80 +522,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_writable_whole_root() {
-        assert!(compile_mount_plan(&policy(vec![allow("**", FsAccess::ReadWrite)])).is_err());
+    fn whole_root_grants_have_literal_access_without_sibling_enumeration() {
+        for (access, expected) in [
+            (FsAccess::Read, MountAccess::ReadOnly),
+            (FsAccess::ReadWrite, MountAccess::ReadWrite),
+        ] {
+            for pattern in ["**", "/**", "/"] {
+                let grants = compile_mount_plan(&policy(vec![allow(pattern, access)])).unwrap();
+                assert_eq!(
+                    grants,
+                    vec![MountGrant {
+                        path: PathBuf::from("/"),
+                        access: expected,
+                        rule_index: 0
+                    }]
+                );
+            }
+        }
     }
 
-    /// ⛔ THE `read:"disk"` ALLOW-SET MUST SURVIVE THIS PLANNER, AND NOTHING ELSE TESTED THAT.
-    ///
-    /// `defaults::disk_minus_secrets_read_allows` walks the real `/` and grants every child that
-    /// does not lead to a secret — which on any real host includes the kernel-virtual trees.
-    /// [`is_reserved_tree`] refuses those with a hard `Err`, and the Linux build jail is
-    /// Landlock-or-nothing and FAIL-CLOSED, so one emitted `/proc/**` does not merely widen the
-    /// jail: it stops `read:"disk"` launching the script at all.
-    ///
-    /// The gap was structural rather than an oversight in either file. The compiler's own tests
-    /// (`preset::read_disk_excludes_secret_subtrees_and_emits_no_whole_disk_allow` and its
-    /// siblings) assert on the ALLOW-SET and never build a mount plan; this planner's tests use
-    /// hand-written fixtures and never consume the compiler's whole-disk output. Only running one
-    /// into the other finds it, which is what this test does.
     #[test]
-    fn the_read_disk_allow_set_compiles_to_a_mount_plan() {
-        let dir = tempdir().unwrap();
-        // The crate's canonicalizer, not `std::fs::canonicalize`: on Windows the std one
-        // returns a `\\?\`-verbatim path, whose `?` reads as a glob metacharacter once the
-        // grant is slash-normalized — so every rule derived from this home would evaporate and
-        // the positive control below would fail for a reason that has nothing to do with the walk.
-        let home = crate::matcher::path::canonicalize_including_nonexistent(dir.path());
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        std::fs::create_dir_all(home.join("Documents")).unwrap();
-        // A real directory name carrying a glob metacharacter. The walk emits an unescaped
-        // literal, and this planner demands a bounded one — so if that is unhandled the mount
-        // plan refuses for a SECOND reason, and one npm cache entry named like this would break
-        // the rung on a user's machine.
-        std::fs::create_dir_all(home.join("weird[1]name")).unwrap();
-        let homes = crate::Homes {
-            home: home.clone(),
-            tmp: home.join("tmp"),
-            cache: home.join("cache"),
-            project: home.join("projects"),
-        };
+    fn whole_root_read_does_not_discard_an_existing_write_grant() {
+        let directory = tempdir().unwrap();
+        let grants = compile_mount_plan(&policy(vec![
+            allow(directory.path().to_string_lossy(), FsAccess::ReadWrite),
+            allow("**", FsAccess::Read),
+        ]))
+        .unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].access, MountAccess::ReadWrite);
+        assert_eq!(grants[1].path, PathBuf::from("/"));
+        assert_eq!(grants[1].access, MountAccess::ReadOnly);
+    }
 
-        let allows = crate::compiler::defaults::disk_minus_secrets_read_allows(&homes);
-        // POSITIVE CONTROL: an emitter that returned nothing would satisfy every assertion below
-        // while granting no read at all, which is the failure mode this rung already had once.
+    #[test]
+    fn whole_root_cannot_promise_deny_exclusions() {
         assert!(
-            allows.iter().any(|rule| {
-                let pattern = rule.matcher.as_str();
-                // The emitted matcher is slash-normalized; `Path::join` is not.
-                pattern.strip_suffix("/**").unwrap_or(pattern)
-                    == normalize_slashes(&home.join("Documents").to_string_lossy())
-            }),
-            "the ordinary non-secret sibling must be granted, else this test cannot tell a working \
-             exclusion from an emitter that granted nothing: {allows:?}"
+            compile_mount_plan(&policy(vec![allow("**", FsAccess::Read), deny("/secret")]))
+                .is_err()
         );
-
-        let reserved: Vec<&str> = allows
-            .iter()
-            .map(|rule| rule.matcher.as_str())
-            .filter(|pattern| {
-                let literal = pattern.strip_suffix("/**").unwrap_or(pattern);
-                is_reserved_tree(std::path::Path::new(literal))
-            })
-            .collect();
-        assert!(
-            reserved.is_empty(),
-            "the whole-disk read walk must never name a reserved kernel tree — this planner \
-             refuses one outright, so emitting it turns read:\"disk\" into a launch failure \
-             rather than a broad read grant. Got: {reserved:?}"
-        );
-
-        let mut policy = SandboxPolicy::default();
-        policy.fs.rules.default_effect = Effect::Deny;
-        policy.fs.rules.entries.splice(0..0, allows);
-        compile_mount_plan(&policy).unwrap_or_else(|error| {
-            panic!("the read:\"disk\" allow-set must compile to a mount plan, got: {error}")
-        });
     }
 
     #[test]

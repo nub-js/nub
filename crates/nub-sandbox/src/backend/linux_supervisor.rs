@@ -15,8 +15,8 @@
 //! nothing.
 //!
 //! HOSTNAME POLICY COMES FROM OBSERVED DNS. A UDP `connect` to port 53 is answered by
-//! splicing in a supervisor-owned socket connected to an in-process stub resolver, which
-//! forwards to the real resolver and records `name -> A/AAAA`. A later TCP `connect` to one
+//! splicing in a supervisor-owned socket connected to the configured resolver. Reply peeking
+//! records `name -> A/AAAA` for this launch. A later TCP `connect` to one
 //! of those addresses is attributed to that name and checked against the allowlist.
 //!
 //! THE LISTENER FD IS HANDED OVER A PLAIN PIPE, NEVER `SCM_RIGHTS`. Once `sendmsg` is
@@ -24,12 +24,8 @@
 //! it. The child instead `write`s the listener's fd NUMBER down an ordinary pipe (`write` is
 //! unfiltered) and the parent recovers the descriptor with `pidfd_open` + `pidfd_getfd`.
 //!
-//! STATUS: this module is self-contained (it depends only on `libc`, `seccompiler`, and
-//! `std`) and is NOT yet wired into the launch path — that integration, including how the
-//! supervisor thread relates to the confined child in a library context, is owned by the
-//! sandbox launch code. It also provides the two child-side confinement helpers the Landlock
-//! path calls (`mark_inherited_fds_cloexec`, `install_target_seccomp`), ported from the
-//! dropped `linux_monitor` module.
+//! The library launch path owns the child, its streams and supervisor. Each supervisor owns
+//! its own policy/DNS state and descriptors; cancellation wakes notification and network I/O.
 #![allow(dead_code)]
 
 use crate::matcher::path::PathMatcher;
@@ -37,10 +33,9 @@ use crate::policy::{Effect, FsAccess, FsRuleSet};
 use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 /// Whether the supervisor's per-connection decision trace is enabled. The supervisor runs in the
 /// nub PARENT, so its `eprintln!`s land on nub's own stderr (the user's terminal during `nub
@@ -426,7 +421,6 @@ struct SupState {
     dns_map: Vec<DnsEntry>,
     sk: Vec<SkEntry>,
     upstream_addr_be: u32, // network-order IPv4 of the real upstream resolver
-    stub_port: u16,
     /// `Some` ⇒ redirect an allowed TCP connect through the loopback egress proxy at this port
     /// (epic 5.1); `None` ⇒ dial the destination directly (the coarse path). Paired with
     /// [`Self::proxy_token`], copied from the [`EgressPolicy`] before the fork.
@@ -520,21 +514,32 @@ impl SupState {
     }
 }
 
-fn state() -> &'static Mutex<SupState> {
-    static STATE: OnceLock<Mutex<SupState>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(SupState {
-            allow_all: false,
-            allow: Vec::new(),
-            write_matcher: None,
+impl SupState {
+    fn new(policy: EgressPolicy) -> Self {
+        Self {
+            allow_all: policy.allow_all,
+            allow: policy.allow,
+            write_matcher: policy
+                .write_policy
+                .as_ref()
+                .map(|s| Arc::new(PathMatcher::new(s))),
             dns_map: Vec::new(),
             sk: Vec::new(),
-            upstream_addr_be: 0,
-            stub_port: 0,
-            proxy_port: None,
-            proxy_token: None,
-        })
-    })
+            upstream_addr_be: upstream_resolver(),
+            proxy_port: policy.proxy_port,
+            proxy_token: policy.proxy_token,
+        }
+    }
+}
+
+impl Drop for SupState {
+    fn drop(&mut self) {
+        for socket in &self.sk {
+            if socket.dup >= 0 {
+                unsafe { libc::close(socket.dup) };
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +689,7 @@ fn dns_name(p: &[u8], mut o: usize, out: &mut String) -> Option<usize> {
 }
 
 /// Parse a DNS response and record every A/AAAA answer into the observed-DNS map.
-fn parse_response(p: &[u8]) {
+fn parse_response(state: &mut SupState, p: &[u8]) {
     let len = p.len();
     if len < 12 {
         return;
@@ -715,11 +720,9 @@ fn parse_response(p: &[u8]) {
             return;
         }
         if rtype == 1 && rdlen == 4 {
-            let mut st = state().lock().unwrap();
-            st.record(&qname, libc::AF_INET, &p[off..off + 4]);
+            state.record(&qname, libc::AF_INET, &p[off..off + 4]);
         } else if rtype == 28 && rdlen == 16 {
-            let mut st = state().lock().unwrap();
-            st.record(&qname, libc::AF_INET6, &p[off..off + 16]);
+            state.record(&qname, libc::AF_INET6, &p[off..off + 16]);
         }
         off += rdlen;
     }
@@ -734,24 +737,6 @@ fn make_sockaddr_in(addr_be: u32, port: u16) -> libc::sockaddr_in {
     a
 }
 
-/// Set (or clear, with `secs == 0`) the receive timeout on a blocking socket, so the supervisor's
-/// handshake with the loopback proxy cannot wedge the thread if the proxy never answers.
-fn set_recv_timeout(fd: RawFd, secs: i64) {
-    let tv = libc::timeval {
-        tv_sec: secs,
-        tv_usec: 0,
-    };
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const _ as *const libc::c_void,
-            size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
-}
-
 /// Dial the loopback egress proxy at `proxy_port` and complete the cooperative HTTP `CONNECT`
 /// handshake on the confined child's behalf, returning a BLOCKING connected socket on success or
 /// `-1` on any failure (the caller denies — never a direct-dial fallback, which would bypass the
@@ -761,15 +746,22 @@ fn set_recv_timeout(fd: RawFd, secs: i64) {
 /// `set_proxy_env` hands a cooperating client. Runs in the supervisor thread (unconfined), all raw
 /// libc + blocking I/O; a 10s recv timeout guards the handshake read and is cleared before the
 /// socket is handed back, so the tunnel the child inherits has no timeout. (epic 5.1)
-fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) -> RawFd {
+fn proxy_connect_tcp(
+    control: &WorkerControl,
+    proxy_port: u16,
+    token: &str,
+    authority: &str,
+    dport: u16,
+) -> RawFd {
     use base64::Engine;
-    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if s < 0 {
         return -1;
     }
     let sa = make_sockaddr_in(u32::from_ne_bytes([127, 0, 0, 1]), proxy_port);
     if unsafe {
-        libc::connect(
+        connect_interruptible(
+            control,
             s,
             &sa as *const _ as *const libc::sockaddr,
             size_of::<libc::sockaddr_in>() as libc::socklen_t,
@@ -779,7 +771,6 @@ fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) 
         unsafe { libc::close(s) };
         return -1;
     }
-    set_recv_timeout(s, 10);
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("{token}:"));
     let req = format!(
         "CONNECT {authority}:{dport} HTTP/1.1\r\nHost: {authority}:{dport}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
@@ -787,11 +778,19 @@ fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) 
     let bytes = req.as_bytes();
     let mut off = 0usize;
     while off < bytes.len() {
+        if !control
+            .wait(s, libc::POLLOUT, Some(std::time::Duration::from_secs(10)))
+            .unwrap_or(false)
+        {
+            unsafe { libc::close(s) };
+            return -1;
+        }
         let n = unsafe {
-            libc::write(
+            libc::send(
                 s,
                 bytes.as_ptr().add(off) as *const libc::c_void,
                 bytes.len() - off,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
             )
         };
         if n <= 0 {
@@ -807,6 +806,12 @@ fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) 
     let mut len = 0usize;
     let ok = loop {
         if len >= buf.len() {
+            break false;
+        }
+        if !control
+            .wait(s, libc::POLLIN, Some(std::time::Duration::from_secs(10)))
+            .unwrap_or(false)
+        {
             break false;
         }
         let n = unsafe {
@@ -834,7 +839,6 @@ fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) 
         }
     };
     if ok {
-        set_recv_timeout(s, 0); // clear before handing the tunnel to the child
         s
     } else {
         unsafe { libc::close(s) };
@@ -842,119 +846,18 @@ fn proxy_connect_tcp(proxy_port: u16, token: &str, authority: &str, dport: u16) 
     }
 }
 
-/// Bind a loopback UDP socket, run the forward-and-record loop on it, and return the
-/// bound port. `upstream_be` is the real resolver in network byte order.
-fn start_stub() -> io::Result<()> {
-    // pick the upstream: /etc/resolv.conf's first `nameserver`, else 127.0.0.53
-    let mut upstream_be: u32 = u32::from_ne_bytes([127, 0, 0, 53]);
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            if let Some(ip) = line.strip_prefix("nameserver ")
-                && let Some(be) = parse_ipv4(ip.trim())
-            {
-                upstream_be = be;
-                break;
-            }
-        }
-    }
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut bind_addr = make_sockaddr_in(u32::from_ne_bytes([127, 0, 0, 1]), 0);
-    if unsafe {
-        libc::bind(
-            fd,
-            &bind_addr as *const _ as *const libc::sockaddr,
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    } < 0
-    {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
-    let mut sl = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe { libc::getsockname(fd, &mut bind_addr as *mut _ as *mut libc::sockaddr, &mut sl) };
-    let port = u16::from_be(bind_addr.sin_port);
-    {
-        let mut st = state().lock().unwrap();
-        st.upstream_addr_be = upstream_be;
-        st.stub_port = port;
-    }
-    suplog!(
-        "SUP stub resolver 127.0.0.1:{port} -> upstream {}",
-        fmt_ip(libc::AF_INET, &upstream_be.to_ne_bytes())
-    );
-    std::thread::spawn(move || stub_loop(fd, upstream_be));
-    Ok(())
-}
-
-fn stub_loop(fd: RawFd, upstream_be: u32) {
-    let mut q = [0u8; 1500];
-    let mut r = [0u8; 4096];
-    loop {
-        let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut fl = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let n = unsafe {
-            libc::recvfrom(
-                fd,
-                q.as_mut_ptr() as *mut libc::c_void,
-                q.len(),
-                0,
-                &mut from as *mut _ as *mut libc::sockaddr,
-                &mut fl,
-            )
-        };
-        if n <= 0 {
-            continue;
-        }
-        let n = n as usize;
-        let u = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-        if u < 0 {
-            continue;
-        }
-        let tv = libc::timeval {
-            tv_sec: 3,
-            tv_usec: 0,
-        };
-        unsafe {
-            libc::setsockopt(
-                u,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        let up = make_sockaddr_in(upstream_be, 53);
-        let connected = unsafe {
-            libc::connect(
-                u,
-                &up as *const _ as *const libc::sockaddr,
-                size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        } == 0;
-        if connected
-            && unsafe { libc::send(u, q.as_ptr() as *const libc::c_void, n, 0) } == n as isize
-        {
-            let rn = unsafe { libc::recv(u, r.as_mut_ptr() as *mut libc::c_void, r.len(), 0) };
-            if rn > 0 {
-                parse_response(&r[..rn as usize]);
-                unsafe {
-                    libc::sendto(
-                        fd,
-                        r.as_ptr() as *const libc::c_void,
-                        rn as usize,
-                        0,
-                        &from as *const _ as *const libc::sockaddr,
-                        fl,
-                    )
-                };
-            }
-        }
-        unsafe { libc::close(u) };
-    }
+fn upstream_resolver() -> u32 {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == "nameserver")
+                    .then(|| parse_ipv4(fields.next()?))
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| u32::from_ne_bytes([127, 0, 0, 53]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +997,7 @@ fn join_full(canon: &str, base: &str) -> String {
 /// allowed — perform the operation itself relative to the verified parent, splicing any opened
 /// fd back with `ADDFD`. The child's memory is never consulted after the single read, so there
 /// is nothing to race. Replies to `nfd` itself (errno on denial/failure, value on success).
-fn handle_write_intent(nfd: RawFd, req: &SeccompNotif) {
+fn handle_write_intent(state: &SupState, nfd: RawFd, req: &SeccompNotif) {
     let nr = req.data.nr as libc::c_long;
     let a = &req.data.args;
     // Per-syscall argument layout: which args hold (dirfd, path) and the optional second pair.
@@ -1145,7 +1048,7 @@ fn handle_write_intent(nfd: RawFd, req: &SeccompNotif) {
     // The broker is THE write-intent authority for a supervised launch (it performs opens
     // outside Landlock), so it must apply the FULL fs write policy — the allow-only base AND the
     // deny carve-outs — not just the denies (A6). No matcher ⇒ not armed; let the child run.
-    let Some(matcher) = state().lock().unwrap().write_matcher() else {
+    let Some(matcher) = state.write_matcher() else {
         reply_continue(nfd, req.id);
         return;
     };
@@ -1229,7 +1132,7 @@ fn handle_write_intent(nfd: RawFd, req: &SeccompNotif) {
                     libc::openat(
                         pfd,
                         cstr(&base).as_ptr(),
-                        flags & !libc::O_CLOEXEC,
+                        flags | libc::O_CLOEXEC,
                         mode as libc::c_uint,
                     )
                 };
@@ -1351,7 +1254,7 @@ fn handle_write_intent(nfd: RawFd, req: &SeccompNotif) {
                     libc::openat(
                         pfd,
                         cstr(&base).as_ptr(),
-                        libc::O_WRONLY | libc::O_NOFOLLOW,
+                        libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                         0,
                     )
                 };
@@ -1422,9 +1325,129 @@ fn cstr(s: &str) -> CString {
 // the supervisor loop
 // ---------------------------------------------------------------------------
 
-static DNS_SLOT: AtomicU32 = AtomicU32::new(0);
+/// One cancellation descriptor wakes both notification polling and outbound I/O. Keeping it
+/// separate from the listener avoids closing a descriptor while another thread is using it.
+struct WorkerControl(OwnedFd);
 
-fn supervisor(nfd: RawFd) {
+impl WorkerControl {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn cancel(&self) {
+        let value = 1u64;
+        // An already-readable eventfd remains cancelled; no thread drains it.
+        unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                &value as *const _ as *const libc::c_void,
+                8,
+            )
+        };
+    }
+
+    fn wait(
+        &self,
+        fd: RawFd,
+        events: i16,
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<bool> {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        loop {
+            let millis = deadline.map_or(-1, |end| {
+                end.saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32
+            });
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.0.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd,
+                    events,
+                    revents: 0,
+                },
+            ];
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result == 0 || fds[0].revents != 0 {
+                return Ok(false);
+            }
+            // Deliver readable bytes even alongside HUP (e.g. the final proxy response).
+            return Ok(fds[1].revents & events != 0);
+        }
+    }
+}
+
+/// Dial without blocking shutdown on the kernel's TCP retry budget. The returned socket keeps
+/// its original blocking disposition; the caller later applies the target's socket flags.
+unsafe fn connect_interruptible(
+    control: &WorkerControl,
+    fd: RawFd,
+    addr: *const libc::sockaddr,
+    len: libc::socklen_t,
+) -> i32 {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return -1;
+    }
+    let result = unsafe { libc::connect(fd, addr, len) };
+    let result = if result == 0 {
+        0
+    } else if errno() == libc::EINPROGRESS {
+        if control
+            .wait(fd, libc::POLLOUT, Some(std::time::Duration::from_secs(30)))
+            .unwrap_or(false)
+        {
+            let mut error = 0i32;
+            let mut size = size_of::<i32>() as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut error as *mut _ as *mut libc::c_void,
+                    &mut size,
+                )
+            } == 0
+                && error == 0
+            {
+                0
+            } else {
+                unsafe { *libc::__errno_location() = if error == 0 { libc::EIO } else { error } };
+                -1
+            }
+        } else {
+            unsafe { *libc::__errno_location() = libc::ECANCELED };
+            -1
+        }
+    } else {
+        -1
+    };
+    let error = errno();
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return -1;
+    }
+    unsafe { *libc::__errno_location() = error };
+    result
+}
+
+fn supervisor(listener: OwnedFd, mut state: SupState, control: Arc<WorkerControl>) {
+    let nfd = listener.as_raw_fd();
+    let mut dns_slot = 0u32;
     loop {
         // Wait for a notification OR a listener hangup. `poll` separates two events a bare
         // `NOTIF_RECV` conflates onto one ENOENT: "the target died" (exit — the filter is being
@@ -1436,23 +1459,8 @@ fn supervisor(nfd: RawFd) {
         // with the exit-on-error loop too (the earlier "0/8" was a test-harness `xargs -I _` bug,
         // not the supervisor). This is hardening against the race the kernel docs and the route.c
         // measurement (other kernels) describe, not a fix for a failure observed on this host.
-        let mut pfd = libc::pollfd {
-            fd: nfd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
-        if pr < 0 {
-            if errno() == libc::EINTR {
-                continue;
-            }
-            return; // the listener itself is unusable
-        }
-        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return; // the target is gone and the filter is being torn down — the clean exit
-        }
-        if pfd.revents & libc::POLLIN == 0 {
-            continue;
+        if !control.wait(nfd, libc::POLLIN, None).unwrap_or(false) {
+            return;
         }
         let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
         if ioctl_notif(nfd, notif_recv(), &mut req as *mut _ as *mut libc::c_void) < 0 {
@@ -1468,7 +1476,7 @@ fn supervisor(nfd: RawFd) {
         // built with the write branch (a policy carried carve-outs), so this is inert for the
         // build jail.
         if is_write_intent(nr) {
-            handle_write_intent(nfd, &req);
+            handle_write_intent(&state, nfd, &req);
             continue;
         }
 
@@ -1476,7 +1484,7 @@ fn supervisor(nfd: RawFd) {
         if nr == libc::SYS_recvfrom || nr == libc::SYS_read || nr == libc::SYS_recvmsg {
             let tg = tgid_of(req.pid);
             let dup = {
-                let st = state().lock().unwrap();
+                let st = &state;
                 st.sk
                     .iter()
                     .find(|e| e.tgid == tg && e.fd == cfd && e.dns)
@@ -1485,29 +1493,23 @@ fn supervisor(nfd: RawFd) {
             };
             if dup >= 0 {
                 let mut r = [0u8; 4096];
-                let tv = libc::timeval {
-                    tv_sec: 3,
-                    tv_usec: 0,
-                };
-                unsafe {
-                    libc::setsockopt(
-                        dup,
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVTIMEO,
-                        &tv as *const _ as *const libc::c_void,
-                        size_of::<libc::timeval>() as libc::socklen_t,
-                    )
-                };
+                let ready = control
+                    .wait(dup, libc::POLLIN, Some(std::time::Duration::from_secs(3)))
+                    .unwrap_or(false);
+                if !ready {
+                    reply_continue(nfd, req.id);
+                    continue;
+                }
                 let rn = unsafe {
                     libc::recv(
                         dup,
                         r.as_mut_ptr() as *mut libc::c_void,
                         r.len(),
-                        libc::MSG_PEEK,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
                     )
                 };
                 if rn > 0 {
-                    parse_response(&r[..rn as usize]);
+                    parse_response(&mut state, &r[..rn as usize]);
                 }
             }
             reply_continue(nfd, req.id);
@@ -1546,7 +1548,7 @@ fn supervisor(nfd: RawFd) {
                 reply_continue(nfd, req.id);
                 continue;
             }
-            let s = unsafe { libc::socket(dom, typ, pro) };
+            let s = unsafe { libc::socket(dom, typ | libc::SOCK_CLOEXEC, pro) };
             if s < 0 {
                 reply(nfd, req.id, -errno());
                 continue;
@@ -1564,7 +1566,8 @@ fn supervisor(nfd: RawFd) {
             let is_dgram = (typ & 0xff) == libc::SOCK_DGRAM;
             if is_dgram {
                 af.flags = SECCOMP_ADDFD_FLAG_SETFD;
-                let slot = DNS_SLOT.fetch_add(1, Ordering::Relaxed) % 64;
+                let slot = dns_slot % 64;
+                dns_slot = dns_slot.wrapping_add(1);
                 af.newfd = DNS_FD_LO + slot;
             }
             let mut newfd = ioctl_notif(nfd, notif_addfd(), &mut af as *mut _ as *mut libc::c_void);
@@ -1577,7 +1580,7 @@ fn supervisor(nfd: RawFd) {
                 continue;
             }
             {
-                let mut st = state().lock().unwrap();
+                let st = &mut state;
                 st.sk_put(tgid_of(req.pid), newfd, dom, typ & 0xff);
             }
             let mut r = SeccompNotifResp {
@@ -1594,7 +1597,7 @@ fn supervisor(nfd: RawFd) {
         let tgid = tgid_of(req.pid);
         let (mut dom, mut typ): (i32, i32) = (-1, -1);
         let by_construction = {
-            let st = state().lock().unwrap();
+            let st = &state;
             match st.sk_get(tgid, cfd) {
                 Some((d, t)) => {
                     dom = d;
@@ -1694,10 +1697,12 @@ fn supervisor(nfd: RawFd) {
         if typ == libc::SOCK_DGRAM {
             if port == 53 {
                 let (upstream_be,) = {
-                    let st = state().lock().unwrap();
+                    let st = &state;
                     (st.upstream_addr_be,)
                 };
-                s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+                s = unsafe {
+                    libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
+                };
                 let up = make_sockaddr_in(upstream_be, 53);
                 if unsafe {
                     libc::connect(
@@ -1712,11 +1717,16 @@ fn supervisor(nfd: RawFd) {
                         "SUP DNS-UDP asked {ip}:{port} -> dialed upstream {}:53 (observed via peek)",
                         fmt_ip(libc::AF_INET, &upstream_be.to_ne_bytes())
                     );
-                    let dupfd = unsafe { libc::dup(s) };
-                    let mut st = state().lock().unwrap();
+                    let dupfd = unsafe { libc::fcntl(s, libc::F_DUPFD_CLOEXEC, 3) };
+                    let st = &mut state;
                     if let Some(e) = st.sk.iter_mut().find(|e| e.tgid == tgid && e.fd == cfd) {
+                        if e.dup >= 0 {
+                            unsafe { libc::close(e.dup) };
+                        }
                         e.dns = true;
                         e.dup = dupfd;
+                    } else if dupfd >= 0 {
+                        unsafe { libc::close(dupfd) };
                     }
                 } else {
                     suplog!("SUP DENY UDP {ip}:{port} (dial upstream failed)");
@@ -1727,7 +1737,7 @@ fn supervisor(nfd: RawFd) {
         } else if typ == libc::SOCK_STREAM {
             let loopback = fam == libc::AF_INET && addr[0] == 127;
             let name = {
-                let st = state().lock().unwrap();
+                let st = &state;
                 st.lookup(fam, &addr[..n])
             };
             // The proxy config, copied from `EgressPolicy` before the fork (epic 5.1). `Some` ⇒ a
@@ -1736,7 +1746,7 @@ fn supervisor(nfd: RawFd) {
             // always dialed directly — the proxy is itself loopback, so routing loopback through it
             // would loop, and the child reaching its own loopback services is not egress.
             let proxy = {
-                let st = state().lock().unwrap();
+                let st = &state;
                 st.proxy_port
                     .map(|p| (p, st.proxy_token.clone().unwrap_or_default()))
             };
@@ -1750,7 +1760,7 @@ fn supervisor(nfd: RawFd) {
                 // ALLOWED host's IP is dropped at the SNI gate). On ANY dial/handshake failure we
                 // deny; never fall back to a direct dial, which would bypass the SNI gate. (5.1 L3/L4)
                 let authority = name.clone().unwrap_or_else(|| ip.clone());
-                s = proxy_connect_tcp(pport, &ptoken, &authority, port);
+                s = proxy_connect_tcp(&control, pport, &ptoken, &authority, port);
                 if s >= 0 {
                     verdict_err = 0;
                     suplog!("SUP PROXY {ip}:{port} authority={authority} -> 127.0.0.1:{pport}");
@@ -1760,13 +1770,14 @@ fn supervisor(nfd: RawFd) {
                 }
             } else {
                 let allow = {
-                    let st = state().lock().unwrap();
+                    let st = &state;
                     st.allowed(name.as_deref())
                 };
                 if loopback || allow {
-                    s = unsafe { libc::socket(fam, libc::SOCK_STREAM, 0) };
+                    s = unsafe { libc::socket(fam, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
                     if unsafe {
-                        libc::connect(
+                        connect_interruptible(
+                            &control,
                             s,
                             &ss as *const _ as *const libc::sockaddr,
                             alen as libc::socklen_t,
@@ -1900,116 +1911,6 @@ impl EgressPolicy {
     }
 }
 
-/// Fork `argv` under the connect-notifier, hand its listener fd to an in-process supervisor
-/// thread over a plain pipe, and wait for it. Returns the child's exit code.
-///
-/// SAFETY / DESIGN NOTE: this is the standalone (route.c-shaped) driver — it forks and the
-/// child performs only async-signal-safe raw syscalls before `execve`. Embedding this into a
-/// library launch path (where the confined child is spawned via `Command`/`pre_exec` rather
-/// than a bespoke fork) is deliberately left to the sandbox launch code.
-pub fn run_supervised(policy: EgressPolicy, argv: &[CString]) -> io::Result<i32> {
-    // Build the filter in the PARENT (allocation is fine here); `fork` copies it into the child,
-    // which installs it with no post-fork allocation.
-    let filter = notifier_program(policy.write_broker());
-    {
-        let mut st = state().lock().unwrap();
-        st.allow_all = policy.allow_all;
-        st.allow = policy.allow.clone();
-        st.write_matcher = policy
-            .write_policy
-            .as_ref()
-            .map(|s| Arc::new(PathMatcher::new(s)));
-        st.proxy_port = policy.proxy_port;
-        st.proxy_token = policy.proxy_token.clone();
-    }
-    start_stub()?;
-
-    // child->parent (fd number) and parent->child (go) plain pipes
-    let mut c2p = [0i32; 2];
-    let mut p2c = [0i32; 2];
-    if unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 || unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    let argv_ptrs: Vec<*const libc::c_char> = argv
-        .iter()
-        .map(|a| a.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if pid == 0 {
-        // ---- child ---- (async-signal-safe only)
-        unsafe {
-            libc::close(c2p[0]);
-            libc::close(p2c[1]);
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
-                libc::_exit(2);
-            }
-            let nfd = install_notifier(&filter);
-            if nfd < 0 {
-                libc::_exit(3);
-            }
-            // write the listener fd NUMBER (never SCM_RIGHTS) down the pipe
-            let nfd_bytes = nfd.to_ne_bytes();
-            if libc::write(c2p[1], nfd_bytes.as_ptr() as *const libc::c_void, 4) != 4 {
-                libc::_exit(4);
-            }
-            let mut go = [0u8; 1];
-            if libc::read(p2c[0], go.as_mut_ptr() as *mut libc::c_void, 1) != 1 {
-                libc::_exit(5);
-            }
-            libc::close(nfd);
-            libc::close(c2p[1]);
-            libc::close(p2c[0]);
-            libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
-            libc::_exit(9);
-        }
-    }
-
-    // ---- parent ----
-    unsafe {
-        libc::close(c2p[1]);
-        libc::close(p2c[0]);
-    }
-    let mut child_nfd_bytes = [0u8; 4];
-    let got = unsafe { libc::read(c2p[0], child_nfd_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
-    if got != 4 {
-        let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
-        return Err(io::Error::other("child did not hand over its notifier fd"));
-    }
-    let child_nfd = i32::from_ne_bytes(child_nfd_bytes);
-    let pf = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
-    let nfd = if pf >= 0 {
-        unsafe { libc::syscall(libc::SYS_pidfd_getfd, pf, child_nfd, 0) as RawFd }
-    } else {
-        -1
-    };
-    if nfd < 0 {
-        let e = io::Error::last_os_error();
-        let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
-        return Err(e);
-    }
-    std::thread::spawn(move || supervisor(nfd));
-    let _ = unsafe { libc::write(p2c[1], b"g".as_ptr() as *const libc::c_void, 1) };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    if pf >= 0 {
-        unsafe { libc::close(pf) };
-    }
-    Ok(if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        -1
-    })
-}
-
 // ---------------------------------------------------------------------------
 // The library launch path: a bespoke-fork confined child + its supervisor thread.
 // ---------------------------------------------------------------------------
@@ -2029,18 +1930,92 @@ pub(super) struct SupervisedChild {
     pid: libc::pid_t,
     /// The `pidfd` opened to grab the listener; retained for a race-free kill in `Drop`.
     pidfd: RawFd,
-    /// The supervisor loop thread, held only so it is DETACHED (not joined) on wait/drop — see
-    /// [`SupervisedChild::wait`]. The thread self-terminates when the target dies (its filter is
-    /// torn down and `NOTIF_RECV` returns ENOENT); joining is still avoided so a stuck target
-    /// cannot block the reap.
+    /// Joined after cancellation; the thread owns the notification and DNS descriptors.
     supervisor: Option<std::thread::JoinHandle<()>>,
+    control: Arc<WorkerControl>,
     /// Set once `waitpid` has reaped `pid`, so `Drop` neither re-kills nor double-reaps.
     reaped: bool,
     /// The child leads its own session (`setsid`), so `-pid` names its whole descendant tree.
     group_leader: bool,
+    status: Option<std::process::ExitStatus>,
+    pub(super) stdin: Option<std::process::ChildStdin>,
+    pub(super) stdout: Option<std::process::ChildStdout>,
+    pub(super) stderr: Option<std::process::ChildStderr>,
 }
 
 impl SupervisedChild {
+    pub(super) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.stdin.take()
+    }
+    pub(super) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout.take()
+    }
+    pub(super) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.stderr.take()
+    }
+
+    pub(super) fn kill(&mut self) -> io::Result<()> {
+        if self.group_leader {
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        }
+        if self.reaped {
+            return Ok(());
+        }
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 && errno() != libc::ESRCH {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.reap(libc::WNOHANG)
+    }
+
+    fn reap(&mut self, flags: i32) -> io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let mut status = 0;
+        loop {
+            match unsafe { libc::waitpid(self.pid, &mut status, flags) } {
+                0 => return Ok(None),
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                _ => break,
+            }
+        }
+        self.reaped = true;
+        if self.group_leader {
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        }
+        self.stop_supervisor();
+        let status = std::process::ExitStatus::from_raw(status);
+        self.status = Some(status);
+        Ok(Some(status))
+    }
+
+    fn stop_supervisor(&mut self) {
+        self.control.cancel();
+        if let Some(worker) = self.supervisor.take() {
+            let _ = worker.join();
+        }
+    }
+
     pub(super) fn id(&self) -> u32 {
         self.pid as u32
     }
@@ -2056,53 +2031,22 @@ impl SupervisedChild {
     /// is its only handle on a build tool the child backgrounded. Joins the supervisor thread
     /// after reaping (it has already returned once the target is gone).
     pub(super) fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut status = 0;
-        loop {
-            if unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            break;
-        }
-        self.reaped = true;
-        if self.group_leader {
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-        }
-        // DETACH, never join. The thread self-terminates: once the target exits, its seccomp
-        // filter is torn down and the blocked `NOTIF_RECV` returns ENOENT, so the loop returns and
-        // the thread ends on its own (measured: one `RECV: No such file or directory` per launch).
-        // So this is not a leak — dropping the handle detaches a thread already on its way out. A
-        // JOIN here is nonetheless avoided: a stuck target (e.g. the pre-1.3 O_NONBLOCK hang, where
-        // the child never exited) would block the join forever, and reaping the child is the
-        // caller's contract, not "wait for the supervisor to notice." (epic 1.4d)
-        drop(self.supervisor.take());
-        Ok(std::process::ExitStatus::from_raw(status))
+        self.stdin.take();
+        self.reap(0)?
+            .ok_or_else(|| io::Error::other("blocking wait returned without a child status"))
     }
 }
 
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
         if !self.reaped {
-            let target = if self.group_leader {
-                -self.pid
-            } else {
-                self.pid
-            };
-            unsafe {
-                libc::kill(target, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(self.pid, &mut status, 0);
-            }
+            let _ = self.kill();
+            let _ = self.reap(0);
         }
         if self.pidfd >= 0 {
             unsafe { libc::close(self.pidfd) };
         }
-        // Detached, never joined — see [`SupervisedChild::wait`].
-        drop(self.supervisor.take());
+        self.stop_supervisor();
     }
 }
 
@@ -2124,11 +2068,216 @@ pub(super) struct SupervisedLaunch<'a> {
     /// Put the child in its own session (`setsid`): detaches the controlling terminal (the
     /// `TIOCSTI` defence) and gives the parent a group to reap.
     pub setsid: bool,
+    pub stdin: SupervisedStdio,
+    pub stdout: SupervisedStdio,
+    pub stderr: SupervisedStdio,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SupervisedStdio {
+    Inherit,
+    Null,
+    Piped,
+}
+
+struct LaunchIo {
+    child: Option<OwnedFd>,
+    parent: Option<OwnedFd>,
+}
+
+impl LaunchIo {
+    fn new(mode: SupervisedStdio, input: bool) -> io::Result<Self> {
+        match mode {
+            SupervisedStdio::Inherit => Ok(Self {
+                child: None,
+                parent: None,
+            }),
+            SupervisedStdio::Null => {
+                let file = std::fs::OpenOptions::new()
+                    .read(input)
+                    .write(!input)
+                    .open("/dev/null")?;
+                Ok(Self {
+                    child: Some(above_stdio(file.into())?),
+                    parent: None,
+                })
+            }
+            SupervisedStdio::Piped => {
+                let (read, write) = pipe_owned()?;
+                let (child, parent) = if input { (read, write) } else { (write, read) };
+                Ok(Self {
+                    child: Some(child),
+                    parent: Some(parent),
+                })
+            }
+        }
+    }
+}
+
+fn pipe_owned() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    // The launching program may itself have closed a standard stream. Never let a pipe
+    // occupy 0/1/2: dup2 of another stream would otherwise clobber a still-needed endpoint.
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    fn policy(host: &str) -> EgressPolicy {
+        EgressPolicy {
+            allow_all: false,
+            allow: vec![host.into()],
+            write_policy: None,
+            proxy_port: None,
+            proxy_token: None,
+        }
+    }
+
+    #[test]
+    fn policies_and_observed_dns_do_not_cross_launches() {
+        let mut first = SupState::new(policy("first.example"));
+        first.record("first.example", libc::AF_INET, &[192, 0, 2, 1]);
+        let second = SupState::new(policy("second.example"));
+        assert!(first.allowed(first.lookup(libc::AF_INET, &[192, 0, 2, 1]).as_deref()));
+        assert!(!second.allowed(Some("first.example")));
+        assert_eq!(second.lookup(libc::AF_INET, &[192, 0, 2, 1]), None);
+    }
+
+    #[test]
+    fn cancellation_wakes_an_idle_worker_and_stays_cancelled() {
+        let (read, _write) = pipe_owned().unwrap();
+        let control = Arc::new(WorkerControl::new().unwrap());
+        let worker_control = Arc::clone(&control);
+        let worker =
+            std::thread::spawn(move || worker_control.wait(read.as_raw_fd(), libc::POLLIN, None));
+        control.cancel();
+        assert!(!worker.join().unwrap().unwrap());
+        let (read, _write) = pipe_owned().unwrap();
+        assert!(
+            !control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_observes_readiness_timeout_and_hangup() {
+        let control = WorkerControl::new().unwrap();
+        let (read, write) = pipe_owned().unwrap();
+        let mut writer = std::fs::File::from(write);
+        assert!(
+            !control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+        writer.write_all(b"x").unwrap();
+        assert!(
+            control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+        std::fs::File::from(read).read_exact(&mut [0u8]).unwrap();
+        let (read, write) = pipe_owned().unwrap();
+        drop(write);
+        assert!(!control.wait(read.as_raw_fd(), libc::POLLIN, None).unwrap());
+    }
+
+    #[test]
+    fn launch_pipe_descriptors_are_private_and_close_on_exec() {
+        let (read, write) = pipe_owned().unwrap();
+        for fd in [read, write] {
+            assert!(fd.as_raw_fd() >= 3);
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Linux runner permitting unprivileged seccomp notification and pidfd_getfd"]
+    fn native_supervised_streams_status_and_repeated_launches() {
+        for _ in 0..24 {
+            let argv = [
+                CString::new("/bin/sh").unwrap(),
+                CString::new("-c").unwrap(),
+                CString::new("read line; printf 'out:%s' \"$line\"; printf err >&2; exit 7")
+                    .unwrap(),
+            ];
+            let launch = SupervisedLaunch {
+                argv: &argv,
+                envp: &[],
+                cwd: None,
+                ruleset_fd: -1,
+                seccomp_ceiling: None,
+                setsid: true,
+                stdin: SupervisedStdio::Piped,
+                stdout: SupervisedStdio::Piped,
+                stderr: SupervisedStdio::Piped,
+            };
+            let mut child = spawn_supervised(policy("example.test"), launch).unwrap();
+            child.take_stdin().unwrap().write_all(b"hello\n").unwrap();
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .take_stdout()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .take_stderr()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(7));
+            assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
+            assert_eq!(stdout, "out:hello");
+            assert_eq!(stderr, "err");
+        }
+    }
+}
+
+fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    let moved = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if moved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
+struct ForkGuard(libc::pid_t);
+
+impl Drop for ForkGuard {
+    fn drop(&mut self) {
+        if self.0 <= 0 {
+            return;
+        }
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+        loop {
+            if unsafe { libc::waitpid(self.0, std::ptr::null_mut(), 0) } >= 0
+                || errno() != libc::EINTR
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// Fork `launch.argv` as a fully-confined child under the connect-notifier, start its supervisor
-/// thread, and return a handle the caller reaps. This is [`run_supervised`]'s network machinery
-/// (DNS stub + supervisor + pidfd handoff) with the FULL child confinement a library launch needs
+/// thread, and return a handle the caller reaps. The supervisor and pidfd handoff retain the
+/// full child confinement a library launch needs
 /// (setsid, `PDEATHSIG`, cloexec sweep, `no_new_privs`, capability drop, Landlock, the seccomp
 /// ceiling) and returning rather than blocking on `waitpid`.
 pub(super) fn spawn_supervised(
@@ -2138,26 +2287,22 @@ pub(super) fn spawn_supervised(
     // Built in the PARENT and copied into the child by `fork`; the child installs it without
     // allocating. The write-intent dispatch is present only when the policy carries carve-outs.
     let filter = notifier_program(policy.write_broker());
-    {
-        let mut st = state().lock().unwrap();
-        st.allow_all = policy.allow_all;
-        st.allow = policy.allow.clone();
-        st.write_matcher = policy
-            .write_policy
-            .as_ref()
-            .map(|s| Arc::new(PathMatcher::new(s)));
-        st.proxy_port = policy.proxy_port;
-        st.proxy_token = policy.proxy_token.clone();
-    }
-    start_stub()?;
+    let state = SupState::new(policy);
+    let control = Arc::new(WorkerControl::new()?);
 
-    // child->parent (listener fd NUMBER) and parent->child ("go" barrier) plain pipes.
-    let mut c2p = [0i32; 2];
-    let mut p2c = [0i32; 2];
-    if unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 || unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0
-    {
-        return Err(io::Error::last_os_error());
+    if launch.argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty supervised argv",
+        ));
     }
+    let (c2p_read, c2p_write) = pipe_owned()?;
+    let (p2c_read, p2c_write) = pipe_owned()?;
+    let c2p = [c2p_read.as_raw_fd(), c2p_write.as_raw_fd()];
+    let p2c = [p2c_read.as_raw_fd(), p2c_write.as_raw_fd()];
+    let mut stdin = LaunchIo::new(launch.stdin, true)?;
+    let mut stdout = LaunchIo::new(launch.stdout, false)?;
+    let mut stderr = LaunchIo::new(launch.stderr, false)?;
 
     let argv_ptrs: Vec<*const libc::c_char> = launch
         .argv
@@ -2173,6 +2318,7 @@ pub(super) fn spawn_supervised(
         .collect();
     let cwd_ptr = launch.cwd.map(|c| c.as_ptr());
 
+    let owner_pid = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
@@ -2187,6 +2333,16 @@ pub(super) fn spawn_supervised(
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 libc::_exit(11);
+            }
+            if libc::getppid() != owner_pid {
+                libc::_exit(11);
+            }
+            for (stream, number) in [(&stdin, 0), (&stdout, 1), (&stderr, 2)] {
+                if let Some(fd) = &stream.child
+                    && libc::dup2(fd.as_raw_fd(), number) < 0
+                {
+                    libc::_exit(12);
+                }
             }
             // FIRST, before any restriction: the sweep opens `/proc/self/fd`, which Landlock
             // below would make unreadable. It marks c2p[1]/p2c[0]/ruleset CLOEXEC too, which is
@@ -2241,24 +2397,15 @@ pub(super) fn spawn_supervised(
     }
 
     // ---- parent ----
-    unsafe {
-        libc::close(c2p[1]);
-        libc::close(p2c[0]);
-    }
-    let reap = |pid: libc::pid_t| {
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-    };
+    use std::io::{Read, Write};
+    let mut pending = ForkGuard(pid);
+    drop(c2p_write);
+    drop(p2c_read);
+    stdin.child.take();
+    stdout.child.take();
+    stderr.child.take();
     let mut child_nfd_bytes = [0u8; 4];
-    let got = unsafe { libc::read(c2p[0], child_nfd_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
-    unsafe { libc::close(c2p[0]) };
-    if got != 4 {
-        unsafe { libc::close(p2c[1]) };
-        reap(pid);
-        return Err(io::Error::other(
-            "supervised child did not hand over its notifier fd",
-        ));
-    }
+    std::fs::File::from(c2p_read).read_exact(&mut child_nfd_bytes)?;
     let child_nfd = i32::from_ne_bytes(child_nfd_bytes);
     let pf = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
     let nfd = if pf >= 0 {
@@ -2271,22 +2418,32 @@ pub(super) fn spawn_supervised(
         if pf >= 0 {
             unsafe { libc::close(pf) };
         }
-        unsafe { libc::close(p2c[1]) };
-        reap(pid);
         return Err(e);
     }
-    let sup_thread = std::thread::spawn(move || supervisor(nfd));
-    // Release the barrier ONLY after the supervisor owns the listener — otherwise the child
-    // could execve and issue a filtered connect before anything services the notification.
-    let _ = unsafe { libc::write(p2c[1], b"g".as_ptr() as *const libc::c_void, 1) };
-    unsafe { libc::close(p2c[1]) };
-    Ok(SupervisedChild {
+    // The thread owns the listener and all duplicated DNS sockets. Cancellation is separate
+    // from listener hangup so shutdown also works when a descendant changed process groups.
+    let listener = unsafe { OwnedFd::from_raw_fd(nfd) };
+    let worker_control = Arc::clone(&control);
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pf) };
+    let sup_thread = std::thread::Builder::new()
+        .name("sandbox-egress".into())
+        .spawn(move || supervisor(listener, state, worker_control))?;
+    use std::os::fd::IntoRawFd;
+    let child = SupervisedChild {
         pid,
-        pidfd: pf,
+        pidfd: pidfd.into_raw_fd(),
         supervisor: Some(sup_thread),
+        control,
         reaped: false,
         group_leader: launch.setsid,
-    })
+        status: None,
+        stdin: stdin.parent.take().map(std::process::ChildStdin::from),
+        stdout: stdout.parent.take().map(std::process::ChildStdout::from),
+        stderr: stderr.parent.take().map(std::process::ChildStderr::from),
+    };
+    pending.0 = 0; // the returned handle now owns kill/reap, including a failed barrier write
+    std::fs::File::from(p2c_write).write_all(b"g")?;
+    Ok(child)
 }
 
 // ---------------------------------------------------------------------------

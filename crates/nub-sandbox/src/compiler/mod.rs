@@ -44,8 +44,7 @@ pub use package_network::{
 };
 pub use preset::build_jail_net_allowed_for;
 pub use preset::{
-    PROJECT_VIRTUAL_STORE_LEAF, compile_build_jail, jail_private_home,
-    relax_fs_read_to_disk_minus_secrets,
+    PROJECT_VIRTUAL_STORE_LEAF, compile_build_jail, jail_private_home, relax_fs_read_to_disk,
 };
 pub use resolve::{CommandRunner, ShellRunner};
 
@@ -134,10 +133,9 @@ pub struct CompileCtx {
     pub homes: Homes,
     /// The current working directory (for diagnostics / relative anchoring).
     pub cwd: std::path::PathBuf,
-    /// EVERY file the policy was sourced from (absolute, canonicalized). Each is injected
-    /// as a high-precedence fs DENY (read AND write) so a sandboxed process can neither
-    /// read nor tamper with the policy that confines it, even under a broad
-    /// `fs: ["."]`/`["/"]`. See `fold::finalize_policy_file_deny`.
+    /// EVERY file the policy was sourced from (absolute, canonicalized). Secure presets
+    /// may inject a high-precedence fs deny for these paths; authored filesystem policy is
+    /// positive-only and does not add implicit filesystem deny floors.
     ///
     /// A SET, not one path, because the source chain can be longer than one hop: a
     /// nub.jsonc `sandbox: "./policy.jsonc"` is confined by BOTH files, and denying only
@@ -207,12 +205,9 @@ impl CompileCtx {
         }
     }
 
-    /// Attach the policy SOURCE-FILE paths (absolute, canonicalized) so the compiler
-    /// self-excludes each from every fs grant. The caller passes the WHOLE chain — the
-    /// referencing config as well as the file it references — not just the document the
-    /// rules were literally read from. Empty (the default) leaves the policy with no
-    /// self-exclusion: the inline-policy case, where there is no source file to hide.
-    /// See [`CompileCtx::policy_files`].
+    /// Attach policy source-file paths (absolute, canonicalized). Secure presets consume
+    /// the whole source chain for their self-exclusion; generic authored policies preserve
+    /// their positive-only filesystem contract. See [`CompileCtx::policy_files`].
     pub fn with_policy_files(mut self, policy_files: Vec<std::path::PathBuf>) -> Self {
         self.policy_files = policy_files;
         self

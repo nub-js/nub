@@ -379,7 +379,17 @@ pub(crate) fn derive_grants(
         }]);
     }
     let plan = compile_mount_plan(policy)?;
-    reject_narrowing_grants(&plan)?;
+    // Authored positive grants union; a read allow is not a cap on an earlier write allow.
+    // Keep the conservative legacy check only for internal policies carrying real denies.
+    if policy
+        .fs
+        .rules
+        .entries
+        .iter()
+        .any(|rule| rule.effect == crate::policy::Effect::Deny)
+    {
+        reject_narrowing_grants(&plan)?;
+    }
 
     let mut grants: Vec<LandlockGrant> = Vec::new();
     for path in system_read_paths() {
@@ -970,16 +980,15 @@ mod tests {
         assert_eq!(RulesetAttr::size_for(6), std::mem::size_of::<RulesetAttr>());
     }
 
-    /// Landlock unions rules, so a read-only cap nested in a writable grant does not
-    /// restrict. Refuse rather than silently hand back write access.
+    /// Positive read grants do not take away a parent's write grant.
     #[test]
-    fn a_read_only_cap_inside_a_writable_grant_is_refused() {
+    fn a_read_only_allow_inside_a_writable_grant_unions() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("parent");
         let child = parent.join("child");
         std::fs::create_dir_all(&child).unwrap();
 
-        let error = derive_grants_for_test(&policy(
+        let grants = derive_grants_for_test(&policy(
             [
                 subtree(
                     &parent.to_string_lossy(),
@@ -992,10 +1001,11 @@ mod tests {
             .flatten()
             .collect(),
         ))
-        .expect_err("a narrowing cap must be refused, not silently widened");
+        .expect("positive access grants compose");
         assert!(
-            error.contains("rules union"),
-            "the refusal must name the mechanism: {error}"
+            grants
+                .iter()
+                .any(|grant| grant.path == parent && grant.access.grants_write())
         );
     }
 

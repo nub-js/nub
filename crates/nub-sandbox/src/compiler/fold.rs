@@ -33,6 +33,8 @@ const NEGATED_REUSE_MSG: &str = "`!...:#/pointer` (negated reuse) is not support
 /// An empty / whitespace-only fs entry used to expand to `**` (a silent whole-fs
 /// grant, fail-OPEN); it is now a hard shape error (D3).
 const EMPTY_FS_ENTRY_MSG: &str = "an empty fs entry is not allowed (it would grant the whole filesystem) — name a path or remove it";
+const USER_FS_DENY_MSG: &str =
+    "filesystem deny entries are not part of the public policy grammar — omit the path to deny it";
 /// `$tooldirs` is a SET (the built-in tool-cache dirs), not a directory root, so it
 /// takes no `/subpath` — a `$tooldirs/x` would silently name nothing. Fail loud.
 const TOOLDIRS_SUBPATH_MSG: &str = "`$tooldirs` is a built-in set (the package-manager / toolchain cache dirs) and takes no subpath — use it bare (`$tooldirs`) or with a permission (`{ \"$tooldirs\": \"r\" }`)";
@@ -95,23 +97,18 @@ pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, 
             ));
         }
     }
-    // Order is load-bearing: the policy-file deny goes in BEFORE the `.env*` floor so
-    // the two env-deny bands stay the LAST entries — that floor is recognized POSITIONALLY
-    // (`defaults::env_deny_floor_start`). The policy-file deny and the env bands are
-    // disjoint (a policy path is never a `.env*` basename), so their relative order does
-    // not affect either verdict; only the env-bands-last invariant matters.
-    finalize_policy_file_deny(&mut set, ctx);
-    finalize_env_deny(&mut set);
+    // Authored filesystem policy is positive-only. Secret filtering remains an environment
+    // concern; policy-file and secret-file denies belong only to explicit secure presets.
     Ok(FsPolicy { rules: set, tmp })
 }
 
-/// Self-exclude EVERY policy source file (`ctx.policy_files`) from every fs grant: append
+/// Secure presets self-exclude EVERY policy source file (`ctx.policy_files`) from every fs grant: append
 /// an exact-path DENY (read AND write) per file so a sandboxed process can neither read nor
 /// tamper with the policy that confines it, even under a broad `fs: ["."]`/`["/"]`. Mirrors
 /// [`finalize_env_deny`]: appended AFTER all user + default entries, so last-match-wins
 /// makes it authoritative over any earlier allow of those exact paths.
 ///
-/// Skipped in the same two cases the `.env*` floor is (and for the same reason — the deny
+/// Skipped in the same two cases the secure secret-file floor is (and for the same reason — the deny
 /// would be inert noise): a FULLY-relaxed axis (`fs: true` — the explicit escape hatch),
 /// and a no-read policy (a deny of an already-unreadable file; and since fs has no
 /// write-without-read, no read ⇒ no write ⇒ the file is already fully denied). An empty
@@ -133,17 +130,12 @@ fn finalize_policy_file_deny(set: &mut FsRuleSet, ctx: &CompileCtx) {
     );
 }
 
-/// A `$tmp` sentinel malformed by a suffix that is neither empty nor a path separator
-/// (`$tmp*`, `$tmp.bak`). Rejected loud rather than folded: `expand_symbolic` would otherwise
-/// root it at the SHARED host tmp, the exact leak the sentinel exists to prevent — so any
-/// `$tmp`-named form that is not the bare sentinel or a `$tmp/subpath` is an error. (`$tmpx`
-/// is a DIFFERENT `$name`, not this — it is caught as an unrecognized sentinel instead.)
-const MALFORMED_TMP_MSG: &str = "malformed `$tmp` sentinel — use `$tmp` (a fresh per-run private tmp dir) or `$tmp/subpath` (a path inside it); `$tmp` followed by anything else is not a path into the shared system tmp — grant the literal `/tmp` for that";
+/// `$tmp` is a managed per-run directory. A suffix cannot name a stable path, so reject it.
+const MALFORMED_TMP_MSG: &str = "`$tmp` is a managed per-run directory and takes no suffix — use bare `$tmp`; grant a literal path for a specific shared-temp location";
 
 /// Classify a trimmed key/entry against the `$tmp` sentinel. Identifier-boundary aware
-/// (via [`split_fs_sentinel`]) so `$tmpx` is the `$name` `tmpx` (NotTmp — the unrecognized-
-/// sentinel path rejects it), while `$tmp` / `$tmp{/,\}subpath` is the sentinel and any other
-/// remainder after the `tmp` name (`$tmp*`, `$tmp.bak`) is malformed — the leak guard.
+/// (via [`split_fs_sentinel`]) so `$tmpx` remains the different `$name` `tmpx`; only bare
+/// `$tmp` is the sentinel and every suffix is malformed rather than silently ignored.
 enum TmpKey {
     Sentinel,
     Malformed,
@@ -151,20 +143,15 @@ enum TmpKey {
 }
 fn classify_tmp_key(k: &str) -> TmpKey {
     match crate::matcher::path::split_fs_sentinel(k) {
-        Some(("tmp", rest)) if rest.is_empty() || rest.starts_with(['/', '\\']) => TmpKey::Sentinel,
+        Some(("tmp", rest)) if rest.is_empty() => TmpKey::Sentinel,
         Some(("tmp", _)) => TmpKey::Malformed,
         _ => TmpKey::NotTmp,
     }
 }
 
-/// Fold a `$tmp`-prefixed key into a tmp MODE. `$tmp` (and any `$tmp/subpath`) denotes the
-/// per-run PRIVATE dir — a subpath maps INTO that dir, never the shared system tmp — so the
-/// value is a plain fs permission on it: a truthy grant (`"r"`/`"rw"`/`true`) → `Private`
-/// (provision the fresh dir + grant it rw); `false` → `Deny` (no tmp). Read-only on a fresh
-/// empty dir is degenerate, so `"r"` is treated as `"rw"` — `Private` always grants rw. The
-/// whole private subtree is backend-granted, so a `$tmp/x` key needs no path rule of its own;
-/// the caller consumes a `Some` and emits nothing. `None` for a normal (non-`$tmp`) key; a
-/// malformed `$tmp` suffix is a hard error (it would otherwise leak into the shared host tmp).
+/// Fold a bare `$tmp` key into a tmp MODE. `"rw"`/`true` provisions a fresh private dir and
+/// `false` disables it. Read-only is invalid because a fresh scratch directory is writable;
+/// the backend grants the whole managed subtree, so the caller emits no path rule.
 fn parse_tmp_mode(key: &str, val: &Value, path: &str) -> Result<Option<TmpMode>, CompileError> {
     match classify_tmp_key(key.trim()) {
         TmpKey::NotTmp => return Ok(None),
@@ -174,33 +161,31 @@ fn parse_tmp_mode(key: &str, val: &Value, path: &str) -> Result<Option<TmpMode>,
     let mode = match val {
         Value::Bool(true) => TmpMode::Private,
         Value::Bool(false) => TmpMode::Deny,
-        Value::String(s) if s == "r" || s == "rw" => TmpMode::Private,
+        Value::String(s) if s == "rw" => TmpMode::Private,
         _ => {
             return Err(CompileError::shape(
                 path,
-                "`$tmp` takes an fs permission: \"r\"/\"rw\"/`true` (a fresh per-run private tmp dir, shared system tmp hidden) or `false` (no tmp) — for the shared system tmp, grant the literal path `/tmp`",
+                "`$tmp` takes only \"rw\"/`true` (a fresh per-run private tmp dir) or `false` (no tmp); read-only cannot use a fresh writable scratch directory",
             ));
         }
     };
     Ok(Some(mode))
 }
 
-/// Array-form `$tmp` sentinel → tmp MODE. A `$tmp` / `$tmp/subpath` entry is `Private`
-/// (array grants are rw); a `!`-negated one is `Deny`. `None` for a normal entry; a malformed
-/// `$tmp` suffix errors, same as the object [`parse_tmp_mode`], so the two agree on the class.
+/// Array-form bare `$tmp` selects private mode. User deny spelling and every suffix reject;
+/// object-form `false` is the explicit no-tmp form.
 fn parse_tmp_mode_array(entry: &str, path: &str) -> Result<Option<TmpMode>, CompileError> {
     let (body, deny) = match entry.trim().strip_prefix('!') {
         Some(rest) => (rest.trim_start(), true),
         None => (entry.trim(), false),
     };
+    if deny && !matches!(classify_tmp_key(body), TmpKey::NotTmp) {
+        return Err(CompileError::shape(path, USER_FS_DENY_MSG));
+    }
     match classify_tmp_key(body) {
         TmpKey::NotTmp => Ok(None),
         TmpKey::Malformed => Err(CompileError::shape(path, MALFORMED_TMP_MSG)),
-        TmpKey::Sentinel => Ok(Some(if deny {
-            TmpMode::Deny
-        } else {
-            TmpMode::Private
-        })),
+        TmpKey::Sentinel => Ok(Some(TmpMode::Private)),
     }
 }
 
@@ -224,8 +209,7 @@ fn classify_tooldirs_key(k: &str) -> ToolsKey {
 
 /// Array-form `$tooldirs` set → its fs rules, emitted IN-PLACE (last-match order
 /// preserved). A bare `$tooldirs` grants ReadWrite (array grants are rw, like a bare
-/// path); `!$tooldirs` denies each dir (expand-then-negate, grammar-uniform with
-/// `!path`). Returns `Ok(true)` when the entry was a `$tooldirs` set (consumed),
+/// path). Returns `Ok(true)` when the entry was a `$tooldirs` set (consumed),
 /// `Ok(false)` for a normal entry the caller then folds itself.
 fn fold_tooldirs_array_entry(
     entry: &str,
@@ -241,20 +225,26 @@ fn fold_tooldirs_array_entry(
         ToolsKey::NotTooldirs => Ok(false),
         ToolsKey::WithSubpath => Err(CompileError::shape(path, TOOLDIRS_SUBPATH_MSG)),
         ToolsKey::Set => {
-            let effect = if deny { Effect::Deny } else { Effect::Allow };
-            out.extend(builtin_sets::tooldirs_fs_rules(
-                &ctx.homes,
-                effect,
-                FsAccess::ReadWrite,
-            ));
+            if deny {
+                return Err(CompileError::shape(path, USER_FS_DENY_MSG));
+            }
+            out.extend(
+                builtin_sets::tooldirs_fs_rules_with_env(
+                    &ctx.homes,
+                    &ctx.ambient_env,
+                    Effect::Allow,
+                    FsAccess::ReadWrite,
+                )
+                .map_err(|message| CompileError::shape(path, &message))?,
+            );
             Ok(true)
         }
     }
 }
 
 /// Object-form `$tooldirs` set → its fs rules. The value uses the SAME access ladder as
-/// an ordinary path key ([`parse_fs_object_access`]): `"r"`→Read, `"rw"`/`true`→ReadWrite,
-/// `false`→Deny. Returns `Ok(true)` when the key was a `$tooldirs` set (consumed).
+/// an ordinary path key ([`parse_fs_object_access`]): `"r"`→Read and `"rw"`/`true`→ReadWrite.
+/// User `false` deny grammar is rejected. Returns `Ok(true)` when consumed.
 fn fold_tooldirs_object_entry(
     key: &str,
     val: &Value,
@@ -268,11 +258,17 @@ fn fold_tooldirs_object_entry(
         ToolsKey::Set => {}
     }
     let (effect, access) = parse_fs_object_access(val, path)?;
-    out.extend(builtin_sets::tooldirs_fs_rules(&ctx.homes, effect, access));
+    if effect == Effect::Deny {
+        return Err(CompileError::shape(path, USER_FS_DENY_MSG));
+    }
+    out.extend(
+        builtin_sets::tooldirs_fs_rules_with_env(&ctx.homes, &ctx.ambient_env, effect, access)
+            .map_err(|message| CompileError::shape(path, &message))?,
+    );
     Ok(true)
 }
 
-/// Inject the default secret-FILE READ-deny (`.env*` + `.npmrc`) as an UNCONDITIONAL floor
+/// Inject the secure-preset secret-FILE READ-deny (`.env*` + `.npmrc`) as an UNCONDITIONAL floor
 /// — the highest-precedence rule on the fs axis, which no directory grant, glob, or exact
 /// path can reopen (sandbox.mdx "`.env` files are always blocked"). `.env*` files hold the
 /// exact secrets the sandbox scrubs; a project-local `.npmrc` can hardcode a registry token
@@ -306,8 +302,8 @@ fn finalize_env_deny(set: &mut FsRuleSet) {
 }
 
 /// One entry of the fs Array form — the per-item body, shared by direct entries and
-/// each entry of a `...:#/pointer`-spliced list so reuse composes with `$tmp` mode,
-/// `$tooldirs`, and the `.env*` floor for free (the P3↔P4 seam). Reuse is checked
+/// each entry of a `...:#/pointer`-spliced list so reuse composes with `$tmp` mode and
+/// `$tooldirs`. Secure presets add their own secret-file floor after folding. Reuse is checked
 /// FIRST; a naked `...`/`!...` is a migration error; then `$tmp` mode, `$tooldirs`, and
 /// the ordinary path. `tmp`/`out` are the OUTER accumulators (a spliced `$tmp` sets the
 /// outer mode); `stack` is the reuse resolution stack for cycle detection.
@@ -356,7 +352,7 @@ fn fold_fs_array_entry(
         return Err(CompileError::shape(path, EMPTY_FS_ENTRY_MSG));
     }
     let (pattern, effect) = match s.strip_prefix('!') {
-        Some(rest) => (rest, Effect::Deny),
+        Some(_) => return Err(CompileError::shape(path, USER_FS_DENY_MSG)),
         None => (s, Effect::Allow),
     };
     // `$(…)` resolves AFTER the `!` strip so a command's stdout is a path, never a
@@ -420,6 +416,9 @@ fn fold_fs_object_entry(
         return Err(CompileError::shape(path, EMPTY_FS_ENTRY_MSG));
     }
     let (effect, access) = parse_fs_object_access(val, path)?;
+    if effect == Effect::Deny {
+        return Err(CompileError::shape(path, USER_FS_DENY_MSG));
+    }
     // Resolve `$(…)` in the path key AFTER validating the access value, so an
     // invalid `val` errors before any command runs (no wasted exec side effect).
     let pattern = resolve_fs_path(key, ctx, path)?;
@@ -428,9 +427,8 @@ fn fold_fs_object_entry(
 }
 
 /// The fs object-value access ladder, shared by an ordinary path key and the
-/// `$tooldirs` set: `"r"`→Read allow, `"rw"`/`true`→ReadWrite allow, `false`→Deny.
-/// (`push_fs_rules`/`tooldirs_fs_rules` later normalize a Deny's access to the inert
-/// `FsAccess::DENY`; the `Read` here is the pre-normalization placeholder.)
+/// `$tooldirs` set. `false` is represented briefly so its caller can reject the removed
+/// public deny grammar with the same diagnostic as every other path form.
 fn parse_fs_object_access(val: &Value, path: &str) -> Result<(Effect, FsAccess), CompileError> {
     match val {
         Value::Bool(true) => Ok((Effect::Allow, FsAccess::ReadWrite)),
@@ -459,10 +457,8 @@ fn push_fs_rules(
     ctx: &CompileCtx,
     out: &mut Vec<FsRule>,
 ) {
-    // Normalize a deny's access to the canonical inert value (D20): the array
-    // form grants ReadWrite even to a `!`-deny, the object form emits Read — same
-    // enforcement (a deny removes read+write), divergent IR. Fold both to one here,
-    // the single funnel for user fs rules, so the IR carries a uniform deny.
+    // Keep the IR canonical for internal callers: a deny has no access mode. Authored
+    // filesystem grammar reaches this funnel only with an Allow effect.
     let access = if effect == Effect::Deny {
         FsAccess::DENY
     } else {
@@ -492,9 +488,10 @@ fn push_fs_rules(
 /// line that could grant the wrong subtree. Trailing whitespace is trimmed so a
 /// path is clean; interior whitespace is a legitimate path character and preserved.
 fn resolve_fs_path(raw: &str, ctx: &CompileCtx, path: &str) -> Result<String, CompileError> {
-    reject_unknown_fs_sentinel(raw, path)?;
-    if resolve::has_substitution(raw) {
-        let resolved = resolve::resolve_with(raw, ctx.runner.as_ref())
+    let raw = normalize_home_alias(raw, path)?;
+    reject_unknown_fs_sentinel(&raw, path)?;
+    if resolve::has_substitution(&raw) {
+        let resolved = resolve::resolve_with(&raw, ctx.runner.as_ref())
             .map_err(|e| CompileError::substitution(path, &e))?;
         let resolved = resolved.trim_end().to_string();
         if resolved.is_empty() {
@@ -510,7 +507,7 @@ fn resolve_fs_path(raw: &str, ctx: &CompileCtx, path: &str) -> Result<String, Co
             ));
         }
         Ok(resolved)
-    } else if resolve::has_open_substitution(raw) {
+    } else if resolve::has_open_substitution(&raw) {
         // A `$(` with no balanced close — name it rather than ship shell-looking
         // text as a literal path (the same footgun the env path guards against).
         Err(CompileError::substitution(
@@ -518,8 +515,24 @@ fn resolve_fs_path(raw: &str, ctx: &CompileCtx, path: &str) -> Result<String, Co
             resolve::UNTERMINATED_SUBST_MSG,
         ))
     } else {
-        Ok(raw.to_string())
+        Ok(raw)
     }
+}
+
+/// `$home` is the public spelling of the existing `~` anchor. Normalize before
+/// `matcher::path` sees the token, keeping that module a pure path expander.
+fn normalize_home_alias(raw: &str, path: &str) -> Result<String, CompileError> {
+    let trimmed = raw.trim_start();
+    let Some(("home", rest)) = crate::matcher::path::split_fs_sentinel(trimmed) else {
+        return Ok(raw.to_string());
+    };
+    if rest.is_empty() || rest.starts_with(['/', '\\']) {
+        return Ok(raw.replacen("$home", "~", 1));
+    }
+    Err(CompileError::shape(
+        path,
+        "malformed `$home` sentinel — use `$home` or `$home/subpath`",
+    ))
 }
 
 /// Reject a leading `$name` that is not a recognized filesystem sentinel (per the v2
@@ -527,8 +540,8 @@ fn resolve_fs_path(raw: &str, ctx: &CompileCtx, path: &str) -> Result<String, Co
 /// recognized BEFORE `$name` — the paren disambiguation — so a leading `$(` returns Ok
 /// and is handled by the substitution branches. Validated on the RAW pattern's leading
 /// token so an unrecognized sentinel is rejected even when a `$(…)` also appears later
-/// (`$foo/$(cmd)`). `$tmp` never reaches here (the fold consumes it as a mode first),
-/// leaving `$cache` as the sole recognized sentinel that flows through.
+/// (`$foo/$(cmd)`). `$tmp` never reaches here and `$home` is normalized to `~`; `$cache`
+/// remains the sole `$name` sentinel that reaches the matcher.
 fn reject_unknown_fs_sentinel(raw: &str, path: &str) -> Result<(), CompileError> {
     let p = raw.trim_start();
     // P0-F1: the pre-v2 angle-bracket fs sentinels (`<tmp>`/`<cache>`/`<home>`) were
@@ -553,20 +566,20 @@ fn reject_unknown_fs_sentinel(raw: &str, path: &str) -> Result<(), CompileError>
             return Err(CompileError::shape(
                 path,
                 &format!(
-                    "`${name}` is a network host set — use it on the `net` axis; the filesystem sentinels are `$cache` and `$tmp`"
+                    "`${name}` is a network host set — use it on the `net` axis; the filesystem sentinels are `$home`, `$cache`, and `$tmp`"
                 ),
             ));
         }
         return Err(CompileError::shape(
             path,
             &format!(
-                "unrecognized `${name}` filesystem sentinel — the built-in names are `$cache` and `$tmp`; use `$( … )` for command substitution"
+                "unrecognized `${name}` filesystem sentinel — the built-in names are `$home`, `$cache`, and `$tmp`; use `$( … )` for command substitution"
             ),
         ));
     }
     Err(CompileError::shape(
         path,
-        "a bare `$` is not a valid filesystem path — the built-in sentinels are `$cache` and `$tmp`, and `$( … )` is command substitution",
+        "a bare `$` is not a valid filesystem path — the built-in sentinels are `$home`, `$cache`, and `$tmp`, and `$( … )` is command substitution",
     ))
 }
 
@@ -591,11 +604,10 @@ fn deprecated_angle_sentinel_msg(p: &str) -> String {
 }
 
 /// `sandbox: true`'s fs base, built DIRECTLY: the generous-read allow + the home-secret
-/// read denies, then the policy-file self-exclusion and the unconditional `.env*` floor
+/// read denies, then secure-only policy-file self-exclusion and the `.env*` floor
 /// — byte-identical to what `fold_fs(["..."])` produced before P4 removed the naked-`...`
 /// splice. The home-secret denies live HERE (part of the `sandbox: true` posture), NOT
-/// as an unconditional floor on every read-granting policy — relocating them to a
-/// preset-only model is decision (a), deferred to Phase 7.
+/// as an unconditional floor on every read-granting policy.
 pub(super) fn secure_default_fs(ctx: &CompileCtx) -> FsPolicy {
     let mut set = FsRuleSet {
         entries: Vec::new(),

@@ -11,17 +11,15 @@
 //! Resurrected verbatim (epic 1.6/3.2) from the dropped `windows_account` module — the
 //! privileged dedicated-account tier that was removed with the curated import (epic 0.3), which
 //! is where this machinery happened to live. Only the window-object subgraph is kept: the
-//! AppContainer path calls exactly [`WindowAceGuard::grant`] + [`sid_to_string`], and the DACL
+//! AppContainer path journals [`grant_persistent`] mutations, and the DACL
 //! read-modify-write is a SID-keyed strip (never a snapshot restore) so concurrent runs on the
 //! process-global station cannot delete each other's still-live aces.
 
 #![cfg(target_os = "windows")]
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::sync::Mutex;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -398,97 +396,160 @@ fn win32_last_err(op: &str, path: &Path) -> io::Error {
     ))
 }
 
-/// Every window-object grant this process holds, keyed by SID, with the number of live guards
-/// behind each. The Mutex serializes the DACL read-modify-write itself, not just the bookkeeping,
-/// so two runs granting the process-global station cannot lost-update each other. The refcount
-/// orders the shared-SID case; the AppContainer backend mints a fresh container SID per run, so
-/// only the last live guard for a SID strips it.
-static WINDOW_ACES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+use super::windows::windows_registry::{OperationLock, WindowObject};
 
-/// Grants this run's container SID access to the process window station and thread desktop, and
-/// strips exactly its own aces on drop. See the module doc for why this is load-bearing on a
-/// non-interactive station. Fails FORWARD: a station whose DACL nub cannot rewrite still launches.
-pub(crate) struct WindowAceGuard {
-    sid: String,
-    handles: Vec<HANDLE>,
+fn object_name(handle: HANDLE) -> io::Result<String> {
+    use windows_sys::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+    let mut bytes = 0;
+    unsafe {
+        GetUserObjectInformationW(handle, UOI_NAME, null_mut(), 0, &mut bytes);
+    }
+    if bytes == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = vec![0u16; (bytes as usize).div_ceil(2)];
+    if unsafe {
+        GetUserObjectInformationW(
+            handle,
+            UOI_NAME,
+            name.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let len = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    Ok(String::from_utf16_lossy(&name[..len]))
 }
 
-impl WindowAceGuard {
-    /// The station/desktop ace state for this guard's SID, read from the DACLs as they stand,
-    /// plus how many guards are live across every SID. Printed beside a child's exit code under
-    /// `NUB_JAIL_DUMP_POLICY` — `station_ace=false` next to `code=3221225794` names the fault.
-    pub(crate) fn probe(&self) -> String {
-        let total: usize = {
-            let live = WINDOW_ACES.lock().unwrap_or_else(|e| e.into_inner());
-            live.values().sum()
-        };
-        let mut out = format!("live={total}");
-        for (i, handle) in self.handles.iter().enumerate() {
-            let label = if i == 0 { "station" } else { "desktop" };
-            match window_object_has_sid(*handle, &self.sid) {
-                Ok(v) => out.push_str(&format!(" {label}_ace={v}")),
-                Err(e) => out.push_str(&format!(" {label}_ace=err({e})")),
-            }
-        }
-        out
+pub(crate) fn current_objects() -> io::Result<Vec<WindowObject>> {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut session = 0;
+    if unsafe { ProcessIdToSessionId(std::process::id(), &mut session) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-
-    pub(crate) fn grant(sid: &str) -> Self {
-        // SAFETY: neither call takes a parameter that can be invalid, and both return a handle
-        // owned by the system for this process/thread's lifetime.
-        let (station, desktop) = unsafe {
-            (
-                GetProcessWindowStation().cast::<std::ffi::c_void>(),
-                GetThreadDesktop(GetCurrentThreadId()).cast::<std::ffi::c_void>(),
-            )
-        };
-        // Poison-tolerant: a panicking holder leaves the map consistent, and refusing to grant
-        // here would cost a run for nothing.
-        let mut live = WINDOW_ACES.lock().unwrap_or_else(|e| e.into_inner());
-        let mut handles = Vec::with_capacity(2);
-        for (handle, mask) in [(station, WINSTA_GRANT), (desktop, DESKTOP_GRANT)] {
-            if handle.is_null() {
-                continue;
-            }
-            handles.push(handle);
-            if let Err(e) = grant_window_object(handle, sid, mask) {
-                tracing::debug!(
-                    error = %e,
-                    "sandbox: could not grant the container SID window-object access — a child \
-                     on a non-interactive station may fail loader init"
-                );
-            }
-        }
-        *live.entry(sid.to_string()).or_insert(0) += 1;
-        WindowAceGuard {
-            sid: sid.to_string(),
-            handles,
-        }
-    }
+    let station = object_name(unsafe { GetProcessWindowStation() })?;
+    let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) })?;
+    Ok(vec![
+        WindowObject {
+            session,
+            station: station.clone(),
+            desktop: None,
+        },
+        WindowObject {
+            session,
+            station,
+            desktop: Some(desktop),
+        },
+    ])
 }
 
-impl Drop for WindowAceGuard {
+struct WindowHandle {
+    raw: HANDLE,
+    desktop: bool,
+}
+impl Drop for WindowHandle {
     fn drop(&mut self) {
-        let mut live = WINDOW_ACES.lock().unwrap_or_else(|e| e.into_inner());
-        match live.get_mut(&self.sid) {
-            // A sibling run still has a child alive under this same SID. Stripping now is the
-            // exact bug this guard exists to avoid, so leave the ace for the last one out.
-            Some(n) if *n > 1 => {
-                *n -= 1;
-                return;
-            }
-            _ => {
-                live.remove(&self.sid);
-            }
-        }
-        for handle in &self.handles {
-            if let Err(e) = strip_window_object(*handle, &self.sid) {
-                tracing::debug!(
-                    error = %e,
-                    "sandbox: could not remove the container SID's window-object ace — it keeps \
-                     station access until this session ends"
-                );
+        use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, CloseWindowStation};
+        unsafe {
+            if self.desktop {
+                CloseDesktop(self.raw);
+            } else {
+                CloseWindowStation(self.raw);
             }
         }
     }
+}
+
+fn open_recorded(object: &WindowObject) -> io::Result<Option<WindowHandle>> {
+    use windows_sys::Win32::System::StationsAndDesktops::{OpenDesktopW, OpenWindowStationW};
+    let current = current_objects()?;
+    if current[0].session != object.session {
+        use windows_sys::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTSEnumerateSessionsW, WTSFreeMemory,
+        };
+        let mut sessions = null_mut();
+        let mut count = 0;
+        if unsafe {
+            WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let exists = if count == 0 {
+            false
+        } else {
+            unsafe { std::slice::from_raw_parts(sessions, count as usize) }
+                .iter()
+                .any(|session| session.SessionId == object.session)
+        };
+        unsafe { WTSFreeMemory(sessions.cast()) };
+        // A logged-off session no longer owns any station or desktop to revoke.
+        if !exists {
+            return Ok(None);
+        }
+    }
+    if current[0].session != object.session || current[0].station != object.station {
+        // Window-object names are scoped to an OS logon session. Never substitute
+        // a same-named object in this process's different station/session.
+        return Err(io::Error::other(
+            "sandbox window-object cleanup requires its recorded logon session and window station",
+        ));
+    }
+    let name = object.desktop.as_deref().unwrap_or(&object.station);
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    const READ_CONTROL_WRITE_DAC: u32 = 0x0006_0000;
+    let raw = unsafe {
+        if object.desktop.is_some() {
+            OpenDesktopW(wide.as_ptr(), 0, 0, READ_CONTROL_WRITE_DAC)
+        } else {
+            OpenWindowStationW(wide.as_ptr(), 0, READ_CONTROL_WRITE_DAC)
+        }
+    };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(2 | 3)) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    Ok(Some(WindowHandle {
+        raw,
+        desktop: object.desktop.is_some(),
+    }))
+}
+
+/// The registry journals the object before this mutation and owns the ACE until
+/// eviction. A command finishing must not revoke another process's shared SID.
+pub(crate) fn grant_persistent(object: &WindowObject, sid: PSID) -> io::Result<()> {
+    let _lock = OperationLock::acquire("acl")?;
+    let handle = open_recorded(object)?
+        .ok_or_else(|| io::Error::other("sandbox window object disappeared"))?;
+    let sid = unsafe { sid_to_string(sid) }?;
+    if window_object_has_sid(handle.raw, &sid)? {
+        return Ok(());
+    }
+    grant_window_object(
+        handle.raw,
+        &sid,
+        if handle.desktop {
+            DESKTOP_GRANT
+        } else {
+            WINSTA_GRANT
+        },
+    )
+}
+
+pub(crate) fn revoke_persistent(object: &WindowObject, sid: PSID) -> io::Result<()> {
+    let _lock = OperationLock::acquire("acl")?;
+    let Some(handle) = open_recorded(object)? else {
+        return Ok(());
+    };
+    let sid = unsafe { sid_to_string(sid) }?;
+    strip_window_object(handle.raw, &sid)
 }
