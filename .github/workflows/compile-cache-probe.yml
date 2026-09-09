@@ -57,7 +57,11 @@ jobs:
           (cd crates/nub-native && cargo build --profile fast)
           mkdir -p runtime/addons
           cp target/fast/libnub_native.dylib runtime/addons/nub-native.node
-          cp -R node_modules runtime/node_modules
+          mkdir -p runtime/node_modules
+          for package in @oxc-project/runtime urlpattern-polyfill @js-temporal/polyfill @petamoriken/float16 jsbi; do
+            mkdir -p "runtime/node_modules/$(dirname "$package")"
+            cp -RL "node_modules/$package" "runtime/node_modules/$package"
+          done
       - name: Build the launcher template
         run: cd crates/nub-launcher && cargo build --locked --release
       - name: Build merge-base and modified compilers
