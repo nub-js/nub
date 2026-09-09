@@ -151,7 +151,7 @@ fn sandbox(root: &std::path::Path, case: &str) -> Sandbox {
         ScopeCapabilities::approved(),
         BTreeMap::new(),
     );
-    let mut policy = compile(&json!({"fs": {(root.join("project").to_string_lossy()): "rw", (root.join("readable").to_string_lossy()): "r", "$tmp": "rw"}, "net": false, "env": false}), &ctx).unwrap();
+    let mut policy = compile(&json!({"fs": {(root.join("project").to_string_lossy()): "rw", (root.join("readable").to_string_lossy()): "r", "$tmp": "rw"}, "net": false}), &ctx).unwrap();
     for key in [
         "PATH",
         "SystemRoot",

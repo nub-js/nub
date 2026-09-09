@@ -79,8 +79,7 @@ fn policy(root: &Path, fs: Value, extra_env: &[(&str, &str)]) -> nub_sandbox::Sa
         ScopeCapabilities::approved(),
         env.clone(),
     );
-    let mut policy = compile(&json!({"fs": fs, "env": false, "net": false}), &ctx)
-        .expect("tool policy compiles");
+    let mut policy = compile(&json!({"fs": fs, "net": false}), &ctx).expect("tool policy compiles");
     policy.env.constructed = env;
     policy
 }

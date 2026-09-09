@@ -39,7 +39,7 @@ fn policy(root: &Path) -> SandboxPolicy {
         environment.clone(),
     );
     let mut policy = compile(
-        &json!({"fs": {"./": "rw", "$tmp": "rw"}, "env": false, "net": false}),
+        &json!({"fs": {"./": "rw", "$tmp": "rw"}, "net": false}),
         &context,
     )
     .unwrap();

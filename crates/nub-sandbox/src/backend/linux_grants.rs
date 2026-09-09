@@ -402,7 +402,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].path, before);
-        assert_eq!(plan[1].path, Path::new("/"));
+        assert_eq!(plan[1].path, std::path::Path::new("/"));
         assert_eq!(plan[1].access, MountAccess::ReadOnly);
         assert_eq!(plan[2].path, after);
         assert_eq!(plan[2].access, MountAccess::ReadWrite);
