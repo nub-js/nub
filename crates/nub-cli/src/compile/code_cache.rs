@@ -95,7 +95,7 @@ pub(super) fn attach(files: &mut Vec<AppFile<Vec<u8>>>, node: &Path) -> Result<b
     let args = serde_json::to_string(&(PACK_NAME, id, index.version, index.arch, index.tag))?;
     let suffix = format!("\n;{INSTALLER}(...{args});\n");
     files[bootstrap].bytes.extend_from_slice(suffix.as_bytes());
-    files.push(AppFile::plain(PACK_NAME.into(), pack));
+    files.push(AppFile::plain(PACK_NAME, pack));
     Ok(true)
 }
 
@@ -123,8 +123,8 @@ mod tests {
     #[test]
     fn small_programs_do_not_start_a_cache_generator() {
         let mut files = vec![
-            AppFile::plain(COMPILE_BOOTSTRAP_NAME.into(), Vec::new()),
-            AppFile::plain("main.mjs".into(), b"console.log(1)".to_vec()),
+            AppFile::plain(COMPILE_BOOTSTRAP_NAME, Vec::new()),
+            AppFile::plain("main.mjs", b"console.log(1)".to_vec()),
         ];
         assert!(!attach(&mut files, Path::new("nonexistent-node")).unwrap());
         assert_eq!(files.len(), 2);
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn an_included_pack_name_is_not_overwritten() {
         let mut files = vec![AppFile::plain(
-            "__NUB_CODE_CACHE.BIN".into(),
+            "__NUB_CODE_CACHE.BIN",
             b"user asset".to_vec(),
         )];
         assert!(!attach(&mut files, Path::new("nonexistent-node")).unwrap());
