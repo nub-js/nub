@@ -33,14 +33,22 @@ fn resolved_policy(root: &Path) -> SandboxPolicy {
 fn echo_command(value: &str) -> CommandSpec {
     CommandSpec::new("/bin/sh")
         .arg("-c")
-        .arg(format!("printf {value}"))
+        .arg(format!("printf '{value}\\n'"))
 }
 
 #[cfg(windows)]
 fn echo_command(value: &str) -> CommandSpec {
     CommandSpec::new("cmd.exe")
         .args(["/d", "/s", "/c"])
-        .arg(format!("<nul set /p ={value} & exit /b 0"))
+        .arg(format!("echo {value}"))
+}
+
+fn expected_echo(value: &str) -> Vec<u8> {
+    if cfg!(windows) {
+        format!("{value}\r\n").into_bytes()
+    } else {
+        format!("{value}\n").into_bytes()
+    }
 }
 
 #[test]
@@ -61,8 +69,8 @@ fn acquired_sandbox_submits_independent_commands() {
 
     assert!(first.status.success());
     assert!(second.status.success());
-    assert_eq!(first.stdout, b"one");
-    assert_eq!(second.stdout, b"two");
+    assert_eq!(first.stdout, expected_echo("one"));
+    assert_eq!(second.stdout, expected_echo("two"));
 }
 
 #[test]
@@ -78,7 +86,7 @@ fn prepared_command_keeps_acquired_resources_alive_after_close() {
         .output()
         .expect("prepared command still owns its lease");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"live");
+    assert_eq!(output.stdout, expected_echo("live"));
 }
 
 #[test]

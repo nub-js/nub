@@ -81,7 +81,7 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
 
 function uvExecutable(target) {
   const candidates = process.platform === 'win32'
-    ? [join(target, 'Scripts', 'uv.exe')]
+    ? [join(target, 'bin', 'uv.exe'), join(target, 'Scripts', 'uv.exe')]
     : [join(target, 'bin', 'uv')];
   const executable = candidates.find(existsSync);
   if (!executable) throw new Error(`uv@${pins.uv} did not provide an executable (looked in ${candidates.join(', ')})`);
@@ -103,7 +103,7 @@ const pipVersion = command(runtime.command, ['-c', 'import pip; print(pip.__vers
 });
 if (pipVersion !== pins.pip) throw new Error(`expected pip ${pins.pip}, got ${pipVersion}`);
 const uvProgram = uvExecutable(uvRoot);
-const uvVersion = command(uvProgram, ['--version']).split(/\s+/).at(-1);
+const uvVersion = command(uvProgram, ['--version']).split(/\s+/)[1];
 if (uvVersion !== pins.uv) throw new Error(`expected uv ${pins.uv}, got ${uvVersion}`);
 
 const matrix = [

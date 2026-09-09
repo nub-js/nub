@@ -3319,6 +3319,22 @@ pub(super) mod launch {
         recover_idle_resources(true, false)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_profile_has_ace(profile: &str, path: &Path) -> io::Result<bool> {
+        let sid = SidGuard(derive_appcontainer(profile)?);
+        path_has_sid(path, sid.0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_profile_ace(profile: &str, path: &Path, grant: bool) -> io::Result<()> {
+        let sid = SidGuard(derive_appcontainer(profile)?);
+        if grant {
+            set_ace(path, sid.0, 0x0012_0089, GRANT_ACCESS, false)
+        } else {
+            revoke_ace(path, sid.0)
+        }
+    }
+
     fn recover_idle_resources(all: bool, reserve_slot: bool) -> io::Result<()> {
         let mut first_error = None;
         for entry in super::windows_registry::begin_recovery(all, reserve_slot)? {
@@ -4537,3 +4553,7 @@ mod tests {
 #[cfg(all(test, windows))]
 #[path = "windows_native_child_tests.rs"]
 mod native_child_tests;
+
+#[cfg(all(test, windows))]
+#[path = "windows_cleanup_tests.rs"]
+mod windows_cleanup_tests;

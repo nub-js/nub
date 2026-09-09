@@ -110,10 +110,10 @@ fn native_child() {
                 "net:false allowed a direct TCP connection"
             );
             if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
-                assert!(
-                    socket.send_to(b"not-a-secret", address).is_err(),
-                    "net:false allowed a UDP datagram"
-                );
+                // Windows can accept a datagram into the send queue and drop it
+                // at network isolation. The parent checks actual delivery.
+                let result = socket.send_to(b"confined-datagram", address);
+                eprintln!("UDP send result: {result:?}");
             }
         }
         "proc" => {
@@ -287,9 +287,25 @@ fn net_false_blocks_native_tcp_and_udp() {
     let control = std::net::TcpStream::connect(address).unwrap();
     let _accepted = listener.accept().unwrap();
     drop(control);
+    let datagrams = std::net::UdpSocket::bind(address).unwrap();
+    datagrams
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sender.send_to(b"control", address).unwrap();
+    let mut received = [0_u8; 64];
+    let (length, _) = datagrams.recv_from(&mut received).unwrap();
+    assert_eq!(&received[..length], b"control");
     std::fs::write(root.path().join("project/address"), address.to_string()).unwrap();
     let sandbox = sandbox(root.path(), "network");
     run(&sandbox, root.path(), "network");
+    let error = datagrams
+        .recv_from(&mut received)
+        .expect_err("net:false delivered a UDP datagram to the unconfined receiver");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ));
 }
 
 #[cfg(target_os = "linux")]

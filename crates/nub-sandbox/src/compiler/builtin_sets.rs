@@ -928,14 +928,17 @@ mod tests {
             ("XDG_DATA_HOME".into(), data.display().to_string()),
             ("XDG_CONFIG_HOME".into(), config.display().to_string()),
         ]);
-        let paths = environment_tooldirs(&env);
+        let paths: BTreeSet<PathBuf> = environment_tooldirs(&env)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         for tool in ["pnpm", "yarn", "pip", "uv", "go-build", "composer"] {
-            assert!(paths.contains(&cache.join(tool).display().to_string()));
+            assert!(paths.contains(&cache.join(tool)));
         }
-        assert!(paths.contains(&data.join("pip").display().to_string()));
-        assert!(paths.contains(&config.join("yarn").display().to_string()));
+        assert!(paths.contains(&data.join("pip")));
+        assert!(paths.contains(&config.join("yarn")));
         for root in [&cache, &data, &config] {
-            assert!(!paths.contains(&root.display().to_string()));
+            assert!(!paths.contains(root));
         }
         let rules =
             tooldirs_fs_rules_with_env(&homes(), &env, Effect::Allow, FsAccess::Read).unwrap();

@@ -298,7 +298,7 @@ fn tool_env(tool: &Tool, root: &Path) -> (PathBuf, PathBuf, Vec<(String, String)
                 "PATH".into(),
                 format!(
                     "{}{}{}",
-                    global.to_string_lossy(),
+                    global.join("bin").to_string_lossy(),
                     if cfg!(windows) { ";" } else { ":" },
                     std::env::var("PATH").expect("runner PATH")
                 ),
@@ -410,12 +410,19 @@ fn grant_policy(
         );
         Value::Object(entries)
     } else {
-        exact_grants(&[
+        let yarn_home = root.join("home/.yarn");
+        let mut grants = vec![
             (cache, "rw"),
             (global, "rw"),
             (&tool.tool_root, "r"),
             (&tool.runtime_root, "r"),
-        ])
+        ];
+        // Yarn Classic falls back to this user-global state root even with
+        // `YARN_GLOBAL_FOLDER` relocated. Keep this narrow rather than granting home.
+        if tool.kind == "yarn1" {
+            grants.push((&yarn_home, "rw"));
+        }
+        exact_grants(&grants)
     };
     policy(root, fs, &env)
 }
@@ -458,6 +465,7 @@ fn run_normal_operations(
         "npm" => &["exec", "--", "fixture-bin"],
         "pnpm" => &["exec", "fixture-bin"],
         "yarn1" => &["run", "fixture-bin"],
+        "yarn" if tool.name == "yarn2" => &["run", "fixture-bin"],
         "yarn" => &["exec", "fixture-bin"],
         "bun" => &["x", "--no-install", "fixture-bin"],
         _ => unreachable!(),
@@ -550,6 +558,10 @@ fn run_tool_control(name: &str, control: ToolControl) {
     // can name. Cold-root denial is covered separately below.
     std::fs::create_dir_all(&cache).expect("materialized cache precondition");
     std::fs::create_dir_all(&global).expect("materialized global precondition");
+    if tool.kind == "yarn1" {
+        std::fs::create_dir_all(root.path().join("home/.yarn"))
+            .expect("materialized Yarn Classic state precondition");
+    }
     let policy = control
         .tooldirs()
         .map(|tooldirs| grant_policy(tool, root.path(), &cache, &global, &env, tooldirs));
