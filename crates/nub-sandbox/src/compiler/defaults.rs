@@ -1,110 +1,8 @@
-//! The built-in default ENTRIES — the secret deny-set and trusted-host allows the
-//! compiler emits into an ordered list (for `sandbox: true`'s base, the build-jail
-//! preset, and the `$trusted`/`$tooldirs` sets). Per .fray/sandbox.md "Built-in
-//! defaults are just default ENTRIES, not a floor": these are ordinary last-match-wins
-//! entries, so a later user rule can override any of them.
-//!
-//! The data (secret paths/globs, browser/wallet dirs) is ported verbatim from the
-//! reviewed `secrets.rs` in the salvage branches — the §8.5 attack→capability
-//! mapping. It is DATA, re-homed under the fresh policy model.
+//! Shared compiler defaults: curated environment handling, filesystem subtree
+//! expansion, and compatibility classifiers used by backend controls.
 
-use crate::matcher::path::{
-    Homes, canonicalize_glob_prefix, canonicalize_including_nonexistent, expand_symbolic,
-    normalize_slashes,
-};
-use crate::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
-use std::path::Path;
-
-/// Secret-bearing paths to DENY-READ, resolved under the home anchors. Classic
-/// creds, VCS/cloud tokens, the 2024–26 crypto-wallet wave, browser profiles, and
-/// the macOS Keychain. Each becomes a subtree Deny entry (path + `path/**`).
-const SECRET_READ_RELPATHS: &[&str] = &[
-    // classic credentials
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".netrc",
-    ".git-credentials",
-    ".config/git/credentials",
-    ".docker/config.json",
-    ".kube",
-    ".config/gcloud",
-    ".config/gh",
-    ".config/hub",
-    ".npmrc",
-    ".pgpass",
-    ".pypirc",
-    // crypto wallets / keystores
-    ".config/solana",
-    ".config/sui",
-    ".aptos",
-    ".electrum",
-    ".ethereum/keystore",
-    ".bitcoin",
-    // macOS Keychain (harmless path elsewhere)
-    "Library/Keychains",
-    // browser profile/cookie dirs (wallet-extension state + session cookies)
-    "Library/Application Support/Google/Chrome",
-    "Library/Application Support/BraveSoftware",
-    "Library/Application Support/Firefox",
-    "Library/Application Support/Microsoft Edge",
-    ".config/google-chrome",
-    ".config/BraveSoftware",
-    ".mozilla/firefox",
-    ".config/microsoft-edge",
-];
-
-/// The default secret-FILE READ-deny globs: any file whose BASENAME starts with `.env`
-/// (`.env`, `.env.local`, `.env.production`, `.envrc`, …) OR is an npm config file, at
-/// any depth. `.env*` holds the exact secrets the sandbox scrubs from the env; a
-/// project-local `.npmrc` (`./.npmrc`, `packages/x/.npmrc`) can hardcode a registry
-/// token and would otherwise fall inside the project `./` read grant (the home-anchored
-/// `~/.npmrc` deny does not cover it). Both are denied by DEFAULT on every read-granting
-/// fs policy (an unconditional floor) — see
-/// [`env_deny_leaf_rules`]/[`env_deny_subtree_rules`] and the injection in
-/// `fold::finalize_env_deny`. Denying reads is near-zero-breakage: legit code reads
-/// secrets via the injected process env / the PM's constructed registry config, not by
-/// `fs.read()`-ing the file inside a lifecycle script.
-///
-/// npm's BUILTIN config file is `<npm>/npmrc` with NO leading dot, so the `.npmrc` globs
-/// miss it. It sits at `<node-root>/lib/node_modules/npm/npmrc` — inside the subtree the
-/// build jail grants to make `npm`/`npx` resolvable — and while it usually holds only
-/// shipped defaults, a managed install can put an auth token there. Denying it keeps the
-/// floor consistent: every OTHER npmrc in npm's hierarchy is already denied, so leaving
-/// the one undotted spelling readable was an artifact of keying on the dot. Matched at
-/// its canonical location rather than by bare basename, which would also deny unrelated
-/// files a project happens to call `npmrc`.
-///
-/// NO LONGER ENFORCED FOR THE BUILD JAIL, and the machinery that used to enforce it there
-/// is inert. `preset::enforce_pure_allowlist` strips every deny from a build-jail policy, so
-/// `requires_deny_search_roots` returns false for it and the Linux mask walk never runs —
-/// which also makes `pm_engine::build_jail`'s `npm_builtin_config_deny_root` seeding (added
-/// solely to aim that walk at npm's own dir past `DENY_WALK_SKIP_DIRS`) dead on that path.
-///
-/// This glob is IRREDUCIBLE under a pure allowlist and is the one build-jail residual with a
-/// real credential behind it: the jail must grant `<node-root>/lib/node_modules` wholesale so
-/// `npm`/`npx`/`corepack` resolve, `npmrc` sits inside that tree, and withholding one file
-/// from inside a granted subtree is precisely the deny-in-grant shape Landlock and Windows
-/// AppContainer cannot express. Narrowing the grant instead would mean enumerating npm's tree
-/// to exclude one entry — an enumerate-to-exclude scan, which breaks on anything created after
-/// the scan and is not the model. Closing it properly means not granting npm's tree at all
-/// (e.g. resolving `npm`/`npx` through a shim), which is a separate design change.
-///
-/// The band still applies in full to every NON-build-jail policy, where it is enforced as
-/// before — Linux by masking a granted path, macOS by an SBPL deny.
-///
-/// The set splits into a LEAF band ([`ENV_DENY_LEAF_GLOBS`] — the file itself) and a
-/// SUBTREE band ([`ENV_DENY_SUBTREE_GLOBS`] — `**/.env*/**`, covering a `.env.d/`-style
-/// DIRECTORY of per-target secret files; an npmrc is always a file, so it has no subtree
-/// twin). Both are appended as the LAST entries so the block is UNCONDITIONAL — no
-/// directory grant, glob, or exact allow can reopen a denied file or a `.env*/`
-/// directory's contents (sandbox.mdx "`.env` files are always blocked"). See
-/// `fold::finalize_env_deny`. Each glob carries a rootless twin mirroring it for a
-/// depth-0 match; canonical candidates are absolute, so `**/…` is the form that bites.
-///
-/// These two arrays are the SINGLE SOURCE OF TRUTH for the floor: `finalize_env_deny` emits
-/// it and every consumer derives from these constants rather than restating them — a
-/// hand-copied list silently desynced on every edit here.
+/// Legacy classifier retained for the Windows pure-allowlist control test. It is not
+/// emitted by the compiler: broad filesystem grants are literal positive grants.
 pub(crate) const ENV_DENY_LEAF_GLOBS: &[&str] = &[
     "**/.env*",
     ".env*",
@@ -113,7 +11,6 @@ pub(crate) const ENV_DENY_LEAF_GLOBS: &[&str] = &[
     "**/node_modules/npm/npmrc",
     "node_modules/npm/npmrc",
 ];
-pub(crate) const ENV_DENY_SUBTREE_GLOBS: &[&str] = &["**/.env*/**", ".env*/**"];
 
 /// Case-insensitive substring test for a secret name-word anywhere in a key. Used by
 /// [`is_npm_config_credential`] for the registry-credential family.
@@ -138,89 +35,8 @@ fn segments(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build the default secret-PATH read DENY entries (`~/.ssh`, `~/.aws`, wallets, …).
-/// Emitted into `sandbox: true`'s fs base (`fold::secure_default_fs`) and re-asserted by
-/// the build-jail preset. Deny access is neutral (Read). The depth-independent `.env*`
-/// denies are handled SEPARATELY (the env-deny bands, injected unconditionally as the
-/// last entries on every read-granting policy) — see `fold::fold_fs`.
-pub fn secret_read_denies(homes: &Homes) -> Vec<FsRule> {
-    let mut out = Vec::new();
-    for rel in SECRET_READ_RELPATHS {
-        let anchored = format!("~/{rel}");
-        for g in subtree_globs(&expand_symbolic(&anchored, homes)) {
-            out.push(deny(g));
-        }
-    }
-    out
-}
-
-/// The LEAF secret-file READ-deny entries ([`ENV_DENY_LEAF_GLOBS`]) — the `.env*` /
-/// `.npmrc` file itself. Depth-independent (matched by basename anywhere), NOT anchored
-/// under any root. Appended as a trailing band so it beats every prior allow — a broad
-/// dir-allow, a glob, OR an exact-file allow — and cannot be reopened (the unconditional
-/// floor).
-pub(crate) fn env_deny_leaf_rules() -> Vec<FsRule> {
-    ENV_DENY_LEAF_GLOBS
-        .iter()
-        .map(|g| deny(g.to_string()))
-        .collect()
-}
-
-/// The SUBTREE `.env*` READ-deny entries ([`ENV_DENY_SUBTREE_GLOBS`]) — the CONTENTS of
-/// a `.env*`-named directory. Injected as the LAST band, so it is unconditionally
-/// authoritative for a `.env.d/`-style secret directory: nothing reopens its children.
-pub(crate) fn env_deny_subtree_rules() -> Vec<FsRule> {
-    ENV_DENY_SUBTREE_GLOBS
-        .iter()
-        .map(|g| deny(g.to_string()))
-        .collect()
-}
-
-/// The policy SOURCE-FILE self-exclusion DENY — an EXACT-path deny (read AND write) on ONE
-/// file the sandbox rules were sourced from (the caller emits one per `ctx.policy_files`
-/// entry), so a sandboxed process can neither read nor tamper with the policy that confines
-/// it. Canonicalized through the EXACT same
-/// path the matcher runs a candidate through (`canonicalize_including_nonexistent` — resolve
-/// symlinks / firmlinks, strip the Windows `\\?\` verbatim prefix, survive a non-existent
-/// tail) then slash-normalized, so (a) a grant reaching the file via a different spelling
-/// still hits this deny, and (b) the rule string is byte-identical to the candidate string
-/// the matcher builds — a plain literal, never the verbatim prefix whose `?` would read as a
-/// glob metachar and break the match. Deny access is the inert canonical [`FsAccess::DENY`].
-/// Injected as the last user/default entry BEFORE the `.env*` floor (see
-/// `fold::finalize_policy_file_deny`), so last-match-wins beats any prior allow — including a
-/// broad `fs: ["."]`.
-///
-/// The literal path is glob-ESCAPED ([`globset::escape`]) before it becomes the pattern: a
-/// real path may contain glob metachars (`[id]`/`[...slug]` Next.js segments, a `{a,b}`
-/// directory), and an unescaped `[`/`{`/`*`/`?` would be read as a pattern that does NOT
-/// match the literal candidate — a silent fail-OPEN leaving the policy file readable. The
-/// candidate side is a literal subject string, so escaping ONLY the deny pattern matches it
-/// exactly with no sibling over-match.
-pub(crate) fn policy_file_deny_rule(policy_file: &Path) -> FsRule {
-    let canon = canonicalize_including_nonexistent(policy_file);
-    let normalized = normalize_slashes(&canon.to_string_lossy());
-    FsRule {
-        matcher: CanonGlob(globset::escape(&normalized)),
-        effect: Effect::Deny,
-        access: FsAccess::DENY,
-        origin: FsOrigin::Authored,
-    }
-}
-
-/// The generous read base entry: allow everything, then the secret denies (added
-/// by the caller after this) tighten it. Emitted for the wrapper `true` /
-/// spread-of-defaults read posture.
-pub fn generous_read_allow() -> FsRule {
-    FsRule {
-        matcher: CanonGlob("**".to_string()),
-        effect: Effect::Allow,
-        access: FsAccess::Read,
-        origin: FsOrigin::Authored,
-    }
-}
-
 /// A subtree grant expands to two globs — the node itself and everything under
-/// it — so a bare path like `~/.ssh` denies both `~/.ssh` and `~/.ssh/id_rsa`.
+/// it — so a bare path grants both the named node and its descendants.
 /// A pattern already carrying a glob metachar is emitted as-is (no `/**` suffix).
 pub fn subtree_globs(expanded: &str) -> Vec<String> {
     if expanded.contains(['*', '?', '[', '{']) {
@@ -1342,6 +1158,8 @@ mod tests {
         );
     }
     use super::*;
+    use crate::matcher::path::Homes;
+    use crate::policy::Effect;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -2088,100 +1906,49 @@ mod tests {
     }
 
     #[test]
-    fn secret_path_denies_are_home_anchored_and_exclude_dotenv() {
-        let globs: Vec<String> = secret_read_denies(&homes())
-            .into_iter()
-            .map(|r| r.matcher.as_str().to_string())
-            .collect();
-        // Home-anchored secret files/dirs appear as subtree denies (substring match
-        // tolerates OS firmlink canonicalization of the fake home prefix).
-        for frag in [".gnupg", ".pgpass", ".pypirc", ".config/git/credentials"] {
-            assert!(
-                globs.iter().any(|g| g.contains(frag)),
-                "missing home secret deny containing {frag}"
-            );
-        }
-        // `.env*` is NOT in the secret-PATH set — it is injected separately (with the
-        // exact-file override precedence) via the env-deny bands, so it must not appear here.
-        assert!(
-            globs.iter().all(|g| !g.contains(".env")),
-            "`.env*` must be handled by the env-deny bands, not the secret-path splice"
+    fn secure_default_fs_is_positive_project_read_with_private_tmp() {
+        let homes = homes();
+        let ctx = crate::compiler::CompileCtx::new(
+            homes.clone(),
+            homes.project.clone(),
+            crate::compiler::ScopeCapabilities::approved(),
+            BTreeMap::new(),
         );
-    }
+        let policy = crate::compiler::compile(&serde_json::Value::Bool(true), &ctx)
+            .expect("secure defaults compile");
+        let matcher = crate::matcher::path::PathMatcher::new(&policy.fs.rules);
 
-    #[test]
-    fn env_deny_bands_split_leaf_and_subtree_as_deny() {
-        let leaf = env_deny_leaf_rules();
-        let subtree = env_deny_subtree_rules();
-        // Every rule is a Deny with the canonical inert access.
         assert!(
-            leaf.iter()
-                .chain(&subtree)
-                .all(|r| r.effect == Effect::Deny)
+            policy
+                .fs
+                .rules
+                .entries
+                .iter()
+                .all(|rule| rule.effect != Effect::Deny),
+            "the secure default must emit positive grants only"
         );
-        let leaf_globs: Vec<&str> = leaf.iter().map(|r| r.matcher.as_str()).collect();
-        let subtree_globs: Vec<&str> = subtree.iter().map(|r| r.matcher.as_str()).collect();
-        // The LEAF band denies the secret FILE itself; the SUBTREE band denies a
-        // `.env*/`-directory's contents. The split is what lets an exact-file allow sit
-        // between them (leaf-deny → allow → subtree-deny-last). An npmrc is a file with
-        // no subtree twin, so it appears only in the leaf band.
-        //
-        // EXACT, ORDERED equality — not membership. This is the crate's only content pin
-        // on the floor, and both consumers read it POSITIONALLY, so a reorder or a
-        // PREPEND is as much a break as a removal and a subset check sees none of them.
-        // Widening the floor is a deliberate security change: land it here first, then
-        // follow the restated literal in `tests/compiler.rs`, which cannot reach these
-        // crate-private arrays.
+        assert_eq!(policy.fs.tmp, crate::policy::TmpMode::Private);
+        let project_input = matcher.decide(&homes.project.join("src/input.js"));
         assert_eq!(
-            leaf_globs,
-            [
-                "**/.env*",
-                ".env*",
-                "**/.npmrc",
-                ".npmrc",
-                "**/node_modules/npm/npmrc",
-                "node_modules/npm/npmrc",
-            ]
+            project_input,
+            crate::matcher::path::FsDecision {
+                effect: Effect::Allow,
+                access: crate::policy::FsAccess::Read,
+            }
         );
-        assert_eq!(subtree_globs, ["**/.env*/**", ".env*/**"]);
-    }
-
-    /// npm's builtin config is the one file in its config hierarchy spelled without a
-    /// leading dot, so the `.npmrc` globs miss it — and it sits inside the subtree the
-    /// build jail grants so `npm`/`npx` resolve. A managed install can put an auth token
-    /// there, so the floor must cover it.
-    ///
-    /// This pins the POLICY only. Whether a backend enforces it is separate: macOS does,
-    /// Linux does not reach this path with a mask (see the `ENV_DENY_LEAF_GLOBS` doc), so
-    /// a green run here is not evidence of Linux enforcement.
-    #[test]
-    fn the_floor_denies_npms_undotted_builtin_config_in_policy() {
-        // An allow-by-default set with only the floor on top: whatever the floor denies
-        // is denied no matter how permissive the grants above it were.
-        let set = crate::policy::FsRuleSet {
-            entries: env_deny_leaf_rules()
-                .into_iter()
-                .chain(env_deny_subtree_rules())
-                .collect(),
-            default_effect: Effect::Allow,
-        };
-        let matcher = crate::matcher::path::PathMatcher::new(&set);
-        for denied in [
-            "/opt/node/lib/node_modules/npm/npmrc",
-            "/home/u/.nvm/versions/node/v26.5.0/lib/node_modules/npm/npmrc",
-        ] {
-            assert_eq!(
-                matcher.decide(Path::new(denied)).effect,
-                Effect::Deny,
-                "npm's builtin config must be denied: {denied}"
-            );
-        }
-        // Scoped to npm's own location — an unrelated file a project calls `npmrc`
-        // (a template, a distro's `etc/npmrc`) is not swept up by the floor.
+        // Read-only access is the IR's structural no-write representation.
+        let project_write_attempt = matcher.decide(&homes.project.join("out/result.js"));
         assert_eq!(
-            matcher.decide(Path::new("/srv/app/config/npmrc")).effect,
-            Effect::Allow,
-            "the floor must not deny an unrelated file named `npmrc`"
+            project_write_attempt,
+            crate::matcher::path::FsDecision {
+                effect: Effect::Allow,
+                access: crate::policy::FsAccess::Read,
+            }
+        );
+        assert_eq!(
+            matcher.decide(&homes.home.join(".npmrc")).effect,
+            Effect::Deny,
+            "a path outside the project remains denied"
         );
     }
 }

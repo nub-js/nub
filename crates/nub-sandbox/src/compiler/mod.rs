@@ -54,11 +54,8 @@ pub use resolve::{CommandRunner, ShellRunner};
 /// catalog override; the `const` is the compiled floor behind it.
 pub use builtin_sets::{DOWNLOAD_HOSTS, download_hosts};
 
-/// The secret-file deny leaf-glob floor, re-exported for a cross-backend TEST that pins the
-/// floor's contents. The Linux mask-placement emitter that read these positionally was the
-/// bwrap mount-stream tier, dropped with the privileged engine (epic 1.6); the Landlock
-/// backend builds flat rulesets and does not need them. Exposing just this one rather than
-/// the whole `defaults` module keeps the policy CONSTRUCTORS out of backend reach.
+/// Legacy secret-path classifier, re-exported for the Windows pure-allowlist control test.
+/// It is not emitted by the compiler; filesystem grants are literal positive entries.
 #[cfg(test)]
 pub(crate) use defaults::ENV_DENY_LEAF_GLOBS;
 
@@ -133,15 +130,10 @@ pub struct CompileCtx {
     pub homes: Homes,
     /// The current working directory (for diagnostics / relative anchoring).
     pub cwd: std::path::PathBuf,
-    /// EVERY file the policy was sourced from (absolute, canonicalized). Secure presets
-    /// may inject a high-precedence fs deny for these paths; authored filesystem policy is
-    /// positive-only and does not add implicit filesystem deny floors.
-    ///
-    /// A SET, not one path, because the source chain can be longer than one hop: a
-    /// nub.jsonc `sandbox: "./policy.jsonc"` is confined by BOTH files, and denying only
-    /// the referenced one leaves the referencing config writable — rewrite it to name a
-    /// permissive policy and the next run is unconfined. Empty for an inline policy with
-    /// no distinct source file (`--sandbox true|<preset>`, nub's own build-jail).
+    /// EVERY file the policy was sourced from (absolute, canonicalized), retained as
+    /// host context for callers that need provenance. The compiler does not turn these
+    /// into implicit filesystem deny rules: filesystem grants are literal positive
+    /// entries. Empty for an inline policy with no distinct source file.
     pub policy_files: Vec<std::path::PathBuf>,
     /// The capabilities of this single-block compile — the `compile`/`compile_with_warnings`
     /// entry, whose one scope IS this whole ctx (the `--sandbox <file>` / `run_sandboxed`
@@ -631,11 +623,8 @@ fn relaxed_net() -> NetPolicy {
     }
 }
 
-/// `sandbox: true` — secure defaults per axis. PROVISIONAL posture (documented):
-/// the exact runtime secure-default is the deferred runtime-frontend's product
-/// call; the frontend-less engine only needs a safe, explicit baseline since the
-/// conformance fixtures drive explicit policies. Today: generous read minus
-/// secrets + no write, deny-all net, stripped env.
+/// `sandbox: true` — secure defaults per axis: project-read/private-tmp fs,
+/// deny-all net, and a curated environment.
 fn secure_default(ctx: &CompileCtx) -> Result<SandboxPolicy, CompileError> {
     Ok(SandboxPolicy {
         fs: secure_default_fs(ctx),
@@ -667,11 +656,8 @@ fn secure_default_env(ctx: &CompileCtx) -> crate::policy::EnvPolicy {
 }
 
 fn secure_default_fs(ctx: &CompileCtx) -> FsPolicy {
-    // `sandbox: true`'s fs base — the generous-read allow + home-secret read denies, no
-    // write grant. P4 removed the naked-`...` splice that used to assemble this; the fold
-    // now builds it DIRECTLY (behavior-preserving). The home-secret denies remain part of
-    // the `sandbox: true` posture here — relocating them to a preset-only model is decision
-    // (a), deferred to Phase 7 (build-jail v2). See `fold::secure_default_fs`.
+    // `sandbox: true` is an explicit positive project-read policy with private scratch;
+    // it does not claim a broad read grant minus credential/path exceptions.
     fold::secure_default_fs(ctx)
 }
 

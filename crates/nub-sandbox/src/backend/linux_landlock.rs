@@ -807,23 +807,21 @@ unsafe fn install_confinement_pre_exec<C: std::os::unix::process::CommandExt>(
     command: &mut C,
     ruleset_fd: RawFd,
     seccomp: Option<std::sync::Arc<Vec<seccompiler::sock_filter>>>,
+    terminal_filter: Vec<seccompiler::sock_filter>,
 ) {
+    let owner_pid = unsafe { libc::getpid() };
     let hook = move || -> std::io::Result<()> {
-        // `setsid`, NOT `setpgid` — it detaches the CONTROLLING TERMINAL as well as
-        // starting a new process group. Bubblewrap got this from `--new-session`, whose
-        // comment in linux.rs records a MEASURED result: with every other flag present but
-        // that one removed, a confined child holding the launcher's tty can `ioctl(TIOCSTI)`
-        // bytes into the parent shell's input queue, to be executed OUTSIDE the sandbox.
-        // Seccomp cannot catch it (TIOCSTI is an ioctl request, not a syscall), so
-        // relinquishing the terminal is the whole defence. The new session also gives the
-        // parent a process GROUP to signal, which is its only handle on descendants without
-        // a PID namespace. Safe here because a freshly forked child is never already a
-        // process-group leader, which is the sole `EPERM` case.
-        if unsafe { libc::setsid() } < 0 {
+        // The launch joins its owner-death guardian's group before exec. Stay in
+        // the same session so that join is possible; ioctl argument filtering below
+        // independently blocks terminal-input injection.
+        if unsafe { libc::setpgid(0, 0) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::getppid() } != owner_pid {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
         }
         // FIRST, before any restriction is installed: the sweep's fallback path opens
         // `/proc/self/fd`, which the ruleset below makes unreadable. Ordering it here keeps
@@ -834,6 +832,8 @@ unsafe fn install_confinement_pre_exec<C: std::os::unix::process::CommandExt>(
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        super::linux_lifetime::install(&terminal_filter)
+            .map_err(std::io::Error::from_raw_os_error)?;
         unsafe { drop_all_capabilities() }?;
         unsafe { restrict_self(ruleset_fd) }.map_err(std::io::Error::from_raw_os_error)?;
         if let Some(filter) = &seccomp {
@@ -881,7 +881,16 @@ pub(crate) fn install_landlock_confinement<C: std::os::unix::process::CommandExt
 ) -> Result<LandlockRuleset, String> {
     let ruleset = build(policy, tmp_dir, entry_program)?;
     let fd = ruleset.as_raw_fd();
-    unsafe { install_confinement_pre_exec(command, fd, seccomp.map(std::sync::Arc::new)) };
+    let terminal_filter =
+        super::linux_lifetime::program(false).map_err(|error| error.to_string())?;
+    unsafe {
+        install_confinement_pre_exec(
+            command,
+            fd,
+            seccomp.map(std::sync::Arc::new),
+            terminal_filter,
+        )
+    };
     Ok(ruleset)
 }
 

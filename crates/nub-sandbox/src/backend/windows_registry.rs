@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCHEMA_VERSION: u32 = 2;
-pub(crate) const BACKEND_VERSION: &str = "appcontainer-acl-v2";
+pub(crate) const BACKEND_VERSION: &str = "appcontainer-acl-v3";
 pub(crate) const MAX_IDLE_ENTRIES: usize = 64;
 pub(crate) const MAX_OWNED_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_IDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -79,6 +79,16 @@ impl PolicyIdentity {
     pub(crate) fn profile_name(&self) -> String {
         // Keep below the documented 64-char AppContainer profile-name limit.
         format!("nub_sbx_r_{}", &self.hash[..40])
+    }
+
+    pub(crate) fn with_private_tmp(mut self, private: bool) -> Self {
+        self.canonical.push_str(if private {
+            "\nmanaged-tmp=profile/AC/Temp"
+        } else {
+            "\nmanaged-tmp=none"
+        });
+        self.hash = hex(&Sha256::digest(self.canonical.as_bytes()));
+        self
     }
 }
 
@@ -238,9 +248,24 @@ pub(crate) struct Acquired {
     pub(crate) fresh: bool,
     lease: Lease,
     root: PathBuf,
+    closed: bool,
 }
 
 impl Acquired {
+    #[cfg(all(test, windows))]
+    pub(crate) fn has_live_lease(&self) -> bool {
+        Lease::live(&self.lease.name)
+    }
+
+    pub(crate) fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.lease.close();
+        release(&self.root, &self.entry.identity, &self.lease.name)?;
+        self.closed = true;
+        Ok(())
+    }
     pub(crate) fn record_window_object(&mut self, object: WindowObject) -> io::Result<()> {
         let _lock = MutationLock::acquire(&self.root)?;
         let mut file = load(&self.root)?;
@@ -433,8 +458,9 @@ impl Drop for Acquired {
         // Close this caller's kernel lease first: otherwise `prune_with` would see
         // the still-live handle owned by this very Drop frame and retain a phantom
         // active entry forever.
-        self.lease.close();
-        let _ = release(&self.root, &self.entry.identity, &self.lease.name);
+        if let Err(error) = self.close() {
+            tracing::warn!(%error, "sandbox registry lease release failed");
+        }
     }
 }
 
@@ -476,7 +502,12 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
                 .values()
                 .filter(|e| e.leases.is_empty())
                 .count();
-            let bytes = file.entries.values().map(|e| e.owned_bytes).sum::<u64>();
+            let bytes = file
+                .entries
+                .values()
+                .filter(|entry| entry.leases.is_empty())
+                .map(|entry| entry.owned_bytes)
+                .sum::<u64>();
             if idle >= MAX_IDLE_ENTRIES || bytes > MAX_OWNED_BYTES {
                 return Err(io::Error::other(
                     "sandbox reusable-resource cache is full; cleanup is required before admitting another profile",
@@ -507,6 +538,7 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
         fresh,
         lease,
         root,
+        closed: false,
     })
 }
 
@@ -514,19 +546,29 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
 /// The Windows launcher owns the actual ACE/profile removal because it can verify
 /// object identity at the mutation boundary.  A failed removal is left journaled as
 /// `RecoveryNeeded`, never silently discarded.
-pub(crate) fn begin_recovery(all: bool) -> io::Result<Vec<Entry>> {
+pub(crate) fn begin_recovery(all: bool, reserve_slot: bool) -> io::Result<Vec<Entry>> {
     let root = registry_root()?;
-    begin_recovery_at(&root, all)
+    begin_recovery_at(&root, all, reserve_slot)
 }
 
-fn begin_recovery_at(root: &Path, all: bool) -> io::Result<Vec<Entry>> {
+fn begin_recovery_at(root: &Path, all: bool, reserve_slot: bool) -> io::Result<Vec<Entry>> {
     let _lock = MutationLock::acquire(root)?;
     let mut file = load(root)?;
     prune_with(&mut file, Lease::live);
     let now = now_secs();
-    for entry in file.entries.values_mut() {
+    for entry in file
+        .entries
+        .values_mut()
+        .filter(|entry| entry.leases.is_empty())
+    {
         entry.owned_bytes = owned_bytes(&entry.private_paths)?;
     }
+    let selected = select_recovery(&mut file, all, reserve_slot, now);
+    save(root, &file)?;
+    Ok(selected)
+}
+
+fn select_recovery(file: &mut RegistryFile, all: bool, reserve_slot: bool, now: u64) -> Vec<Entry> {
     let mut selected = Vec::new();
     let mut idle: Vec<(String, u64, u64)> = file
         .entries
@@ -535,11 +577,11 @@ fn begin_recovery_at(root: &Path, all: bool) -> io::Result<Vec<Entry>> {
         .map(|(identity, entry)| (identity.clone(), entry.last_used_at, entry.owned_bytes))
         .collect();
     idle.sort_by_key(|(_, last_used, _)| *last_used);
-    // Reserve one idle slot for a cache miss.  Active entries are never candidates;
-    // if cleanup cannot reclaim an idle record, admission remains explicitly bounded.
+    // Admission reserves one slot for a miss; close enforces the actual idle cap.
+    // Active entries are never candidates, even under byte or age pressure.
     let mut over_count = idle
         .len()
-        .saturating_sub(MAX_IDLE_ENTRIES.saturating_sub(1));
+        .saturating_sub(MAX_IDLE_ENTRIES.saturating_sub(usize::from(reserve_slot)));
     let mut bytes = idle.iter().map(|(_, _, bytes)| *bytes).sum::<u64>();
     let mut pressure = BTreeSet::new();
     for (identity, _, owned) in &idle {
@@ -563,8 +605,7 @@ fn begin_recovery_at(root: &Path, all: bool) -> io::Result<Vec<Entry>> {
             selected.push(entry.clone());
         }
     }
-    save(root, &file)?;
-    Ok(selected)
+    selected
 }
 
 pub(crate) fn finish_recovery(entry: &Entry, result: io::Result<()>) -> io::Result<()> {
@@ -598,7 +639,7 @@ fn release(root: &Path, identity: &str, lease: &str) -> io::Result<()> {
         prune_with(&mut file, Lease::live);
         if let Some(entry) = file.entries.get_mut(identity)
             && entry.leases.is_empty()
-            && matches!(entry.state, EntryState::Ready)
+            && matches!(entry.state, EntryState::Ready | EntryState::Idle)
         {
             entry.state = EntryState::Idle;
             entry.last_used_at = now_secs();
@@ -1142,10 +1183,124 @@ mod tests {
         let mut acquired = acquire_at(root.clone(), id(dir.path())).unwrap();
         acquired.ready().unwrap();
         drop(acquired);
-        let first = begin_recovery_at(&root, true).unwrap();
+        let first = begin_recovery_at(&root, true, false).unwrap();
         assert_eq!(first.len(), 1);
-        let second = begin_recovery_at(&root, false).unwrap();
+        let second = begin_recovery_at(&root, false, false).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].identity, first[0].identity);
+    }
+
+    fn idle_entry(index: usize, now: u64) -> Entry {
+        Entry {
+            identity: index.to_string(),
+            canonical_policy: String::new(),
+            profile_name: format!("fixture-{index}"),
+            state: EntryState::Idle,
+            created_at: now,
+            last_used_at: now,
+            private_paths: Vec::new(),
+            owned_bytes: 0,
+            mutations: Vec::new(),
+            leases: BTreeSet::new(),
+            recovery_error: None,
+            window_objects: Vec::new(),
+            object_ids: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn close_enforces_idle_count_without_evicting_active_resources() {
+        let now = MAX_IDLE_AGE.as_secs() + 1;
+        let mut file = RegistryFile {
+            schema: SCHEMA_VERSION,
+            entries: (0..MAX_IDLE_ENTRIES)
+                .map(|index| {
+                    let entry = idle_entry(index, now);
+                    (entry.identity.clone(), entry)
+                })
+                .collect(),
+        };
+        assert!(select_recovery(&mut file, false, false, now).is_empty());
+        let extra = idle_entry(MAX_IDLE_ENTRIES, now);
+        file.entries.insert(extra.identity.clone(), extra);
+        let mut live = idle_entry(MAX_IDLE_ENTRIES + 1, 0);
+        live.state = EntryState::Ready;
+        live.owned_bytes = MAX_OWNED_BYTES + 1;
+        live.leases.insert("live".into());
+        file.entries.insert(live.identity.clone(), live.clone());
+        let selected = select_recovery(&mut file, false, false, now);
+        assert_eq!(selected.len(), 1);
+        assert_ne!(selected[0].identity, live.identity);
+        file.entries.remove(&selected[0].identity);
+        assert!(select_recovery(&mut file, false, false, now).is_empty());
+        assert_eq!(select_recovery(&mut file, false, true, now).len(), 1);
+        assert_eq!(file.entries[&live.identity].state, EntryState::Ready);
+    }
+
+    #[test]
+    fn close_enforces_byte_age_and_failed_cleanup_bounds() {
+        let now = MAX_IDLE_AGE.as_secs() + 5;
+        let mut large = idle_entry(0, now - 1);
+        large.owned_bytes = MAX_OWNED_BYTES;
+        let mut recent = idle_entry(1, now);
+        recent.owned_bytes = 1;
+        let expired = idle_entry(2, now - MAX_IDLE_AGE.as_secs());
+        let mut failed = idle_entry(3, now);
+        failed.state = EntryState::RecoveryNeeded;
+        failed.recovery_error = Some("retained failure".into());
+        let mut file = RegistryFile {
+            schema: SCHEMA_VERSION,
+            entries: [large, recent, expired, failed]
+                .into_iter()
+                .map(|entry| (entry.identity.clone(), entry))
+                .collect(),
+        };
+        let selected = select_recovery(&mut file, false, false, now);
+        let ids: BTreeSet<_> = selected
+            .iter()
+            .map(|entry| entry.identity.as_str())
+            .collect();
+        assert_eq!(ids, BTreeSet::from(["0", "2", "3"]));
+        assert_eq!(file.entries["1"].state, EntryState::Idle);
+        assert_eq!(
+            file.entries["3"].recovery_error.as_deref(),
+            Some("retained failure")
+        );
+    }
+
+    #[test]
+    fn last_close_starts_idle_age_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let mut acquired = acquire_at(root.clone(), id(dir.path())).unwrap();
+        acquired.ready().unwrap();
+        let mut file = load(&root).unwrap();
+        file.entries
+            .get_mut(&acquired.entry.identity)
+            .unwrap()
+            .last_used_at = 0;
+        save(&root, &file).unwrap();
+        let before = now_secs();
+        acquired.close().unwrap();
+        let file = load(&root).unwrap();
+        let entry = &file.entries[&acquired.entry.identity];
+        assert_eq!(entry.state, EntryState::Idle);
+        assert!(entry.last_used_at >= before);
+        let closed_at = entry.last_used_at;
+        acquired.close().unwrap();
+        assert_eq!(
+            load(&root).unwrap().entries[&acquired.entry.identity].last_used_at,
+            closed_at
+        );
+    }
+
+    #[test]
+    fn managed_tmp_marker_changes_identity_without_a_generated_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = id(dir.path());
+        let private = identity.clone().with_private_tmp(true);
+        let shared = identity.with_private_tmp(false);
+        assert_ne!(private.hash, shared.hash);
+        assert!(private.canonical.ends_with("managed-tmp=profile/AC/Temp"));
     }
 }

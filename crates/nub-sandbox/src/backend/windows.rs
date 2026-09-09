@@ -114,6 +114,8 @@ pub(crate) struct AppContainerLaunch {
     /// [`plan_net`] chose [`WinNetPlan::Funnel`]; the proxy's port/token are known only at launch,
     /// so [`AppContainerLaunch::run`] injects the proxy env then rather than `apply` baking it in.
     egress_funnel: Option<NetPolicy>,
+    /// A stable profile-owned slot, resolved only after policy identity acquisition.
+    private_tmp: bool,
     stdout: WindowsStdio,
     stderr: WindowsStdio,
 }
@@ -678,9 +680,8 @@ pub(crate) fn apply(
     proxy_token: Option<&str>,
     // Used only by the relaxed plain-command path.
     ca_bundle: Option<&std::path::Path>,
-    // Private-tmp fresh dir. CUT-1: enforcement (redirect TEMP/TMP + hide the shared tmp
-    // without breaking the OS-essential TEMP floor) is a follow-up decision, so the env is
-    // pointed best-effort and the axis is reported lost (never a silent under-enforce).
+    // Used only by the explicitly unconfined compatibility path. Native private
+    // storage is resolved by acquisition, never by a caller's random TempDir.
     tmp_dir: Option<&std::path::Path>,
 ) -> Result<super::Prepared, super::Degradation> {
     use super::{Degradation, Prepared};
@@ -690,6 +691,7 @@ pub(crate) fn apply(
     let confine_fs = fs_confines(&policy.fs);
     let sandboxing = confine_fs || policy.net.enforce;
     let tmp_lost = super::tmp_lost_axis(policy);
+    let private_tmp = policy.fs.tmp == crate::policy::TmpMode::Private;
 
     // Derived HERE rather than beside its other consumers below because `verify_clean_root`
     // needs `publishable` — the subtrees nub publishes to `ALL APPLICATION PACKAGES` — to tell
@@ -891,13 +893,12 @@ pub(crate) fn apply(
     // OpenProcess(PROCESS_VM_READ), run 29043151805 — so NO `env-read-ascendant`
     // Degradation is emitted. Reporting it would falsely tell a frontend Windows is
     // degraded when it isn't. See the module doc.)
-    // Private/deny tmp is not yet enforced on Windows — hiding the shared tmp while keeping
-    // the OS-essential TEMP floor the child needs to start is a follow-up decision. Report
-    // the axis lost (fail-safe honesty) rather than silently run on the shared tmp.
-    if let Some(axis) = tmp_lost {
+    // The AppContainer owns private temporary storage. A deny-all temp policy
+    // remains unsupported because Windows itself grants the profile's storage.
+    if let Some(axis) = tmp_lost.filter(|_| !private_tmp) {
         deg.lost.push(axis.to_string());
         reason.get_or_insert_with(|| {
-            "private/deny tmp not yet enforced on Windows (shared tmp visible)".to_string()
+            "denying all temporary storage is not supported by Windows AppContainer".to_string()
         });
     }
     deg.reason = reason;
@@ -910,11 +911,12 @@ pub(crate) fn apply(
         read_node_grants,
         write_grants,
         publishable_grants,
-        env: build_child_env(&policy.env, funnel),
+        env: build_child_env(&policy.env, funnel || private_tmp),
         // Only the helper has direct egress under a per-host policy.
         allow_internet: !policy.net.enforce,
         // `run()` launches the co-package helper over this policy and injects its proxy env.
         egress_funnel: funnel.then(|| policy.net.clone()),
+        private_tmp,
         stdout: if spec.redact_stdout {
             WindowsStdio::Piped
         } else {
@@ -1285,11 +1287,6 @@ pub(super) mod launch {
     // ALL APPLICATION PACKAGES. Any right for this SID invalidates the default-deny
     // AppContainer assumption for that path.
     const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
-
-    /// Serializes the per-path DACL read-modify-write in [`set_ace`]. Concurrent launches
-    /// can grant/revoke on a SHARED leaf (two runs granting a common toolchain/program
-    /// dir); without this, two non-atomic RMWs race and one run's ACE is lost (its grant
-    /// then missing). A single global lock is ample — ACL edits are brief and rare.
 
     /// Verify that `cwd` is rooted beneath a protected DACL and that neither it nor any
     /// ancestor up to that boundary grants ALL APPLICATION PACKAGES access. Inherited AAP
@@ -1926,6 +1923,22 @@ pub(super) mod launch {
         // the caller closes its WindowsResource while commands are still running.
         _lease: super::windows_registry::Acquired,
         sid: SidGuard,
+        private_tmp: Option<PathBuf>,
+    }
+
+    impl Drop for ResourceState {
+        fn drop(&mut self) {
+            let result = (|| {
+                let _operation = super::windows_registry::OperationLock::acquire("resources")?;
+                self._lease.close()?;
+                recover_idle_resources(false, false)
+            })();
+            if let Err(error) = result {
+                // Drop cannot return an error, but failed cleanup must remain
+                // journaled and visible rather than become silent idle retention.
+                tracing::warn!(%error, "sandbox resource close requires cleanup");
+            }
+        }
     }
 
     pub(crate) struct WindowsResource {
@@ -1939,13 +1952,20 @@ pub(super) mod launch {
         _state: Arc<ResourceState>,
     }
 
+    #[cfg(test)]
+    impl WindowsLease {
+        pub(crate) fn is_live(&self) -> bool {
+            self._state._lease.has_live_lease()
+        }
+    }
+
     impl AppContainerLaunch {
         pub(crate) fn acquire(self) -> io::Result<WindowsResource> {
             let _operation = super::windows_registry::OperationLock::acquire("resources")?;
             for path in self.read_grants.iter().chain(&self.write_grants) {
                 super::windows_registry::reject_registry_grant(path)?;
             }
-            recover_idle_resources(false)?;
+            recover_idle_resources(false, true)?;
             let mut resource = super::windows_registry::acquire(reusable_identity(&self)?)?;
             if !resource.fresh {
                 super::windows_registry::validate_entry(&resource.entry)?;
@@ -1957,8 +1977,23 @@ pub(super) mod launch {
                 derive_appcontainer(&name)?
             });
             let ac_sid = sid.0;
+            let profile_folder = appcontainer_folder(ac_sid)?;
+            let private_tmp = self.private_tmp.then(|| profile_folder.join("Temp"));
             if resource.fresh {
-                resource.record_private_path(&appcontainer_folder(ac_sid)?)?;
+                resource.record_private_path(&profile_folder)?;
+                if let Some(path) = &private_tmp {
+                    resource.record_mutation(super::windows_registry::AclMutation {
+                        path: path.to_string_lossy().into_owned(),
+                        kind: super::windows_registry::AclKind::PrivateProfile,
+                        access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                    })?;
+                    std::fs::create_dir_all(path)?;
+                    grant_leaf_ace(
+                        path,
+                        ac_sid,
+                        GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                    )?;
+                }
             }
             // Window objects are session-local, whereas profiles are user-global.
             // Journal each session's station/desktop before changing either DACL.
@@ -2048,6 +2083,7 @@ pub(super) mod launch {
                 state: Arc::new(ResourceState {
                     _lease: resource,
                     sid,
+                    private_tmp,
                 }),
             })
         }
@@ -2062,6 +2098,10 @@ pub(super) mod launch {
             WindowsLease {
                 _state: self.state.clone(),
             }
+        }
+        #[cfg(test)]
+        pub(crate) fn private_tmp(&self) -> Option<&Path> {
+            self.state.private_tmp.as_deref()
         }
         #[cfg(test)]
         pub(crate) fn profile_name(&self) -> &str {
@@ -2080,6 +2120,20 @@ pub(super) mod launch {
         ) -> io::Result<WindowsChild> {
             let mut plan = self.plan.clone();
             let ac_sid = self.state.sid.0;
+            if let Some(path) = &self.state.private_tmp {
+                let env = plan.env.get_or_insert_with(|| std::env::vars().collect());
+                env.retain(|key, _| {
+                    !["TEMP", "TMP", "TMPDIR"]
+                        .iter()
+                        .any(|name| key.eq_ignore_ascii_case(name))
+                });
+                let path = super::strip_verbatim_prefix(path.clone())
+                    .to_string_lossy()
+                    .into_owned();
+                for key in ["TEMP", "TMP", "TMPDIR"] {
+                    env.insert(key.to_string(), path.clone());
+                }
+            }
             // 3. Capabilities: internetClient iff egress allowed, and nothing else. The
             //    ancestor chain contributes none — see the DEAD note in 2b.
             let mut cap_sid_owned: Option<CapSid> = None;
@@ -2717,6 +2771,7 @@ pub(super) mod launch {
             launch.egress_funnel.is_some(),
         )?
         .with_network(launch.egress_funnel.as_ref())
+        .map(|identity| identity.with_private_tmp(launch.private_tmp))
     }
 
     /// Derive the stable SID for an already-created policy-named profile.  This is
@@ -2777,12 +2832,12 @@ pub(super) mod launch {
     /// journaled Nub ACEs are removed; no whole-DACL snapshot is ever restored.
     pub(crate) fn cleanup_resources() -> io::Result<()> {
         let _operation = super::windows_registry::OperationLock::acquire("resources")?;
-        recover_idle_resources(true)
+        recover_idle_resources(true, false)
     }
 
-    fn recover_idle_resources(all: bool) -> io::Result<()> {
+    fn recover_idle_resources(all: bool, reserve_slot: bool) -> io::Result<()> {
         let mut first_error = None;
-        for entry in super::windows_registry::begin_recovery(all)? {
+        for entry in super::windows_registry::begin_recovery(all, reserve_slot)? {
             let result = (|| {
                 let sid = derive_appcontainer(&entry.profile_name)?;
                 let _sid = SidGuard(sid);
@@ -2827,7 +2882,9 @@ pub(super) mod launch {
             }
             super::windows_registry::finish_recovery(&entry, result)?;
         }
-        if all && let Some(error) = first_error {
+        if (all || !reserve_slot)
+            && let Some(error) = first_error
+        {
             return Err(error);
         }
         Ok(())

@@ -97,37 +97,9 @@ pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, 
             ));
         }
     }
-    // Authored filesystem policy is positive-only. Secret filtering remains an environment
-    // concern; policy-file and secret-file denies belong only to explicit secure presets.
+    // Authored filesystem policy is positive-only. Credentials are handled through the
+    // environment policy; filesystem grants are not implicitly subtracted.
     Ok(FsPolicy { rules: set, tmp })
-}
-
-/// Secure presets self-exclude EVERY policy source file (`ctx.policy_files`) from every fs grant: append
-/// an exact-path DENY (read AND write) per file so a sandboxed process can neither read nor
-/// tamper with the policy that confines it, even under a broad `fs: ["."]`/`["/"]`. Mirrors
-/// [`finalize_env_deny`]: appended AFTER all user + default entries, so last-match-wins
-/// makes it authoritative over any earlier allow of those exact paths.
-///
-/// Skipped in the same two cases the secure secret-file floor is (and for the same reason — the deny
-/// would be inert noise): a FULLY-relaxed axis (`fs: true` — the explicit escape hatch),
-/// and a no-read policy (a deny of an already-unreadable file; and since fs has no
-/// write-without-read, no read ⇒ no write ⇒ the file is already fully denied). An empty
-/// `policy_files` (an inline policy with no distinct source file) is a no-op.
-fn finalize_policy_file_deny(set: &mut FsRuleSet, ctx: &CompileCtx) {
-    if ctx.policy_files.is_empty() {
-        return;
-    }
-    let fully_relaxed = set.default_effect == Effect::Allow && set.entries.is_empty();
-    let grants_read = set.default_effect == Effect::Allow
-        || set.entries.iter().any(|e| e.effect == Effect::Allow);
-    if fully_relaxed || !grants_read {
-        return;
-    }
-    set.entries.extend(
-        ctx.policy_files
-            .iter()
-            .map(|f| defaults::policy_file_deny_rule(f)),
-    );
 }
 
 /// `$tmp` is a managed per-run directory. A suffix cannot name a stable path, so reject it.
@@ -268,45 +240,11 @@ fn fold_tooldirs_object_entry(
     Ok(true)
 }
 
-/// Inject the secure-preset secret-FILE READ-deny (`.env*` + `.npmrc`) as an UNCONDITIONAL floor
-/// — the highest-precedence rule on the fs axis, which no directory grant, glob, or exact
-/// path can reopen (sandbox.mdx "`.env` files are always blocked"). `.env*` files hold the
-/// exact secrets the sandbox scrubs; a project-local `.npmrc` can hardcode a registry token
-/// inside the project `./` read grant. Both are denied by default on any read-granting fs
-/// policy — including the OBJECT form. The rule composes with the last-match-wins fs algebra
-/// as two trailing DENY bands appended after all user + default entries (backends stay pure
-/// IR replicators — every one evaluates last-match-wins over these entries):
-///   band 1  — the folded user + default entries, unchanged;
-///   band 2a — the secret-file LEAF deny (`**/.env*`, `.env*`, `**/.npmrc`, `.npmrc`), so it
-///             beats every band-1 broad/glob/exact allow (the `["**", "./"]` footgun where a
-///             trailing dir-allow re-exposed `<proj>/.env`, AND a `{ "./.env": "r" }` exact
-///             allow, are BOTH closed; the same closes a project-local `.npmrc`);
-///   band 2c — the `.env*` SUBTREE deny (`**/.env*/**`, `.env*/**`), so a `.env*`-NAMED
-///             DIRECTORY's CONTENTS are denied too (`.npmrc` is always a file — no subtree).
-/// The two bands are always the LAST entries in that fixed order — `env_deny_floor_start`
-/// recognizes them positionally and the Linux backend's `is_builtin_env_glob` by
-/// membership, so this emission and those matchers are COUPLED and must change together.
-///
-/// Skipped only for a FULLY-relaxed axis (`fs: true` / `sandbox: false` — the explicit
-/// escape hatch) and for a policy that grants no reads at all (a deny-all fs), where the
-/// deny would be inert noise.
-fn finalize_env_deny(set: &mut FsRuleSet) {
-    let fully_relaxed = set.default_effect == Effect::Allow && set.entries.is_empty();
-    let grants_read = set.default_effect == Effect::Allow
-        || set.entries.iter().any(|e| e.effect == Effect::Allow);
-    if fully_relaxed || !grants_read {
-        return;
-    }
-    set.entries.extend(defaults::env_deny_leaf_rules()); // band 2a: leaf deny
-    set.entries.extend(defaults::env_deny_subtree_rules()); // band 2c: subtree deny (LAST)
-}
-
 /// One entry of the fs Array form — the per-item body, shared by direct entries and
 /// each entry of a `...:#/pointer`-spliced list so reuse composes with `$tmp` mode and
-/// `$tooldirs`. Secure presets add their own secret-file floor after folding. Reuse is checked
-/// FIRST; a naked `...`/`!...` is a migration error; then `$tmp` mode, `$tooldirs`, and
-/// the ordinary path. `tmp`/`out` are the OUTER accumulators (a spliced `$tmp` sets the
-/// outer mode); `stack` is the reuse resolution stack for cycle detection.
+/// `$tooldirs`. Reuse is checked FIRST; a naked `...`/`!...` is a migration error; then
+/// `$tmp` mode, `$tooldirs`, and the ordinary path. `tmp`/`out` are the OUTER accumulators.
+/// A spliced `$tmp` sets the outer mode. `stack` is the reuse resolution stack for cycle detection.
 fn fold_fs_array_item(
     s: &str,
     ctx: &CompileCtx,
@@ -364,8 +302,8 @@ fn fold_fs_array_entry(
 
 /// One entry of the fs Object form — the per-entry body, shared by direct entries and
 /// each entry of a `...:#/pointer`-spliced OBJECT, so an object-key spread composes with
-/// `$tmp` mode, `$tooldirs`, and the `.env*` floor for free (the object twin of
-/// [`fold_fs_array_item`]). Reuse is checked FIRST; then `$tmp` mode, `$tooldirs`, and the
+/// `$tmp` mode and `$tooldirs` (the object twin of [`fold_fs_array_item`]). Reuse is
+/// checked FIRST; then `$tmp` mode, `$tooldirs`, and the
 /// ordinary path key. `tmp`/`out` are the OUTER accumulators (a spliced `$tmp` sets the
 /// outer mode); `stack` is the reuse resolution stack for cycle detection.
 fn fold_fs_object_item(
@@ -603,23 +541,28 @@ fn deprecated_angle_sentinel_msg(p: &str) -> String {
     )
 }
 
-/// `sandbox: true`'s fs base, built DIRECTLY: the generous-read allow + the home-secret
-/// read denies, then secure-only policy-file self-exclusion and the `.env*` floor
-/// — byte-identical to what `fold_fs(["..."])` produced before P4 removed the naked-`...`
-/// splice. The home-secret denies live HERE (part of the `sandbox: true` posture), NOT
-/// as an unconditional floor on every read-granting policy.
+/// `sandbox: true`'s positive filesystem default: its project tree is readable,
+/// writes remain denied, and a managed private tmp supplies scratch space. The default
+/// deny applies everywhere else. Broad explicit user grants are deliberately literal;
+/// the compiler does not subtract secret or policy-file paths from them.
 pub(super) fn secure_default_fs(ctx: &CompileCtx) -> FsPolicy {
     let mut set = FsRuleSet {
         entries: Vec::new(),
         default_effect: Effect::Deny,
     };
-    set.entries.push(defaults::generous_read_allow());
-    set.entries.extend(defaults::secret_read_denies(&ctx.homes));
-    finalize_policy_file_deny(&mut set, ctx);
-    finalize_env_deny(&mut set);
+    set.entries.extend(
+        defaults::subtree_globs(&ctx.homes.project.to_string_lossy())
+            .into_iter()
+            .map(|matcher| FsRule {
+                matcher: CanonGlob(matcher),
+                effect: Effect::Allow,
+                access: FsAccess::Read,
+                origin: FsOrigin::Authored,
+            }),
+    );
     FsPolicy {
         rules: set,
-        tmp: TmpMode::Shared,
+        tmp: TmpMode::Private,
     }
 }
 

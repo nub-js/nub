@@ -111,8 +111,11 @@ pub fn serve_windows_egress_helper() -> ! {
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_guardian;
+
+#[cfg(target_os = "linux")]
+mod linux_lifetime;
 
 // NOT macOS-gated, unlike its siblings: only the `log show` call inside is, and compiling the
 // module everywhere keeps its record parser under test on every platform's CI leg rather than the
@@ -478,7 +481,6 @@ pub(crate) struct SupervisedPlan {
     /// Landlock ruleset held open until the fork consumes its fd; `None` = no fs boundary.
     pub(crate) ruleset: Option<linux_landlock::LandlockRuleset>,
     pub(crate) seccomp_ceiling: Option<Vec<seccompiler::sock_filter>>,
-    pub(crate) setsid: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -490,6 +492,16 @@ impl SupervisedPlan {
         stdout: linux_supervisor::SupervisedStdio,
         stderr: linux_supervisor::SupervisedStdio,
     ) -> std::io::Result<linux_supervisor::SupervisedChild> {
+        self.spawn_with_ready(stdin, stdout, stderr, |_| Ok(()))
+    }
+
+    fn spawn_with_ready(
+        self,
+        stdin: linux_supervisor::SupervisedStdio,
+        stdout: linux_supervisor::SupervisedStdio,
+        stderr: linux_supervisor::SupervisedStdio,
+        ready: impl FnOnce(i32) -> std::io::Result<()>,
+    ) -> std::io::Result<linux_supervisor::SupervisedChild> {
         let SupervisedPlan {
             egress,
             argv,
@@ -497,7 +509,6 @@ impl SupervisedPlan {
             cwd,
             ruleset,
             seccomp_ceiling,
-            setsid,
         } = self;
         let launch = linux_supervisor::SupervisedLaunch {
             argv: &argv,
@@ -507,12 +518,11 @@ impl SupervisedPlan {
                 .as_ref()
                 .map_or(-1, linux_landlock::LandlockRuleset::as_raw_fd),
             seccomp_ceiling: seccomp_ceiling.as_deref(),
-            setsid,
             stdin,
             stdout,
             stderr,
         };
-        let child = linux_supervisor::spawn_supervised(egress, launch);
+        let child = linux_supervisor::spawn_supervised_with_ready(egress, launch, ready);
         // Keep the ruleset alive across the fork+exec, exactly as the `Command` path keeps
         // `_inherited_files`: the child's `restrict_self` consumes the fd after fork.
         drop(ruleset);
@@ -539,7 +549,7 @@ pub struct PreparedChild {
     #[cfg(target_os = "windows")]
     windows_child: Option<windows::WindowsChild>,
     child_id: u32,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     guardian: Option<unix_guardian::UnixGuardian>,
     #[cfg(windows)]
     windows_job: Option<windows_job::Job>,
@@ -846,7 +856,7 @@ impl PreparedChild {
     }
 
     fn release_resources(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.guardian.take();
         #[cfg(windows)]
         self.windows_job.take();
@@ -951,16 +961,16 @@ fn kill_and_reap(child: &mut std::process::Child) {
 /// caller still holds the unreaped `Child`, so `-pid` names that child's own group or
 /// nothing. The `getpgrp` check keeps that reasoning from being the only thing between a
 /// pid and nub's own group.
-#[cfg(target_os = "linux")]
-fn confirm_group_leader(pid: i32) -> bool {
+#[cfg(unix)]
+fn confirm_group_membership(pid: i32, expected: i32) -> bool {
     // SAFETY: `getpgid` on a child of this process, `getpgrp` on ourselves — plain reads.
     unsafe {
-        if pid == libc::getpgrp() {
+        if expected == libc::getpgrp() || expected <= 0 {
             return false;
         }
         match libc::getpgid(pid) {
             -1 => std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
-            pgid => pgid == pid,
+            pgid => pgid == expected,
         }
     }
 }
@@ -1045,20 +1055,18 @@ impl Prepared {
             } else {
                 linux_supervisor::SupervisedStdio::Inherit
             };
-            let mut child =
-                plan.spawn(linux_supervisor::SupervisedStdio::Inherit, stdout, stderr)?;
+            let child = plan.spawn_with_ready(
+                linux_supervisor::SupervisedStdio::Inherit,
+                stdout,
+                stderr,
+                |group| ready(PreparedSignalTarget::Direct(-group)),
+            )?;
             let child_id = child.id();
             let signal_target = child.process_group_id().map(|group| -group);
-            if let Some(target) = signal_target
-                && let Err(error) = ready(PreparedSignalTarget::Direct(target))
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
             return Ok(PreparedChild {
                 child: None,
                 supervised_child: Some(child),
+                guardian: None,
                 child_id,
                 signal_target,
                 _proxy: self.proxy.take(),
@@ -1075,10 +1083,12 @@ impl Prepared {
         if self.redact_stderr {
             self.command.stderr(std::process::Stdio::piped());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let guardian = {
             let guardian = unix_guardian::UnixGuardian::start()?;
             guardian.join_command(&mut self.command);
+            #[cfg(target_os = "linux")]
+            linux_lifetime::attach(&mut self.command)?;
             guardian
         };
         #[allow(unused_mut)]
@@ -1093,25 +1103,26 @@ impl Prepared {
         // A REQUEST until the kernel confirms it. `confirm_group_leader` is what turns it
         // into a fact, and everything downstream — the negative signal target, the reap in
         // `wait`, the pgid handed to the host — keys on the confirmed value.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let signal_process_group =
-            self.signal_process_group && confirm_group_leader(child.id() as i32);
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if self.signal_process_group && !signal_process_group {
-            tracing::warn!(
-                "sandbox: the confined child did not become its own process-group leader; \
-                 running without descendant reaping — build tools it spawns may be orphaned \
-                 and keep writing after this command returns"
-            );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.signal_process_group
+            && !confirm_group_membership(child.id() as i32, guardian.process_group_id())
+        {
+            kill_and_reap(&mut child, Some(-guardian.process_group_id()));
+            return Err(std::io::Error::other(
+                "sandbox command did not join its owner-death guardian",
+            ));
         }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        let signal_process_group = self.signal_process_group
+            && confirm_group_membership(child.id() as i32, child.id() as i32);
         // Negative = the whole process group, and only ever after `confirm_group_leader`; see
         // `signal_process_group`. The retained-monitor launch that used to fork here was removed
         // with `linux_monitor` (epic 1.1); the Landlock path signals its child's group directly.
         #[cfg(unix)]
         let signal_target = {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let target = -guardian.process_group_id();
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let target = if signal_process_group {
                 -(child.id() as i32)
             } else {
@@ -1133,7 +1144,7 @@ impl Prepared {
             #[cfg(target_os = "windows")]
             windows_child: None,
             child_id,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             guardian: Some(guardian),
             #[cfg(windows)]
             windows_job: Some(windows_job),
@@ -1208,6 +1219,7 @@ impl Prepared {
             return PreparedChild {
                 child: None,
                 supervised_child: Some(child),
+                guardian: None,
                 child_id,
                 signal_target,
                 _proxy: self.proxy.take(),
@@ -1761,7 +1773,8 @@ fn os_str_contains_nul(value: &std::ffi::OsStr) -> bool {
 /// location. Creation failure is a hard error: the engine never silently falls back to shared
 /// tmp while claiming a private one.
 fn make_private_tmp(policy: &SandboxPolicy) -> Result<Option<tempfile::TempDir>, Degradation> {
-    if policy.fs.tmp != crate::policy::TmpMode::Private {
+    // Windows acquires the stable profile-owned slot with its persistent native lease.
+    if cfg!(windows) || policy.fs.tmp != crate::policy::TmpMode::Private {
         return Ok(None);
     }
     tempfile::Builder::new()

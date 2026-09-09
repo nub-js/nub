@@ -424,7 +424,6 @@ fn build_supervised_plan(
             lost: vec!["net".to_string()],
             reason: Some(reason),
         })?,
-        setsid: true,
     })
 }
 
@@ -752,7 +751,9 @@ fn build_seccomp_for(
     }
 }
 
-fn prepend_x86_64_unsupported_abi_guard(mut program: BpfProgram) -> Result<BpfProgram, String> {
+pub(super) fn prepend_x86_64_unsupported_abi_guard(
+    mut program: BpfProgram,
+) -> Result<BpfProgram, String> {
     const MAX_BPF_INSTRUCTIONS: usize = 4096;
     const LEGACY_CONFUSED_ABI_FIRST: u32 = 512;
     const LEGACY_CONFUSED_ABI_LAST: u32 = 547;

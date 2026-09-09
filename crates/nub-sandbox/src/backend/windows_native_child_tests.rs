@@ -42,6 +42,7 @@ fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
         env: Some(env),
         allow_internet: false,
         egress_funnel: None,
+        private_tmp: false,
         stdout: WindowsStdio::Piped,
         stderr: WindowsStdio::Piped,
     }
@@ -87,6 +88,15 @@ fn windows_native_child_fixture() {
             eprintln!("native-stderr");
             println!("{}", super::windows_token_report());
         }
+        "tmp" => {
+            let tmp = std::env::var("TMP").unwrap();
+            assert_eq!(std::env::var("TEMP").unwrap(), tmp);
+            assert_eq!(std::env::var("TMPDIR").unwrap(), tmp);
+            let path = std::env::temp_dir().join("managed-marker");
+            std::fs::write(&path, b"managed-slot").unwrap();
+            println!("managed-temp:{}", path.display());
+            println!("{}", super::windows_token_report());
+        }
         "tree" => {
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", FIXTURE, "--nocapture", "--test-threads=1"])
@@ -103,16 +113,26 @@ fn windows_native_child_fixture() {
             }
         }
         "owner" => {
-            let resource = plan(&root, "hold").acquire().unwrap();
+            let mut launch = plan(&root, "hold");
+            launch.private_tmp = true;
+            let resource = launch.acquire().unwrap();
             let child = resource
                 .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
                 .unwrap();
             wait_for_file(&root.join(format!("ready-{}", child.id())));
+            let record = root.join(format!("owner-{}", std::process::id()));
+            let pending = record.with_extension("pending");
             std::fs::write(
-                root.join(format!("owner-{}", std::process::id())),
-                format!("{}\n{}", resource.profile_name(), child.id()),
+                &pending,
+                format!(
+                    "{}\n{}\n{}",
+                    resource.profile_name(),
+                    child.id(),
+                    resource.private_tmp().unwrap().display()
+                ),
             )
             .unwrap();
+            std::fs::rename(pending, record).unwrap();
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).unwrap();
             drop(child);
@@ -249,12 +269,17 @@ fn windows_native_independent_owner_death_reaps_only_its_command() {
         let path = root.path().join(format!("owner-{}", owner.id()));
         wait_for_file(&path);
         let text = std::fs::read_to_string(path).unwrap();
-        let (profile, pid) = text.split_once('\n').unwrap();
-        (profile.to_string(), pid.parse::<u32>().unwrap())
+        let mut lines = text.lines();
+        (
+            lines.next().unwrap().to_string(),
+            lines.next().unwrap().parse::<u32>().unwrap(),
+            PathBuf::from(lines.next().unwrap()),
+        )
     };
-    let (profile_a, child_a) = record(&a);
-    let (profile_b, child_b) = record(&b);
+    let (profile_a, child_a, tmp_a) = record(&a);
+    let (profile_b, child_b, tmp_b) = record(&b);
     assert_eq!(profile_a, profile_b);
+    assert_eq!(tmp_a, tmp_b);
     a.kill().unwrap();
     a.wait().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -272,6 +297,81 @@ fn windows_native_independent_owner_death_reaps_only_its_command() {
     drop(b.stdin.take());
     assert!(b.wait().unwrap().success());
     assert!(!is_running(child_b));
-    let resource = plan(root.path(), "hold").acquire().unwrap();
+    let mut launch = plan(root.path(), "hold");
+    launch.private_tmp = true;
+    let resource = launch.acquire().unwrap();
     assert_eq!(resource.profile_name(), profile_a);
+    assert_eq!(resource.private_tmp(), Some(tmp_a.as_path()));
+}
+
+#[test]
+fn windows_native_managed_tmp_reuses_slot_without_retaining_command_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let mut first = plan(root.path(), "tmp");
+    first.private_tmp = true;
+    let mut second = first.clone();
+    for (launch, value) in [(&mut first, "caller-one"), (&mut second, "caller-two")] {
+        launch
+            .env
+            .as_mut()
+            .unwrap()
+            .insert("tMp".into(), value.into());
+        launch
+            .env
+            .as_mut()
+            .unwrap()
+            .insert("TEMP".into(), value.into());
+    }
+    let first = first.acquire().unwrap();
+    let slot = first.private_tmp().unwrap().to_path_buf();
+    let identity = first.identity().to_string();
+    let keepalive = first.lease();
+    drop(first);
+    assert!(
+        keepalive.is_live(),
+        "session retains the native registry lease"
+    );
+    assert!(
+        slot.is_dir(),
+        "session lease protects a resource between commands"
+    );
+    let second = second.acquire().unwrap();
+    assert_eq!(second.identity(), identity);
+    assert_eq!(second.private_tmp(), Some(slot.as_path()));
+    let mut child = second
+        .spawn_with_stdio(
+            WindowsStdio::Null,
+            WindowsStdio::Piped,
+            WindowsStdio::Inherit,
+        )
+        .unwrap();
+    let mut stdout = String::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(stdout.contains("is_appcontainer=true"));
+    assert_eq!(
+        std::fs::read(slot.join("managed-marker")).unwrap(),
+        b"managed-slot"
+    );
+    drop(child);
+    drop(second);
+    drop(keepalive);
+}
+
+#[test]
+fn windows_native_explicit_grant_changes_never_share_managed_tmp() {
+    let root = tempfile::tempdir().unwrap();
+    let unique = tempfile::tempdir().unwrap();
+    let mut first = plan(root.path(), "hold");
+    first.private_tmp = true;
+    let mut second = first.clone();
+    second.read_grants.push(unique.path().to_path_buf());
+    let first = first.acquire().unwrap();
+    let second = second.acquire().unwrap();
+    assert_ne!(first.identity(), second.identity());
+    assert_ne!(first.private_tmp(), second.private_tmp());
 }

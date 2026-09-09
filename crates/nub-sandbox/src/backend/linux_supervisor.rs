@@ -1935,8 +1935,7 @@ pub(super) struct SupervisedChild {
     control: Arc<WorkerControl>,
     /// Set once `waitpid` has reaped `pid`, so `Drop` neither re-kills nor double-reaps.
     reaped: bool,
-    /// The child leads its own session (`setsid`), so `-pid` names its whole descendant tree.
-    group_leader: bool,
+    guardian: Option<super::unix_guardian::UnixGuardian>,
     status: Option<std::process::ExitStatus>,
     pub(super) stdin: Option<std::process::ChildStdin>,
     pub(super) stdout: Option<std::process::ChildStdout>,
@@ -1955,9 +1954,7 @@ impl SupervisedChild {
     }
 
     pub(super) fn kill(&mut self) -> io::Result<()> {
-        if self.group_leader {
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-        }
+        self.guardian.take();
         if self.reaped {
             return Ok(());
         }
@@ -2000,9 +1997,7 @@ impl SupervisedChild {
             }
         }
         self.reaped = true;
-        if self.group_leader {
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-        }
+        self.guardian.take();
         self.stop_supervisor();
         let status = std::process::ExitStatus::from_raw(status);
         self.status = Some(status);
@@ -2023,7 +2018,9 @@ impl SupervisedChild {
     /// The child's process-GROUP id — `Some` only when it leads its own group, the sole state
     /// in which `-pid` names the child's tree and nothing else. See [`SupervisedChild`].
     pub(super) fn process_group_id(&self) -> Option<i32> {
-        self.group_leader.then_some(self.pid)
+        self.guardian
+            .as_ref()
+            .map(super::unix_guardian::UnixGuardian::process_group_id)
     }
 
     /// Reap the child and return its exit status. When it leads its own group, best-effort
@@ -2065,9 +2062,6 @@ pub(super) struct SupervisedLaunch<'a> {
     pub ruleset_fd: RawFd,
     /// The shared deny-ceiling filter (io_uring/keyctl/xattr/…), installed before the notifier.
     pub seccomp_ceiling: Option<&'a [seccompiler::sock_filter]>,
-    /// Put the child in its own session (`setsid`): detaches the controlling terminal (the
-    /// `TIOCSTI` defence) and gives the parent a group to reap.
-    pub setsid: bool,
     pub stdin: SupervisedStdio,
     pub stdout: SupervisedStdio,
     pub stderr: SupervisedStdio,
@@ -2206,6 +2200,30 @@ mod lifecycle_tests {
     #[test]
     #[ignore = "requires a Linux runner permitting unprivileged seccomp notification and pidfd_getfd"]
     fn native_supervised_streams_status_and_repeated_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-execute");
+        let argv = [
+            CString::new("/usr/bin/touch").unwrap(),
+            CString::new(marker.as_os_str().as_encoded_bytes()).unwrap(),
+        ];
+        let launch = SupervisedLaunch {
+            argv: &argv,
+            envp: &[],
+            cwd: None,
+            ruleset_fd: -1,
+            seccomp_ceiling: None,
+            stdin: SupervisedStdio::Null,
+            stdout: SupervisedStdio::Null,
+            stderr: SupervisedStdio::Null,
+        };
+        let result = spawn_supervised_with_ready(policy("example.test"), launch, |_| {
+            Err(io::Error::other("ready callback rejected launch"))
+        });
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "ready failure must precede workload execution"
+        );
         for _ in 0..24 {
             let argv = [
                 CString::new("/bin/sh").unwrap(),
@@ -2219,7 +2237,6 @@ mod lifecycle_tests {
                 cwd: None,
                 ruleset_fd: -1,
                 seccomp_ceiling: None,
-                setsid: true,
                 stdin: SupervisedStdio::Piped,
                 stdout: SupervisedStdio::Piped,
                 stderr: SupervisedStdio::Piped,
@@ -2278,11 +2295,20 @@ impl Drop for ForkGuard {
 /// Fork `launch.argv` as a fully-confined child under the connect-notifier, start its supervisor
 /// thread, and return a handle the caller reaps. The supervisor and pidfd handoff retain the
 /// full child confinement a library launch needs
-/// (setsid, `PDEATHSIG`, cloexec sweep, `no_new_privs`, capability drop, Landlock, the seccomp
+/// (guardian membership, `PDEATHSIG`, cloexec sweep, `no_new_privs`, capability drop, Landlock, the seccomp
 /// ceiling) and returning rather than blocking on `waitpid`.
+#[cfg(test)]
 pub(super) fn spawn_supervised(
     policy: EgressPolicy,
     launch: SupervisedLaunch,
+) -> io::Result<SupervisedChild> {
+    spawn_supervised_with_ready(policy, launch, |_| Ok(()))
+}
+
+pub(super) fn spawn_supervised_with_ready(
+    policy: EgressPolicy,
+    launch: SupervisedLaunch,
+    ready: impl FnOnce(i32) -> io::Result<()>,
 ) -> io::Result<SupervisedChild> {
     // Built in the PARENT and copied into the child by `fork`; the child installs it without
     // allocating. The write-intent dispatch is present only when the policy carries carve-outs.
@@ -2296,6 +2322,8 @@ pub(super) fn spawn_supervised(
             "empty supervised argv",
         ));
     }
+    let guardian = super::unix_guardian::UnixGuardian::start()?;
+    let lifetime_filter = super::linux_lifetime::program(true)?;
     let (c2p_read, c2p_write) = pipe_owned()?;
     let (p2c_read, p2c_write) = pipe_owned()?;
     let c2p = [c2p_read.as_raw_fd(), c2p_write.as_raw_fd()];
@@ -2328,7 +2356,7 @@ pub(super) fn spawn_supervised(
         unsafe {
             libc::close(c2p[0]);
             libc::close(p2c[1]);
-            if launch.setsid && libc::setsid() < 0 {
+            if guardian.child_join() != 0 {
                 libc::_exit(10);
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
@@ -2353,6 +2381,9 @@ pub(super) fn spawn_supervised(
             // Gates Landlock and seccomp, both of which refuse a caller that could still gain
             // privileges through a setuid `execve`.
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                libc::_exit(13);
+            }
+            if super::linux_lifetime::install(&lifetime_filter).is_err() {
                 libc::_exit(13);
             }
             if super::linux_landlock::drop_all_capabilities().is_err() {
@@ -2435,13 +2466,18 @@ pub(super) fn spawn_supervised(
         supervisor: Some(sup_thread),
         control,
         reaped: false,
-        group_leader: launch.setsid,
+        guardian: Some(guardian),
         status: None,
         stdin: stdin.parent.take().map(std::process::ChildStdin::from),
         stdout: stdout.parent.take().map(std::process::ChildStdout::from),
         stderr: stderr.parent.take().map(std::process::ChildStderr::from),
     };
     pending.0 = 0; // the returned handle now owns kill/reap, including a failed barrier write
+    ready(
+        child
+            .process_group_id()
+            .ok_or_else(|| io::Error::other("supervised command has no guardian"))?,
+    )?;
     std::fs::File::from(p2c_write).write_all(b"g")?;
     Ok(child)
 }

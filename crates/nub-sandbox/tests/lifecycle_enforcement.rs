@@ -13,6 +13,61 @@ fn native_child() {
     };
     let root = PathBuf::from(std::env::var("SANDBOX_FIXTURE_ROOT").unwrap());
     match case.as_str() {
+        #[cfg(target_os = "linux")]
+        "lifetime" => {
+            for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+                assert_eq!(unsafe { libc::syscall(syscall, 0, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM)
+                );
+            }
+            for request in [0x5412, 0x541c] {
+                assert_eq!(unsafe { libc::ioctl(-1, request, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM)
+                );
+            }
+            assert_eq!(unsafe { libc::ioctl(-1, libc::TIOCGWINSZ, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+        #[cfg(unix)]
+        "owner" => {
+            let session = sandbox(&root, "descendants");
+            let _child = session
+                .prepare(
+                    CommandSpec::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "native_child", "--nocapture"])
+                        .cwd(root.join("project")),
+                )
+                .unwrap()
+                .spawn()
+                .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        #[cfg(unix)]
+        "descendants" => {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native_child", "--nocapture"])
+                .env(CASE, "sleep")
+                .spawn()
+                .unwrap();
+            std::fs::write(root.join("project/descendant-pid"), child.id().to_string()).unwrap();
+            // The sandbox's guardian, rather than this direct child, owns reaping.
+            loop {
+                std::thread::park();
+            }
+        }
+        #[cfg(unix)]
+        "sleep" => loop {
+            std::thread::park();
+        },
         "files" => {
             assert_eq!(
                 std::fs::read(root.join("readable/input")).unwrap(),
@@ -214,4 +269,76 @@ fn net_false_blocks_native_tcp_and_udp() {
     std::fs::write(root.path().join("project/address"), address.to_string()).unwrap();
     let sandbox = sandbox(root.path(), "network");
     run(&sandbox, root.path(), "network");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_commands_cannot_detach_or_inject_terminal_input() {
+    let root = fixture();
+    for path in ["project", "readable", "cache"] {
+        std::fs::create_dir_all(root.path().join(path)).unwrap();
+    }
+    for request in [0x5412, 0x541c] {
+        assert_eq!(unsafe { libc::ioctl(-1, request, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+    let sandbox = sandbox(root.path(), "lifetime");
+    run(&sandbox, root.path(), "lifetime");
+}
+
+#[cfg(unix)]
+fn process_running(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, tail)| !tail.starts_with('Z'));
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+#[test]
+fn killing_the_owner_terminates_the_native_descendant_tree() {
+    let root = fixture();
+    for path in ["project", "readable", "cache"] {
+        std::fs::create_dir_all(root.path().join(path)).unwrap();
+    }
+    let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_child", "--nocapture"])
+        .env(CASE, "owner")
+        .env("SANDBOX_FIXTURE_ROOT", root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pid_file = root.path().join("project/descendant-pid");
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            owner.try_wait().unwrap().is_none(),
+            "owner exited before creating descendant"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .expect("descendant readiness")
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survived = process_running(pid);
+    if survived {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(!survived, "descendant survived owner SIGKILL");
 }
