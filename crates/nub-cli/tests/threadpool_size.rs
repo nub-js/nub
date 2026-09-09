@@ -304,3 +304,126 @@ fn node_compat_env_leaves_pool_alone() {
         v["size"]
     );
 }
+
+/// Run a named fixture from the threadpool fixture dir under `nub [extra_args] [env]`.
+fn run_named(name: &str, extra_args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+    let f = fixture().with_file_name(name);
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(extra_args)
+        .arg(&f)
+        .current_dir(f.parent().unwrap())
+        .env_remove("UV_THREADPOOL_SIZE")
+        .env("NUB_BIN", nub_binary());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to spawn nub");
+    assert!(
+        output.status.success(),
+        "nub exited {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+        .expect("fixture must emit valid JSON")
+}
+
+/// Nub's own value is for this process only: the preload deletes it from
+/// `process.env`, so a plain `node` child and a cluster worker start with Node's
+/// default, while a child launched through nub is sized again.
+#[test]
+fn children_keep_nodes_default_and_a_nub_child_is_sized_again() {
+    let v = run_named("children.js", &[], &[]);
+    assert!(
+        v["parent"].is_null(),
+        "the preload must strip nub's value from process.env, got {:?}",
+        v["parent"]
+    );
+    assert_eq!(
+        v["node"].as_str(),
+        Some("null"),
+        "a node child must not inherit nub's pool size"
+    );
+    assert!(
+        v["cluster"].is_null(),
+        "a cluster worker must not inherit nub's pool size, got {:?}",
+        v["cluster"]
+    );
+    let nub: usize = v["nub"]
+        .as_str()
+        .expect("a nub child must be sized again")
+        .parse()
+        .unwrap();
+    assert!(
+        nub >= 4,
+        "a nub child must be sized to at least 4, got {nub}"
+    );
+}
+
+/// A value the user set inherits exactly as it does under plain Node.
+#[test]
+fn user_value_still_inherits() {
+    let v = run_named("children.js", &[], &[("UV_THREADPOOL_SIZE", "3")]);
+    assert_eq!(v["parent"].as_str(), Some("3"));
+    assert_eq!(v["node"].as_str(), Some("3"));
+    assert_eq!(v["cluster"].as_str(), Some("3"));
+    assert_eq!(v["nub"].as_str(), Some("3"));
+}
+
+/// The workers beyond Node's four run at nice 10 on Linux, so on a busy box they
+/// only take idle cycles. CI's runners have 4 cores, where nothing is demoted, so
+/// the test stands in for the launcher: a value equal to the ownership marker is
+/// nub's own, which is exactly what a nested launcher hands the preload.
+#[cfg(target_os = "linux")]
+#[test]
+fn extra_workers_run_at_low_priority() {
+    let v = run(
+        &[],
+        &[
+            ("UV_THREADPOOL_SIZE", "8"),
+            ("__NUB_AUGMENTED_UV_THREADPOOL_SIZE", "8"),
+            ("__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT", "1"),
+        ],
+    );
+    assert_eq!(v["size"].as_str(), Some("8"));
+    assert!(
+        v["env"].is_null(),
+        "nub's value must be stripped from process.env"
+    );
+    assert_eq!(
+        v["workers"].as_u64(),
+        Some(8),
+        "libuv must run the sized pool: {v}"
+    );
+    let nices: Vec<i64> = v["nices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        nices,
+        vec![0, 0, 0, 0, 10, 10, 10, 10],
+        "workers 5..8 must run at nice 10"
+    );
+}
+
+/// A user's value is never demoted: nub did not size that pool, so it does not
+/// touch its threads.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_user_sized_pool_is_not_demoted() {
+    let v = run(&[], &[("UV_THREADPOOL_SIZE", "6")]);
+    assert_eq!(v["env"].as_str(), Some("6"));
+    assert_eq!(v["workers"].as_u64(), Some(6));
+    assert_eq!(
+        v["nices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n.as_i64() != Some(0))
+            .count(),
+        0,
+        "{v}"
+    );
+}

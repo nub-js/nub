@@ -2518,6 +2518,8 @@ static RESTORABLE_VARS: [RestorableVar; 6] = [
         compat: "__NUB_COMPAT_UV_THREADPOOL_SIZE",
         augmented: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE",
         augmented_present: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT",
+        // Read by the preload too (preload-common.cjs THREADPOOL_PRESENT_BIT): a
+        // value nub introduced, and only that, is stripped from `process.env`.
         bit: 1 << 5,
     },
 ];
@@ -2576,7 +2578,10 @@ pub fn threadpool_size_from(cores: usize, headroom: Option<usize>) -> usize {
 /// Whether the ambient [`THREADPOOL_SIZE_ENV`] is nub's own automatic value
 /// rather than the user's: present, and equal to the ownership marker the
 /// installing launcher stamped beside it. An env file may still set the pool
-/// size over such a value; over a shell value it may not.
+/// size over such a value; over a shell value it may not. The preload
+/// (`installThreadpoolPolicy` in preload-common.cjs) decides what to strip from
+/// `process.env` with the same marker plus the compat presence bit, because the
+/// direct spawn records a passed-through shell value under the same marker.
 pub fn threadpool_size_is_nub_default() -> bool {
     let Some(current) = env::var_os(THREADPOOL_SIZE_ENV) else {
         return false;

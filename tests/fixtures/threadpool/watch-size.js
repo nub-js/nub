@@ -3,7 +3,8 @@
 // (its parent), which lets `nub watch` return and the test read the line.
 const os = require("node:os");
 const line = JSON.stringify({
-  size: process.env.UV_THREADPOOL_SIZE ?? null,
+  size: process.env.UV_THREADPOOL_SIZE ?? process.env.__NUB_AUGMENTED_UV_THREADPOOL_SIZE ?? null,
+  env: process.env.UV_THREADPOOL_SIZE ?? null,
   cores: os.availableParallelism(),
 });
 process.stdout.write(line + "\n", () => {
