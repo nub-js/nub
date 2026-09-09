@@ -608,6 +608,22 @@ fn run_nuget_self_proc(tooldirs: bool) {
         nub_sandbox::policy::SelfProcFile::Maps,
         nub_sandbox::policy::SelfProcFile::Stat,
     ]);
+    // Named .NET mutexes use this shared path even with a private TMPDIR.
+    // This fixture explicitly accepts that coordination scope; the catalog does not.
+    std::fs::create_dir_all("/tmp/.dotnet/shm").unwrap();
+    let ctx = CompileCtx::new(
+        Homes {
+            home: root.path().join("home"),
+            cache: root.path().join("cache"),
+            tmp: root.path().join("tmp"),
+            project: root.path().join("project"),
+        },
+        root.path().join("project"),
+        ScopeCapabilities::approved(),
+        BTreeMap::new(),
+    );
+    let shared = compile(&json!({"fs": {"/tmp/.dotnet/shm": "rw"}}), &ctx).unwrap();
+    policy.fs.rules.entries.extend(shared.fs.rules.entries);
     let sandbox = Sandbox::acquire(&policy).unwrap();
     for tail in [
         &["--version"][..],

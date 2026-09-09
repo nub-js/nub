@@ -909,7 +909,7 @@ fn protect_registry_root(
     root: &Path,
     user: windows_sys::Win32::Security::PSID,
     created: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
@@ -917,8 +917,9 @@ fn protect_registry_root(
         SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, EqualSid, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
     if std::fs::symlink_metadata(root)?.file_attributes() & 0x400 != 0 {
         return Err(io::Error::other(
@@ -927,15 +928,16 @@ fn protect_registry_root(
     }
     let path = wide(&root.to_string_lossy());
     let mut owner = std::ptr::null_mut();
+    let mut existing_acl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
     let result = unsafe {
         GetNamedSecurityInfoW(
             path.as_ptr(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut existing_acl,
             std::ptr::null_mut(),
             &mut descriptor,
         )
@@ -944,8 +946,30 @@ fn protect_registry_root(
         return Err(io::Error::from_raw_os_error(result as i32));
     }
     let owned = unsafe { EqualSid(owner, user) } != 0;
+    // Reapplying an inheritable DACL walks the live journal children. Other
+    // acquisitions reach this before their resource lock, so those walks can
+    // race atomic journal replacement. Validate an unchanged root without writes.
+    let mut control = 0;
+    let mut revision = 0;
+    let mut ace = std::ptr::null_mut();
+    let private = owned
+        && unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0
+        && control & SE_DACL_PROTECTED != 0
+        && !existing_acl.is_null()
+        && unsafe { (*existing_acl).AceCount } == 1
+        && unsafe { GetAce(existing_acl, 0, &mut ace) } != 0
+        && unsafe {
+            let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            ace.Header.AceType == 0
+                && ace.Header.AceFlags == 3
+                && ace.Mask == 0x001f_01ff
+                && EqualSid(std::ptr::addr_of!(ace.SidStart).cast_mut().cast(), user) != 0
+        };
     unsafe {
         LocalFree(descriptor);
+    }
+    if private {
+        return Ok(false);
     }
     if !owned && !created {
         return Err(io::Error::other(
@@ -992,7 +1016,7 @@ fn protect_registry_root(
     if result != 0 {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn reject_registry_grant(path: &Path) -> io::Result<()> {
@@ -1069,6 +1093,11 @@ fn save(root: &Path, file: &RegistryFile) -> io::Result<()> {
         } == 0
         {
             let error = io::Error::last_os_error();
+            #[cfg(test)]
+            eprintln!(
+                "WINDOWS_REGISTRY_ERROR replace-journal {}: {error:?}",
+                destination.display()
+            );
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
@@ -1235,6 +1264,33 @@ pub(crate) fn test_entry(profile: &str) -> io::Result<Option<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_registry_validation_does_not_rewrite_unchanged_acls() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, sid) = current_user_sid().unwrap();
+        let user = sid.as_ptr().cast_mut().cast();
+        assert!(protect_registry_root(root.path(), user, true).unwrap());
+        assert!(!protect_registry_root(root.path(), user, false).unwrap());
+
+        // An unexpected additional principal must still be removed on validation.
+        super::super::launch::test_set_profile_ace(
+            "nub-test-registry-validation",
+            root.path(),
+            true,
+        )
+        .unwrap();
+        assert!(protect_registry_root(root.path(), user, false).unwrap());
+        assert!(!protect_registry_root(root.path(), user, false).unwrap());
+        assert!(
+            !super::super::launch::test_profile_has_ace(
+                "nub-test-registry-validation",
+                root.path(),
+            )
+            .unwrap()
+        );
+    }
 
     fn id(root: &Path) -> PolicyIdentity {
         let read = root.join("read");
