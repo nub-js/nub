@@ -5,6 +5,7 @@ on:
     branches: [sandbox-git-runtime]
     paths:
       - crates/nub-sandbox/tests/git_tool_functionality.rs
+      - crates/nub-sandbox/tests/windows_subprocess_diagnostics.rs
       - .github/workflows/sandbox-git-runtime.yml
 
 permissions:

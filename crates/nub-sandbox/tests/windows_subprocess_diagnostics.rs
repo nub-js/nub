@@ -73,9 +73,17 @@ fn subprocess_owner() {
                 "stderr": String::from_utf8_lossy(&output.stderr)})
         })
     } else {
-        command
-            .status()
-            .map(|status| json!({"success": status.success(), "code": status.code()}))
+        command.status().map(|status| {
+            let mut result = json!({"success": status.success(), "code": status.code()});
+            if mode == "file_output" {
+                for name in ["stdout", "stderr"] {
+                    result[name] = json!(String::from_utf8_lossy(
+                        &std::fs::read(project.join(name)).unwrap()
+                    ));
+                }
+            }
+            result
+        })
     };
     let result = result.unwrap_or_else(|error| {
         json!({"success": false, "os_error": error.raw_os_error(), "error": error.to_string()})
@@ -153,6 +161,7 @@ fn windows_subprocess_startup_controls() {
     std::fs::create_dir(&project).unwrap();
     std::fs::write(project.join("input"), "").unwrap();
     std::fs::write(root.path().join("canary"), "synthetic-canary").unwrap();
+    let mut failed_descriptor_controls = Vec::new();
     for target in &targets {
         for mode in [
             "inherit",
@@ -216,20 +225,22 @@ fn windows_subprocess_startup_controls() {
             );
             let output = tool_output::output(prepared);
             assert!(output.status.success(), "confined owner failed: {output:?}");
-            let result = record(&output.stdout, &output.stderr);
+            let mut result = record(&output.stdout, &output.stderr);
+            result["owner_stderr"] = json!(String::from_utf8_lossy(&output.stderr));
             assert_eq!(
                 result["canary_readable"], false,
                 "confinement control: {result}"
             );
             println!("SUBPROCESS_CONFINED {result}");
-            if mode == "inherit" || mode == "file_output" {
-                assert_eq!(
-                    result["result"]["success"], true,
-                    "descriptor-backed control: {result}"
-                );
+            if (mode == "inherit" || mode == "file_output") && result["result"]["success"] != true {
+                failed_descriptor_controls.push(result);
             }
             sandbox.close();
         }
     }
     nub_sandbox::cleanup().unwrap();
+    assert!(
+        failed_descriptor_controls.is_empty(),
+        "descriptor-backed controls failed: {failed_descriptor_controls:?}"
+    );
 }
