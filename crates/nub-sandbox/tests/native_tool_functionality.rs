@@ -592,6 +592,49 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     operations(name, &tool, root.path(), &env, policy.as_ref());
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires pinned Gradle; diagnoses the explicitly acknowledged net-full limit"]
+fn windows_gradle_with_limited_network() {
+    let tool = tool("gradle");
+    let root = fixture();
+    let env = env_for(root.path(), &tool);
+    write_projects(root.path());
+    let policy = policy(root.path(), &tool, env.clone(), true);
+    let sandbox = Sandbox::acquire(&policy).expect("limited-network sandbox acquires");
+    for tail in [
+        &["--offline", "--no-daemon", "--stacktrace", "fixture"][..],
+        &["--offline", "--no-daemon", "--stacktrace", "fixture"][..],
+        &["--stop"][..],
+    ] {
+        let args: Vec<_> = tool
+            .prefix
+            .iter()
+            .cloned()
+            .chain(tail.iter().map(|arg| (*arg).to_owned()))
+            .collect();
+        let spec = CommandSpec::new(std::env::var_os("COMSPEC").unwrap())
+            .verbatim_command_line(format!(
+                "/d /s /c \"{}\"",
+                command_line(&tool.program, &args)
+            ))
+            .cwd(root.path().join("project"))
+            .redact_stdout(true)
+            .redact_stderr(true);
+        let prepared = sandbox
+            .prepare(spec)
+            .expect("limited-network command prepares");
+        // This diagnostic explicitly accepts a narrower network capability than
+        // net:true requested. The strict raw fixture above still refuses it.
+        assert_eq!(prepared.degradation.lost, vec!["net-full".to_owned()]);
+        eprintln!("GRADLE_LIMITED_NETWORK {:?} {tail:?}", prepared.degradation);
+        let output = tool_output::output(prepared);
+        assert_ok(&tool, "limited-network execution", output);
+    }
+    sandbox.close();
+    nub_sandbox::cleanup().expect("limited-network resources are reclaimed");
+}
+
 fn cargo_project_target(tooldirs: Option<bool>) {
     let tool = tool("cargo");
     eprintln!(
