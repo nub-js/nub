@@ -12,6 +12,8 @@ const root = path.resolve(args.get("--out"));
 const target = args.get("--target") ?? "26.6.0";
 const expectCache = args.get("--expect-cache") !== "false";
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("NODE_") && !key.startsWith("__NUB_") && !key.startsWith("NUB_")));
+for (const key of ["NVM_DIR", "FNM_DIR", "VOLTA_HOME", "ASDF_DATA_DIR", "MISE_DATA_DIR"]) delete env[key];
+env.PATH = path.dirname(process.execPath) + path.delimiter + env.PATH;
 if (process.env.__NUB_LAUNCHER_TEMPLATE) env.__NUB_LAUNCHER_TEMPLATE = process.env.__NUB_LAUNCHER_TEMPLATE;
 fs.mkdirSync(root, { recursive: true });
 const source = path.join(root, "source");
@@ -42,6 +44,10 @@ write("small.mjs", "console.log('small program');");
 
 const ext = process.platform === "win32" ? ".exe" : "";
 const effect = path.join(root, "build-effect");
+check(spawnSync(process.execPath, [path.join(source, "main.mjs")], {
+  env, encoding: "utf8", timeout: 30000,
+}), "plain Node control");
+console.log("PASS plain Node control");
 function compile(name, entry, flags) {
   const out = path.join(root, name + ext);
   const result = spawnSync(nub, ["compile", path.join(source, entry), "--out", out, "--target", target, ...flags], {
@@ -80,7 +86,7 @@ if (expectCache) assert.match(cold.result.stderr, /V8 code cache for ESM .*cache
 run("warm");
 run("disabled", { NODE_DISABLE_COMPILE_CACHE: "1" });
 run("portable", { NODE_COMPILE_CACHE: path.join(root, "portable"), NODE_COMPILE_CACHE_PORTABLE: "1" });
-run("different-flags", { NODE_OPTIONS: "--no-lazy" });
+run("different-flags", { NODE_OPTIONS: "--jitless" });
 fs.writeFileSync(path.join(root, "not-a-directory"), "cache unavailable");
 run("unwritable-cache", { NODE_COMPILE_CACHE: path.join(root, "not-a-directory") });
 const preload = path.join(root, "preload.cjs");

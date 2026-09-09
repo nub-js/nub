@@ -1277,6 +1277,11 @@ jobs:
           test -f "$launcher"
           export __NUB_LAUNCHER_TEMPLATE="$launcher"
           cargo test -p nub-cli --features compile --test integration compile_artifact_process_bootstrap_topology -- --exact
+          compiler="$GITHUB_WORKSPACE/target/debug/nub"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then compiler="$compiler.exe"; fi
+          node tests/compile-code-cache/probe.mjs \
+            --nub "$compiler" --target "$(node -p process.versions.node)" \
+            --out "$RUNNER_TEMP/nub-compile-code-cache"
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             cargo test -p nub-cli --features compile --test integration
           fi
