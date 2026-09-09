@@ -5,16 +5,16 @@ use super::*;
 const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
 pub(super) fn check_atomic_addfd(nfd: RawFd) -> io::Result<()> {
-    // The child is still behind the launch barrier: there are no notifications.
-    // A supported ioctl validates flags and srcfd before looking up this absent id.
+    // A supported ioctl validates flags before looking up srcfd. An invalid
+    // source descriptor probes SEND support without ever injecting a descriptor.
     let mut add = SeccompNotifAddfd {
         id: u64::MAX,
         flags: SECCOMP_ADDFD_FLAG_SEND,
-        srcfd: nfd as u32,
+        srcfd: u32::MAX,
         ..Default::default()
     };
     if ioctl_notif(nfd, notif_addfd(), &mut add as *mut _ as *mut libc::c_void) < 0
-        && errno() == libc::ENOENT
+        && errno() == libc::EBADF
     {
         Ok(())
     } else {

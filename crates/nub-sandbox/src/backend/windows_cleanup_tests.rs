@@ -417,13 +417,26 @@ fn windows_cleanup_reuses_equivalent_profile_across_processes_without_killing_su
     };
     let mut first = OwnerFixture(owner());
     let mut second = OwnerFixture(owner());
-    let read = |child: &std::process::Child| {
+    let read = |child: &mut std::process::Child| {
         let p = root.path().join(format!("owner-{}", child.id()));
-        wait_for(&p);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !p.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "owner {} exited before readiness; acquisition diagnostics are on stderr",
+                child.id()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                p.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::read_to_string(p).unwrap()
     };
-    let a = read(&first.0);
-    let b = read(&second.0);
+    let a = read(&mut first.0);
+    let b = read(&mut second.0);
     assert_eq!(
         a.lines().next(),
         b.lines().next(),
@@ -439,6 +452,27 @@ fn windows_cleanup_reuses_equivalent_profile_across_processes_without_killing_su
     );
     drop(second.0.stdin.take());
     assert!(second.0.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "concurrent independent-owner acquisition stress"]
+fn windows_cleanup_acquisition_stress() {
+    for round in 0..8 {
+        eprintln!("WINDOWS_ACQUIRE_STRESS round={round}");
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(
+                windows_cleanup_reuses_equivalent_profile_across_processes_without_killing_survivor
+            )
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+    }
+    cleanup_resources().unwrap();
 }
 
 #[test]

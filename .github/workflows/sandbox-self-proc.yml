@@ -52,6 +52,11 @@ jobs:
         if: runner.os == 'Linux'
         with:
           node-version: '22.18.0'
+      - name: Stressing concurrent Windows profile acquisitions
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib windows_cleanup_acquisition_stress -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/acquisition-stress.log
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
         if: runner.os == 'Linux'
         with:
