@@ -3,6 +3,7 @@ use nub_sandbox::{
     CommandSpec, CompileCtx, Homes, Sandbox, SandboxPolicy, ScopeCapabilities, compile,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -13,7 +14,7 @@ fn cost_child() {
     println!("SANDBOX_COST_CHILD_OK");
 }
 
-fn policy(root: &Path) -> SandboxPolicy {
+fn policy(root: &Path, tool_tree: Option<&Path>) -> SandboxPolicy {
     let mut environment = BTreeMap::new();
     for name in [
         "PATH",
@@ -38,11 +39,11 @@ fn policy(root: &Path) -> SandboxPolicy {
         ScopeCapabilities::approved(),
         environment.clone(),
     );
-    let mut policy = compile(
-        &json!({"fs": {"./": "rw", "$tmp": "rw"}, "net": false}),
-        &context,
-    )
-    .unwrap();
+    let mut input = json!({"fs": {"./": "rw", "$tmp": "rw"}, "net": false});
+    if let Some(tree) = tool_tree {
+        input["fs"][tree.to_str().unwrap()] = json!("rw");
+    }
+    let mut policy = compile(&input, &context).unwrap();
     policy.env.constructed = environment;
     policy
 }
@@ -83,9 +84,34 @@ fn record(scenario: &str, phase: &str, sample: usize, ms: f64) {
     );
 }
 
+fn tree_size(root: &Path) -> (u64, u64) {
+    let mut pending = vec![root.to_path_buf()];
+    let (mut files, mut bytes) = (0, 0);
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        if metadata.is_dir() {
+            pending.extend(
+                std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else if metadata.is_file() {
+            files += 1;
+            bytes += metadata.len();
+        }
+    }
+    (files, bytes)
+}
+
 #[test]
 #[ignore = "serialized native performance and persistent-cache cleanup probe"]
 fn native_session_costs_and_unique_policy_churn() {
+    let binary = std::env::current_exe().unwrap();
+    let digest = Sha256::digest(std::fs::read(&binary).unwrap());
+    println!(
+        "SANDBOX_COST_BINARY {}",
+        json!({"path": binary, "sha256": format!("{digest:x}"), "debug_assertions": cfg!(debug_assertions)})
+    );
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .unwrap();
@@ -103,7 +129,23 @@ fn native_session_costs_and_unique_policy_churn() {
         assert!(output.status.success());
         record("unconfined", "command", sample, elapsed(start));
     }
-    for (scenario, count) in [("empty", 0), ("populated-1000", 1000)] {
+    let real_tree =
+        std::env::var_os("SANDBOX_COST_TOOL_TREE").map(|path| std::fs::canonicalize(path).unwrap());
+    let original_tree_size = real_tree.as_deref().map(tree_size);
+    let mut scenarios = vec![("empty", 0, None), ("populated-1000", 1000, None)];
+    if let Some(tree) = real_tree.as_deref() {
+        let (files, bytes) = tree_size(tree);
+        assert!(
+            files >= 500,
+            "the real tool fixture must contain a populated package tree"
+        );
+        println!(
+            "SANDBOX_COST_TREE {}",
+            json!({"path": tree, "files": files, "bytes": bytes})
+        );
+        scenarios.push(("real-tool-tree", 0, Some(tree)));
+    }
+    for (scenario, count, tool_tree) in scenarios {
         let root = fixture.path().join(scenario);
         std::fs::create_dir(&root).unwrap();
         for index in 0..count {
@@ -113,7 +155,7 @@ fn native_session_costs_and_unique_policy_churn() {
             nub_sandbox::cleanup().unwrap();
             let total = Instant::now();
             let start = Instant::now();
-            let policy = policy(&root);
+            let policy = policy(&root, tool_tree);
             record(scenario, "resolve", sample, elapsed(start));
             let start = Instant::now();
             let session = Sandbox::acquire(&policy).unwrap();
@@ -131,7 +173,7 @@ fn native_session_costs_and_unique_policy_churn() {
             record(scenario, "evict", sample, elapsed(start));
             record(scenario, "fresh-total", sample, elapsed(total));
         }
-        let session = Sandbox::acquire(&policy(&root)).unwrap();
+        let session = Sandbox::acquire(&policy(&root, tool_tree)).unwrap();
         run(&session, &root);
         for sample in 0..32 {
             let start = Instant::now();
@@ -148,12 +190,13 @@ fn native_session_costs_and_unique_policy_churn() {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("caller-output"), b"keep").unwrap();
         let start = Instant::now();
-        let session = Sandbox::acquire(&policy(&root)).unwrap();
+        let session = Sandbox::acquire(&policy(&root, None)).unwrap();
         run(&session, &root);
         session.close();
         record("unique-policy", "create-run-close", sample, elapsed(start));
     }
     nub_sandbox::cleanup().unwrap();
+    assert_eq!(real_tree.as_deref().map(tree_size), original_tree_size);
     for sample in 0..72 {
         assert_eq!(
             std::fs::read(

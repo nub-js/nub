@@ -52,7 +52,7 @@ fn fixture() -> tempfile::TempDir {
         .prefix("sandbox-native-tool-")
         .tempdir_in(parent)
         .expect("fixture root");
-    for path in ["home", "project", "cache"] {
+    for path in ["home", "home/.m2", "project", "cache", "tmp"] {
         std::fs::create_dir_all(root.path().join(path)).expect("fixture directory");
     }
     root
@@ -102,6 +102,10 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
     }
     env.insert("GOPROXY".into(), "off".into());
     env.insert("GOSUMDB".into(), "off".into());
+    env.insert(
+        "JAVA_TOOL_OPTIONS".into(),
+        format!("-Djava.io.tmpdir={}", root.join("tmp").display()),
+    );
     env.extend(tool.tool_env.clone());
     if let Some(seed) = &tool.maven_seed {
         copy_directory(seed, &home.join(".m2/repository"));
@@ -179,8 +183,14 @@ fn policy(
         ScopeCapabilities::approved(),
         env.clone(),
     );
+    // Gradle's file-lock service uses sockets even for an offline local build.
+    // This matrix tests filesystem grants; network enforcement has separate tests.
+    let network = tool.name == "gradle";
+    if network {
+        println!("NATIVE TOOL CAPABILITY gradle network=true (file-lock service)");
+    }
     let mut policy =
-        compile(&json!({"fs": fs, "net": false}), &ctx).expect("native tool policy compiles");
+        compile(&json!({"fs": fs, "net": network}), &ctx).expect("native tool policy compiles");
     policy.env.constructed = env;
     policy
 }
@@ -268,8 +278,9 @@ fn command_line(program: &Path, args: &[String]) -> String {
 fn assert_ok(tool: &Tool, phase: &str, output: Output) {
     assert!(
         output.status.success(),
-        "{} {phase} failed:\n{}",
+        "{} {phase} failed:\nstdout:\n{}\nstderr:\n{}",
         tool.name,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -301,6 +312,11 @@ fn write_projects(root: &Path) {
     std::fs::write(
         project.join("settings.gradle"),
         "rootProject.name = 'native-fixture'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("global.json"),
+        "{\"sdk\":{\"version\":\"10.0.100\",\"rollForward\":\"disable\"}}\n",
     )
     .unwrap();
     std::fs::write(project.join("pom.xml"), "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>fixture</artifactId><version>1</version><build><plugins><plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-clean-plugin</artifactId><version>3.4.1</version></plugin></plugins></build></project>\n").unwrap();

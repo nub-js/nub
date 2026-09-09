@@ -88,31 +88,45 @@ fn policy(
     control: Control,
     extra_env: &[(&str, String)],
     extra_exact: &[(&Path, &str)],
+    standard_global_access: Option<&str>,
+    needs_global_lock: bool,
 ) -> nub_sandbox::SandboxPolicy {
     let home = root.join("home");
     let remote = root.join("remote.git");
     let mut grants = match control {
         Control::Unconfined => unreachable!("an unconfined control has no policy"),
-        Control::Exact => exact_grants(&[
-            (&remote, "rw"),
-            // Git replaces this conventional global config through this adjacent lock. These
-            // are deliberately files rather than a writable synthetic HOME.
-            (&home.join(".gitconfig"), "rw"),
-            (&home.join(".gitconfig.lock"), "rw"),
-        ]),
+        Control::Exact => Value::Object(Map::new()),
         Control::ToolDirs => {
             let mut paths = Map::new();
             paths.insert("$tooldirs".into(), Value::String("rw".into()));
-            paths.insert(
-                remote.to_string_lossy().into_owned(),
-                Value::String("rw".into()),
-            );
             Value::Object(paths)
         }
     };
     let Value::Object(ref mut entries) = grants else {
         unreachable!("all Git grants are object-form");
     };
+    // Config-only cases have no local remote. Do not turn that absent fixture path into a
+    // backend mount-source failure; a real bare remote remains an explicit narrow grant.
+    if remote.exists() {
+        entries.insert(
+            remote.to_string_lossy().into_owned(),
+            Value::String("rw".into()),
+        );
+    }
+    if let Some(access) = standard_global_access {
+        entries.insert(
+            home.join(".gitconfig").to_string_lossy().into_owned(),
+            Value::String(access.into()),
+        );
+    }
+    if needs_global_lock {
+        // Git replaces the conventional global config through this adjacent lock. This is an
+        // explicit capability test, so its absent source cannot block unrelated Git operations.
+        entries.insert(
+            home.join(".gitconfig.lock").to_string_lossy().into_owned(),
+            Value::String("rw".into()),
+        );
+    }
     for (path, access) in extra_exact {
         entries.insert(
             path.to_string_lossy().into_owned(),
@@ -222,6 +236,48 @@ fn require_git() {
         "native Git: {}",
         String::from_utf8_lossy(&output.stdout).trim()
     );
+}
+
+fn git_runtime_paths() -> Vec<PathBuf> {
+    let executable = if cfg!(windows) { "git.exe" } else { "git" };
+    let program = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|path| path.join(executable))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("Git executable must be discoverable on PATH for an explicit runtime grant");
+    let output = Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .expect("Git reports its helper directory");
+    let output = assert_success("git --exec-path", output);
+    let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    assert!(
+        exec_path.is_dir(),
+        "Git helper directory is missing: {}",
+        exec_path.display()
+    );
+
+    let mut paths = vec![
+        program.clone(),
+        program.parent().unwrap().to_path_buf(),
+        exec_path.clone(),
+    ];
+    // Git for Windows dispatches from `cmd/git.exe` into `mingw64/bin/git.exe`; Unix layouts
+    // resolve this to `/usr/bin`, already a narrow executable directory. Include only when it
+    // exists, never a broad system root.
+    if let Some(bin) = exec_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("bin"))
+        .filter(|path| path.is_dir())
+    {
+        paths.push(bin);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn prepare_remote(root: &Path) {
@@ -338,9 +394,12 @@ fn conventional_global_config(root: &Path) -> PathBuf {
 
 fn run_conventional_config_write(control: Control) {
     require_git();
+    let runtime = git_runtime_paths();
+    let runtime: Vec<_> = runtime.iter().map(|path| (path.as_path(), "r")).collect();
     let root = fixture();
     let config = conventional_global_config(root.path());
-    let policy = (control != Control::Unconfined).then(|| policy(root.path(), control, &[], &[]));
+    let policy = (control != Control::Unconfined)
+        .then(|| policy(root.path(), control, &[], &runtime, Some("rw"), true));
     assert_success(
         "write conventional global config through its adjacent lock",
         invoke(
@@ -370,10 +429,13 @@ fn run_conventional_config_write(control: Control) {
 
 fn run_operations(control: Control) {
     require_git();
+    let runtime = git_runtime_paths();
+    let runtime: Vec<_> = runtime.iter().map(|path| (path.as_path(), "r")).collect();
     let root = fixture();
     prepare_remote(root.path());
     conventional_global_config(root.path());
-    let policy = (control != Control::Unconfined).then(|| policy(root.path(), control, &[], &[]));
+    let policy = (control != Control::Unconfined)
+        .then(|| policy(root.path(), control, &[], &runtime, Some("r"), false));
     let project = root.path().join("project");
     let remote = root.path().join("remote.git");
     let clone = project.join("clone");
@@ -548,6 +610,8 @@ fn git_native_tooldirs_status_add_commit_clone_fetch_push_and_worktree() {
 #[ignore = "requires native Git tool functionality job"]
 fn git_documented_global_config_relocation_needs_an_explicit_grant() {
     require_git();
+    let runtime = git_runtime_paths();
+    let mut runtime: Vec<_> = runtime.iter().map(|path| (path.as_path(), "r")).collect();
     let root = fixture();
     let project = root.path().join("project");
     let config = root.path().join("explicit/global.gitconfig");
@@ -572,12 +636,8 @@ fn git_documented_global_config_relocation_needs_an_explicit_grant() {
             &env,
         ),
     );
-    let exact = policy(
-        root.path(),
-        Control::Exact,
-        &env,
-        &[(config.parent().unwrap(), "rw")],
-    );
+    runtime.push((config.parent().unwrap(), "rw"));
+    let exact = policy(root.path(), Control::Exact, &env, &runtime, None, false);
     assert_success(
         "explicitly granted relocated global config",
         invoke(
@@ -637,10 +697,16 @@ fn git_lfs_program() -> PathBuf {
 fn run_lfs(control: Control) {
     require_git();
     let lfs = git_lfs_program();
+    let mut runtime = git_runtime_paths();
+    runtime.push(lfs);
+    runtime.sort();
+    runtime.dedup();
+    let runtime: Vec<_> = runtime.iter().map(|path| (path.as_path(), "r")).collect();
     let root = fixture();
     prepare_remote(root.path());
-    let policy =
-        (control != Control::Unconfined).then(|| policy(root.path(), control, &[], &[(&lfs, "r")]));
+    conventional_global_config(root.path());
+    let policy = (control != Control::Unconfined)
+        .then(|| policy(root.path(), control, &[], &runtime, Some("r"), false));
     let project = root.path().join("project");
     let clone = project.join("clone");
     assert_success(
@@ -680,10 +746,88 @@ fn run_lfs(control: Control) {
             &[],
         ),
     );
+    let binary = clone.join("fixture.bin");
+    let payload = b"sandbox Git LFS payload\n";
+    std::fs::write(&binary, payload).expect("LFS object fixture");
+    assert_success(
+        "stage LFS object",
+        invoke(
+            root.path(),
+            &clone,
+            &["add", ".gitattributes", "fixture.bin"],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
+    assert_success(
+        "commit LFS object",
+        invoke(
+            root.path(),
+            &clone,
+            &["commit", "-m", "LFS fixture"],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
+    assert_success(
+        "push LFS object",
+        invoke(
+            root.path(),
+            &clone,
+            &["push", "origin", "HEAD:main"],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
+    let consumer = project.join("lfs-consumer");
+    assert_success(
+        "clone and fetch LFS object",
+        invoke(
+            root.path(),
+            &project,
+            &[
+                "clone",
+                root.path().join("remote.git").to_str().unwrap(),
+                consumer.to_str().unwrap(),
+            ],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
+    assert_success(
+        "fetch LFS object",
+        invoke(
+            root.path(),
+            &consumer,
+            &["lfs", "fetch", "origin", "main"],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
+    assert_success(
+        "checkout fetched LFS object",
+        invoke(
+            root.path(),
+            &consumer,
+            &["lfs", "checkout", "fixture.bin"],
+            control,
+            policy.as_ref(),
+            &[],
+        ),
+    );
     assert!(
         std::fs::read_to_string(clone.join(".gitattributes"))
             .unwrap()
             .contains("*.bin filter=lfs")
+    );
+    assert_eq!(
+        std::fs::read(consumer.join("fixture.bin")).unwrap(),
+        payload
     );
 }
 

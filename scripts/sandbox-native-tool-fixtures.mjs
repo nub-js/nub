@@ -23,7 +23,11 @@ function output(program, args, options = {}) {
   const command = windows && /\.(cmd|bat)$/i.test(program) ? process.env.COMSPEC ?? 'cmd.exe' : program;
   const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
   const commandArgs = command === program ? args : ['/d', '/s', '/c', `"${[program, ...args].map(quote).join(' ')}"`];
-  return execFileSync(command, commandArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], ...options }).trim();
+  return execFileSync(command, commandArgs, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+    windowsVerbatimArguments: command !== program,
+    ...options,
+  }).trim();
 }
 async function fetchFile(url, destination) {
   const response = await fetch(url);
@@ -52,6 +56,7 @@ async function installRust() {
   const hostRustup = find('rustup');
   const toolEnv = { RUSTUP_HOME: join(root, 'rustup'), CARGO_HOME: join(root, 'cargo') };
   mkdirSync(toolEnv.RUSTUP_HOME, { recursive: true });
+  mkdirSync(toolEnv.CARGO_HOME, { recursive: true });
   output(hostRustup, ['toolchain', 'install', pins.cargo, '--profile', 'minimal', '--no-self-update'], { env: { ...process.env, ...toolEnv } });
   return { cargo: find('cargo'), rustup: hostRustup, toolEnv };
 }

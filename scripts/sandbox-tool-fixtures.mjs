@@ -67,7 +67,9 @@ function unpackWindowsX64Bun(prefix, spec) {
     npmCli(), 'pack', spec, '--ignore-scripts', '--json', '--pack-destination', prefix,
   ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
   if (packed.length !== 1) throw new Error(`unexpected packed files for ${spec}`);
-  execFileSync('tar', ['-xzf', join(prefix, packed[0].filename), '-C', destination, '--strip-components=1'], {
+  // Git's tar interprets a drive-letter archive as a remote host. Use Windows' bsdtar.
+  const tar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
+  execFileSync(tar, ['-xzf', join(prefix, packed[0].filename), '-C', destination, '--strip-components=1'], {
     stdio: 'inherit',
   });
 }
