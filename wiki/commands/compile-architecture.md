@@ -116,6 +116,14 @@ The remaining steps describe a launcher artifact. The cache is chosen before any
 
 Cache selection validates the properties it relies on before using extracted files, including ownership or access control. It checks for an executable mount where supported only when Node will run from that cache. This protects the launcher's cache handoff from other principals; it is not a sandbox, and code running as the same user can modify user-owned files.
 
+## Build-time code cache
+
+Large, native-target extracted artifacts on Node 24 and later carry eagerly compiled ESM bytecode. Node still loads the original source and validates every cache entry before using it.
+
+The [[crates/nub-cli/src/compile/code_cache.rs#attach|cache builder]] runs the target Node in a separate process. It compiles modules without linking or evaluating them, restores normal V8 flags before serializing, and packages the caches as one compressed asset. The bootstrap installs them atomically into Node's ordinary cache before the ESM graph loads; later starts check a completion marker.
+
+The cache requires the same Node version, architecture, and V8 flags. Disabled or portable caches, an unwritable cache directory, and missing or incompatible data fall back to source loading. SEA, inline, `--smol`, and cross-target artifacts do not use this optimization.
+
 ## Process identity
 
 The outer artifact remains the application's executable identity even though the process that ends up running is Node.
