@@ -151,7 +151,7 @@ Coarse `net: true` and `net: false` policies do not start a host-filtering proxy
 
 The environment example inherits named values from the supplied snapshot. A trailing `?` makes a missing value optional. Secret values are sensitive data supplied to the child, not values hidden from it; an allowed child can use them. Unlisted environment values are not implicitly inherited by this explicit policy.
 
-Filtering the environment does not hide files granted through `fs`. The default Linux policy also withholds other processes' `/proc` entries, which can break tools that inspect their own process metadata. Granting all of `/proc` would broaden access to other processes and is not an automatic compatibility fix.
+Filtering the environment does not hide files granted through `fs`. The default Linux policy also withholds other processes' `/proc` entries, which can break tools that inspect their own process metadata. Explicit grants under the reserved `/proc` tree are rejected; there is no automatic procfs compatibility fallback.
 
 ## Resource and command ownership
 

@@ -231,11 +231,6 @@ fn policy(
     }
     fs.insert("./".into(), Value::String("rw".into()));
     fs.insert("$tmp".into(), Value::String("rw".into()));
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("SANDBOX_DIAGNOSTIC_PROC_READ").is_some() {
-        eprintln!("DIAGNOSTIC ONLY: adding /proc read; not a normal tool-directory policy");
-        fs.insert("/proc".into(), Value::String("r".into()));
-    }
     insert_read(&mut fs, &tool.tool_root);
     for root in &tool.runtime_roots {
         insert_read(&mut fs, root);

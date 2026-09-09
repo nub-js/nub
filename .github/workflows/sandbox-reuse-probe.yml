@@ -110,8 +110,6 @@ jobs:
           set +e
           strace -f -s 256 -e trace=%file,%process,prlimit64 -o reports/bun140-syscalls.log cargo test -p nub-sandbox --profile fast --test tool_functionality bun140_tooldirs_normal_operations -- --ignored --exact --nocapture > reports/bun140-traced-result.log 2>&1
           printf 'exit=%s\n' "$?" >> reports/bun140-traced-result.log
-          SANDBOX_DIAGNOSTIC_PROC_READ=1 strace -f -s 256 -e trace=%file,%process,prlimit64 -o reports/bun140-proc-control-syscalls.log cargo test -p nub-sandbox --profile fast --test tool_functionality bun140_tooldirs_normal_operations -- --ignored --exact --nocapture > reports/bun140-proc-control-result.log 2>&1
-          printf 'exit=%s\n' "$?" >> reports/bun140-proc-control-result.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -174,8 +172,6 @@ jobs:
           set +e
           strace -f -s 256 -e trace=%file,%process,prlimit64 -o reports/nuget-syscalls.log cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_tooldirs -- --ignored --exact --nocapture > reports/nuget-traced-result.log 2>&1
           printf 'exit=%s\n' "$?" >> reports/nuget-traced-result.log
-          SANDBOX_DIAGNOSTIC_PROC_READ=1 strace -f -s 256 -e trace=%file,%process,prlimit64 -o reports/nuget-proc-control-syscalls.log cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_tooldirs -- --ignored --exact --nocapture > reports/nuget-proc-control-result.log 2>&1
-          printf 'exit=%s\n' "$?" >> reports/nuget-proc-control-result.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

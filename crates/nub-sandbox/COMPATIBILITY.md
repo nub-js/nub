@@ -52,7 +52,7 @@ The writable directory admits the lock/rename protocol without granting all of h
 
 ## Backend restrictions
 
-- **Linux procfs:** ordinary policy compilation cannot grant every descendant its own dynamically created `/proc/<pid>` files. A whole-procfs grant would also expose other processes and is not an automatic fallback. The exact causes of the Bun 1.4 and CoreCLR initialization failures remain unresolved in this run.
+- **Linux procfs:** the backend rejects explicit grants under the reserved `/proc` tree. Ordinary static path grants cannot express each descendant's own dynamically created process files. [Syscall traces](https://github.com/nubjs/nub/actions/runs/34353404495) record denied `/proc/self/maps` reads in Bun 1.4 and CoreCLR, plus denied process metadata and private FIFO creation in CoreCLR. A test-only procfs grant was rejected before launch, so it does not prove which denial caused the runtime failure. No procfs fallback is enabled.
 - **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.
