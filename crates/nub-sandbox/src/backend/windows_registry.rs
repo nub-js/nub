@@ -1051,6 +1051,13 @@ pub(crate) struct OperationLock {
 
 impl OperationLock {
     pub(crate) fn acquire(kind: &str) -> io::Result<Self> {
+        #[cfg(all(test, windows))]
+        if kind == "acl"
+            && let Some(root) = std::env::var_os("__NUB_WINDOWS_CLEANUP_ACL_LOCK_ROOT")
+        {
+            // Isolated crash-test journals still mutate the shared desktop DACL.
+            return Self::at(Path::new(&root), kind);
+        }
         Self::at(&registry_root()?, kind)
     }
 
@@ -1076,6 +1083,21 @@ impl MutationLock {
             _lock: OperationLock::at(root, "journal")?,
         })
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_registry_root() -> io::Result<PathBuf> {
+    registry_root()
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_entry(profile: &str) -> io::Result<Option<Entry>> {
+    let root = registry_root()?;
+    let _lock = MutationLock::acquire(&root)?;
+    Ok(load(&root)?
+        .entries
+        .into_values()
+        .find(|entry| entry.profile_name == profile))
 }
 
 #[cfg(test)]

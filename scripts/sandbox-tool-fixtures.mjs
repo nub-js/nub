@@ -48,13 +48,27 @@ function npmCli() {
   return cli;
 }
 
-function install(prefix, spec, platformArgs = []) {
+function install(prefix, spec) {
   mkdirSync(prefix, { recursive: true });
   execFileSync(node, [
-    npmCli(), 'install', '--prefix', prefix, '--ignore-scripts=false', '--no-audit', '--no-fund', ...platformArgs, spec,
+    npmCli(), 'install', '--prefix', prefix, '--ignore-scripts=false', '--no-audit', '--no-fund', spec,
   ], {
     stdio: 'inherit',
     env: { ...process.env, npm_config_update_notifier: 'false' },
+  });
+}
+
+function unpackWindowsX64Bun(prefix, spec) {
+  const destination = join(prefix, 'node_modules/@oven/bun-windows-x64');
+  mkdirSync(destination, { recursive: true });
+  // Fetch the platform package without npm install's host-CPU admission check.
+  // npm pack verifies registry integrity; this package contains a standalone binary.
+  const packed = JSON.parse(execFileSync(node, [
+    npmCli(), 'pack', spec, '--ignore-scripts', '--json', '--pack-destination', prefix,
+  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
+  if (packed.length !== 1) throw new Error(`unexpected packed files for ${spec}`);
+  execFileSync('tar', ['-xzf', join(prefix, packed[0].filename), '-C', destination, '--strip-components=1'], {
+    stdio: 'inherit',
   });
 }
 
@@ -63,9 +77,8 @@ const runtimeRoot = process.platform === 'win32' ? dirname(node) : dirname(dirna
 const matrix = [];
 for (const [name, spec, relativeProgram, kind] of packages) {
   const prefix = join(root, name);
-  // npm's documented `--cpu` target selection admits the x64 platform package;
-  // Windows-on-Arm executes that binary through Windows emulation.
-  install(prefix, spec, name === 'bun132' && winArm64 ? ['--cpu=x64'] : []);
+  if (name === 'bun132' && winArm64) unpackWindowsX64Bun(prefix, spec);
+  else install(prefix, spec);
   // Bun publishes bin/bun.exe on Unix too; use the installed manifest rather
   // than assuming an OS-specific filename across release layouts.
   const bunPackage = name === 'bun132' && winArm64

@@ -2,7 +2,7 @@ name: Build-jail framework applications
 
 on:
   push:
-    branches: [build-jail-productionization, sandbox-reuse-epic]
+    branches: [build-jail-productionization]
     paths:
       - tests/build-jail-frameworks/**
       - tests/build-jail-corpus/**
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
-          ref: ${{ matrix.source == 'baseline' && 'b03f68bed9' || github.sha }}
+          ref: ${{ matrix.source == 'baseline' && 'b03f68bed98cd379d2f8f4e6caa9723e1d584ad7' || github.sha }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -84,7 +84,7 @@ jobs:
         if: (success() || failure()) && steps.artifact.outcome == 'success' && matrix.source == 'current'
         run: '"$NUB_BIN" sandbox cleanup > reports/sandbox-cleanup.log 2>&1'
       - name: Comparing Windows path spellings with npm
-        if: always() && runner.os == 'Windows'
+        if: always() && runner.os == 'Windows' && steps.artifact.outcome == 'success'
         env:
           FRAMEWORK_PATH_REPORT: ${{ github.workspace }}/reports/windows-paths
         run: node tests/build-jail-frameworks/windows-paths.mjs

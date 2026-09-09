@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const FIXTURE: &str = "backend::windows::windows_cleanup_tests::windows_cleanup_fixture";
 const MODE: &str = "__NUB_WINDOWS_CLEANUP_FIXTURE";
 const ROOT: &str = "__NUB_WINDOWS_CLEANUP_ROOT";
+const FAULT: &str = "__NUB_WINDOWS_CLEANUP_FAULT";
 
 fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
     let program = std::env::current_exe().unwrap();
@@ -159,8 +160,203 @@ fn windows_cleanup_fixture() {
             std::io::stdin().read_to_string(&mut input).unwrap();
             drop(child);
         }
+        "fault-acquire" => {
+            let _resource = plan(&root, "hold").acquire().unwrap();
+            panic!("acquisition did not reach the requested crash transition");
+        }
+        "fault-cleanup" => {
+            cleanup_resources().unwrap();
+            panic!("cleanup did not reach the requested crash transition");
+        }
+        "crash-transitions" => crash_transitions(&root),
+        "cleanup-retry" => interrupted_cleanup(&root),
+        "cleanup-junction" => cleanup_junction(&root),
         other => panic!("unknown cleanup fixture mode {other}"),
     }
+}
+
+fn fixture_command(root: &Path, mode: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", FIXTURE, "--nocapture", "--test-threads=1"])
+        .env(MODE, mode)
+        .env(ROOT, root)
+        .env_remove(FAULT)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit());
+    command
+}
+
+fn isolated_scenario(mode: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("registry-parent");
+    let caller = root.path().join("caller");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(&caller).unwrap();
+    let shared_acl_lock = windows_registry::test_registry_root().unwrap();
+    let mut owner = OwnerFixture(
+        fixture_command(&caller, mode)
+            // Only this scenario and its subprocesses see this registry. Other
+            // native tests cannot sweep the abandoned entry before inspection.
+            .env("ProgramData", state)
+            .env("__NUB_WINDOWS_CLEANUP_ACL_LOCK_ROOT", shared_acl_lock)
+            .spawn()
+            .unwrap(),
+    );
+    let status = owner.0.wait().unwrap();
+    if !status.success() {
+        // Preserve the journal if a failure leaves recovery work behind.
+        let path = root.keep();
+        panic!(
+            "{mode} failed with {status}; retained fixture registry at {}",
+            path.display()
+        );
+    }
+}
+
+fn crash_owner(root: &Path, mode: &str, stage: &str) -> (String, PathBuf) {
+    let mut owner = OwnerFixture(
+        fixture_command(root, mode)
+            .env(FAULT, stage)
+            .spawn()
+            .unwrap(),
+    );
+    let status = owner.0.wait().unwrap();
+    assert_eq!(status.code(), Some(91), "fault stage {stage}: {status}");
+    let (observed, profile, private): (String, String, PathBuf) =
+        serde_json::from_slice(&std::fs::read(root.join("crash-transition.json")).unwrap())
+            .unwrap();
+    assert_eq!(observed, stage);
+    (profile, private)
+}
+
+fn assert_recovered(profile: &str, private: &Path, caller: &Path, foreign: &ForeignProfileAce) {
+    cleanup_resources().unwrap();
+    assert!(windows_registry::test_entry(profile).unwrap().is_none());
+    assert!(
+        !private.exists(),
+        "owned private root survived recovery: {}",
+        private.display()
+    );
+    assert!(!super::launch::test_profile_has_ace(profile, caller).unwrap());
+    assert!(super::launch::test_profile_has_ace(&foreign.profile, caller).unwrap());
+    assert_eq!(
+        std::fs::read(caller.join("caller-owned.txt")).unwrap(),
+        b"caller-owned"
+    );
+    cleanup_resources().unwrap();
+    assert_eq!(
+        std::fs::read(caller.join("caller-owned.txt")).unwrap(),
+        b"caller-owned"
+    );
+}
+
+fn crash_transitions(root: &Path) {
+    let _cleanup = CleanupAfterTest;
+    for stage in [
+        "profile-created",
+        "private-root-created",
+        "acl-installed-before-ready",
+    ] {
+        let caller = root.join(stage);
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::write(caller.join("caller-owned.txt"), b"caller-owned").unwrap();
+        let foreign = ForeignProfileAce::grant(&caller);
+        let (profile, private) = crash_owner(&caller, "fault-acquire", stage);
+        let entry = windows_registry::test_entry(&profile)
+            .unwrap()
+            .expect("crashed owner lost its journal");
+        assert_eq!(entry.state, windows_registry::EntryState::Preparing);
+        assert!(
+            !entry.leases.is_empty(),
+            "journal must retain the dead owner's lease until recovery"
+        );
+        assert!(
+            private.is_dir(),
+            "profile creation did not leave its private root"
+        );
+        if stage == "acl-installed-before-ready" {
+            assert!(super::launch::test_profile_has_ace(&profile, &caller).unwrap());
+        }
+        assert_recovered(&profile, &private, &caller, &foreign);
+    }
+}
+
+fn interrupted_cleanup(root: &Path) {
+    let _cleanup = CleanupAfterTest;
+    std::fs::write(root.join("caller-owned.txt"), b"caller-owned").unwrap();
+    let foreign = ForeignProfileAce::grant(root);
+    let resource = plan(root, "hold").acquire().unwrap();
+    let profile = resource.profile_name().to_string();
+    let private = resource.private_tmp().unwrap().to_path_buf();
+    std::fs::write(private.join("owned-file"), b"owned").unwrap();
+    drop(resource);
+    let (crashed_profile, _) = crash_owner(root, "fault-cleanup", "cleanup-private-removed");
+    assert_eq!(crashed_profile, profile);
+    let entry = windows_registry::test_entry(&profile)
+        .unwrap()
+        .expect("interrupted cleanup discarded ownership");
+    assert_eq!(entry.state, windows_registry::EntryState::Closing);
+    assert!(
+        !private.exists(),
+        "fault did not occur after private deletion"
+    );
+    assert_recovered(&profile, &private, root, &foreign);
+}
+
+fn cleanup_junction(root: &Path) {
+    let _cleanup = CleanupAfterTest;
+    let caller = root.join("project");
+    let target = root.join("caller-target");
+    std::fs::create_dir(&caller).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("survivor.txt"), b"junction-target").unwrap();
+    let foreign = ForeignProfileAce::grant(&target);
+    let resource = plan(&caller, "hold").acquire().unwrap();
+    let profile = resource.profile_name().to_string();
+    let private = resource.private_tmp().unwrap().to_path_buf();
+    let junction = private.join("caller-junction");
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "unprivileged junction creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(junction.join("survivor.txt")).unwrap(),
+        b"junction-target"
+    );
+    drop(resource);
+    cleanup_resources().unwrap();
+    assert!(windows_registry::test_entry(&profile).unwrap().is_none());
+    assert!(!private.exists());
+    assert!(target.is_dir());
+    assert_eq!(
+        std::fs::read(target.join("survivor.txt")).unwrap(),
+        b"junction-target"
+    );
+    assert!(super::launch::test_profile_has_ace(&foreign.profile, &target).unwrap());
+}
+
+#[test]
+fn windows_cleanup_recovers_abrupt_acquisition_transitions() {
+    isolated_scenario("crash-transitions");
+}
+
+#[test]
+fn windows_cleanup_retries_after_abrupt_private_root_removal() {
+    isolated_scenario("cleanup-retry");
+}
+
+#[test]
+fn windows_cleanup_never_follows_private_junction_into_caller_data() {
+    isolated_scenario("cleanup-junction");
 }
 
 #[test]

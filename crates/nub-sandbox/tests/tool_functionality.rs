@@ -1,4 +1,6 @@
 //! Native tool-directory operations, with unconfined and narrow-policy controls.
+#[path = "common/tool_output.rs"]
+mod tool_output;
 use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -108,6 +110,8 @@ fn confined(
         .prepare(
             CommandSpec::new(program)
                 .args(args)
+                .redact_stdout(true)
+                .redact_stderr(true)
                 .cwd(root.join("project")),
         )
         .expect("tool command prepares without degradation");
@@ -116,7 +120,7 @@ fn confined(
         "native tool fixture degraded: {:?}",
         prepared.degradation
     );
-    prepared.output().expect("tool command launches")
+    tool_output::output(prepared)
 }
 
 fn unconfined(program: &str, args: &[&str], root: &Path, extra_env: &[(&str, &str)]) -> Output {

@@ -17,7 +17,6 @@ use seccompiler::{
 };
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
-use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -963,6 +962,7 @@ fn resolve_program(program: &OsStr, child_cwd: &Path, path: Option<&OsStr>) -> O
 mod tests {
     use super::*;
     use crate::policy::{CanonGlob, FsAccess, FsOrigin, FsRule};
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use tempfile::tempdir;
 

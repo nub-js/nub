@@ -357,6 +357,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
+    "~/.dotnet",
     "~/.local/share/NuGet",
     "~/.composer",
     "~/Library/Caches/composer",
@@ -400,6 +401,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
+    "~/.dotnet",
     "~/AppData/Local/NuGet",
     "~/AppData/Local/Composer",
     "~/AppData/Roaming/Composer",
@@ -440,6 +442,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
+    "~/.dotnet",
     "~/.local/share/NuGet",
     "~/.cache/composer",
     "~/.composer",
@@ -520,6 +523,8 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         "NUGET_HTTP_CACHE_PATH",
         "NUGET_SCRATCH",
         "NUGET_PLUGINS_CACHE_PATH",
+        "DOTNET_CLI_HOME",
+        "DOTNET_BUNDLE_EXTRACT_BASE_DIR",
         "COMPOSER_HOME",
         "COMPOSER_CACHE_DIR",
         "COMPOSER_VENDOR_DIR",
@@ -993,6 +998,22 @@ mod tests {
             matchers.iter().any(|m| m.contains("nub/pm")),
             "nub PM cache path missing from $tooldirs: {matchers:?}"
         );
+    }
+
+    #[test]
+    fn dotnet_supporting_state_uses_documented_environment_locations() {
+        assert!(tooldir_patterns().contains(&"~/.dotnet"));
+        let env = BTreeMap::from([
+            ("DOTNET_CLI_HOME".into(), "/fixture/dotnet-state".into()),
+            (
+                "DOTNET_BUNDLE_EXTRACT_BASE_DIR".into(),
+                "/fixture/extracted-bundles".into(),
+            ),
+        ]);
+        let paths = environment_tooldirs(&env);
+        assert!(paths.contains("/fixture/dotnet-state"));
+        assert!(paths.contains("/fixture/extracted-bundles"));
+        assert!(!paths.contains("/fixture"));
     }
 
     #[test]

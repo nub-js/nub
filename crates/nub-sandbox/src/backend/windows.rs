@@ -2093,6 +2093,8 @@ pub(super) mod launch {
             });
             let ac_sid = sid.0;
             let profile_folder = appcontainer_folder(ac_sid)?;
+            #[cfg(test)]
+            test_crash_transition("profile-created", &name, &profile_folder);
             let private_tmp = self.private_tmp.then(|| profile_folder.join("Temp"));
             if resource.fresh {
                 resource.record_private_path(&profile_folder)?;
@@ -2103,6 +2105,8 @@ pub(super) mod launch {
                         access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
                     })?;
                     std::fs::create_dir_all(path)?;
+                    #[cfg(test)]
+                    test_crash_transition("private-root-created", &name, &profile_folder);
                     grant_leaf_ace(
                         path,
                         ac_sid,
@@ -2191,6 +2195,8 @@ pub(super) mod launch {
                     // Missing optional read/traverse rights can only over-confine.
                     let _ = set_ace_on_object(dir, ac_sid, TRAVERSE_MASK, GRANT_ACCESS);
                 }
+                #[cfg(test)]
+                test_crash_transition("acl-installed-before-ready", &name, &profile_folder);
                 resource.ready()?;
             }
             Ok(self.bind(Arc::new(ResourceState {
@@ -3320,6 +3326,23 @@ pub(super) mod launch {
     }
 
     #[cfg(test)]
+    fn test_crash_transition(stage: &str, profile: &str, private_root: &Path) {
+        if !matches!(
+            std::env::var("__NUB_WINDOWS_CLEANUP_FIXTURE").as_deref(),
+            Ok("fault-acquire" | "fault-cleanup")
+        ) || std::env::var("__NUB_WINDOWS_CLEANUP_FAULT").as_deref() != Ok(stage)
+        {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("__NUB_WINDOWS_CLEANUP_ROOT").unwrap());
+        let record = serde_json::to_vec(&(stage, profile, private_root)).unwrap();
+        std::fs::write(root.join("crash-transition.json"), record).unwrap();
+        // Process exit deliberately bypasses Rust destructors and releases native
+        // locks/leases as an abruptly lost owner would.
+        std::process::exit(91);
+    }
+
+    #[cfg(test)]
     pub(super) fn test_profile_has_ace(profile: &str, path: &Path) -> io::Result<bool> {
         let sid = SidGuard(derive_appcontainer(profile)?);
         path_has_sid(path, sid.0)
@@ -3367,6 +3390,12 @@ pub(super) mod launch {
                     if Path::new(path).exists() {
                         super::windows_registry::validate_private_path(&entry, Path::new(path))?;
                         std::fs::remove_dir_all(path)?;
+                        #[cfg(test)]
+                        test_crash_transition(
+                            "cleanup-private-removed",
+                            &entry.profile_name,
+                            Path::new(path),
+                        );
                     }
                 }
                 let name = to_wide(&entry.profile_name);

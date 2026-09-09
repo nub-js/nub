@@ -142,6 +142,9 @@ fn exact_grants(paths: &[(&Path, &str)]) -> Value {
     Value::Object(entries)
 }
 
+#[path = "common/tool_output.rs"]
+mod tool_output;
+
 fn confined(
     program: &Path,
     args: &[String],
@@ -154,6 +157,8 @@ fn confined(
         .prepare(
             CommandSpec::new(program.to_string_lossy().into_owned())
                 .args(args)
+                .redact_stdout(true)
+                .redact_stderr(true)
                 .cwd(root.join("project")),
         )
         .expect("Python command prepares without degradation");
@@ -162,7 +167,7 @@ fn confined(
         "native Python fixture degraded: {:?}",
         prepared.degradation
     );
-    prepared.output().expect("Python command launches")
+    tool_output::output(prepared)
 }
 
 fn unconfined(
