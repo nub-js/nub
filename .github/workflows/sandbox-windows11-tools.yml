@@ -47,6 +47,9 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p reports
+          # Unqualified pinned toolchain names must use the same x64 host as
+          # this probe's MSVC environment, not the runner's native ARM default.
+          rustup set default-host x86_64-pc-windows-msvc
           git rev-parse HEAD > reports/environment.txt
           rustc -Vv >> reports/environment.txt
           node -p 'process.platform + " " + process.arch' >> reports/environment.txt
