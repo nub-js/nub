@@ -563,7 +563,14 @@ pub fn run(mut opts: CompileOptions) -> Result<i32> {
                             .with_context(|| format!("brotli-compressing {}", file.name))?
                     }
                 } else {
-                    zstd::encode_all(&file.bytes[..], 19)
+                    // The cache pack stays compressed after extraction. Another
+                    // high-level pass over it saves little and can dominate a build.
+                    let level = if has_code_cache && file.name == code_cache::PACK_NAME {
+                        1
+                    } else {
+                        19
+                    };
+                    zstd::encode_all(&file.bytes[..], level)
                         .with_context(|| format!("zstd-compressing {}", file.name))?
                 };
                 Ok::<_, anyhow::Error>(nub_core::compile::AppFile {

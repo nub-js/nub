@@ -6,11 +6,13 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { test } = require("node:test");
 const { createHash } = require("node:crypto");
+const { zstdCompressSync, zstdDecompressSync, constants } = require("node:zlib");
 
 const supported = Number(process.versions.node.split(".")[0]) >= 24;
 const generator = path.join(__dirname, "code_cache_generate.cjs");
 const installer = fs.readFileSync(path.join(__dirname, "code_cache_install.cjs"), "utf8");
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("NODE_") && !key.startsWith("__NUB_")));
+const compress = (pack) => zstdCompressSync(pack, { params: { [constants.ZSTD_c_compressionLevel]: 9 } });
 
 function fixture(t, additional = []) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nub-code-cache-"));
@@ -34,7 +36,7 @@ function fixture(t, additional = []) {
   const pack = build.stdout;
   const index = JSON.parse(pack.subarray(4, 4 + pack.readUInt32LE(0)));
   const id = createHash("sha256").update(pack).digest("hex");
-  fs.writeFileSync(path.join(app, "pack.bin"), pack);
+  fs.writeFileSync(path.join(app, "pack.bin"), compress(pack));
   for (const [name, code] of files) {
     fs.mkdirSync(path.dirname(path.join(app, name)), { recursive: true });
     fs.writeFileSync(path.join(app, name), code);
@@ -101,12 +103,19 @@ test("a missing cache pack leaves program execution intact", { skip: !supported 
 test("corrupt cached data falls back to source", { skip: !supported }, (t) => {
   const f = fixture(t);
   const file = path.join(f.app, "pack.bin");
-  const pack = fs.readFileSync(file);
+  const pack = zstdDecompressSync(fs.readFileSync(file));
   pack[pack.length - 1] ^= 0xff;
-  fs.writeFileSync(file, pack);
+  fs.writeFileSync(file, compress(pack));
   const result = f.run();
   assert.match(result.stdout.toString(), /^2000 /);
   assert.match(result.stderr.toString(), /hash mismatch/);
+});
+
+test("a truncated compressed pack leaves program execution intact", { skip: !supported }, (t) => {
+  const f = fixture(t);
+  const file = path.join(f.app, "pack.bin");
+  fs.writeFileSync(file, fs.readFileSync(file).subarray(0, 12));
+  assert.match(f.run().stdout.toString(), /^2000 /);
 });
 
 test("a shared cache seeds each relocated application", { skip: !supported }, (t) => {

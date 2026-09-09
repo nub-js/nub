@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use nub_core::compile::{AppFile, COMPILE_BOOTSTRAP_NAME};
 use serde::Deserialize;
 
-const PACK_NAME: &str = "__nub_code_cache.bin";
+pub(super) const PACK_NAME: &str = "__nub_code_cache.bin";
 const GENERATOR: &str = include_str!("code_cache_generate.cjs");
 const INSTALLER: &str = include_str!("code_cache_install.cjs");
 const MIN_SOURCE_BYTES: usize = 256 * 1024;
@@ -107,6 +107,9 @@ pub(super) fn attach(files: &mut Vec<AppFile<Vec<u8>>>, node: &Path) -> Result<b
         pack.get(4..index_end)
             .context("truncated compile-cache index")?,
     )?;
+    // Keep the extracted pack compressed too: raw eager bytecode can be several
+    // times larger than the source. Only the first cache seed decompresses it.
+    let pack = zstd::encode_all(&pack[..], 9).context("compressing the compile-cache pack")?;
     let id = crate::cli::sha256_hex(&pack);
     let args = serde_json::to_string(&(PACK_NAME, id, index.version, index.arch, index.tag))?;
     let suffix = format!("\n;{INSTALLER}(...{args});\n");
@@ -237,7 +240,7 @@ mod tests {
                 file.name
             );
         }
-        let pack = &files[3].bytes;
+        let pack = zstd::decode_all(&files[3].bytes[..]).unwrap();
         let end = 4 + u32::from_le_bytes(pack[..4].try_into().unwrap()) as usize;
         let index: serde_json::Value = serde_json::from_slice(&pack[4..end]).unwrap();
         assert_eq!(index["entries"][0][0], "large.js");

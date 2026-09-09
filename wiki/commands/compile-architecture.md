@@ -124,6 +124,8 @@ The [[crates/nub-cli/src/compile/code_cache.rs#attach|cache builder]] runs the t
 
 The cache requires the same Node version, architecture, and V8 flags. Disabled or portable caches, an unwritable cache directory, and missing or incompatible data fall back to source loading. SEA, inline, `--smol`, and cross-target artifacts do not use this optimization.
 
+The pack remains compressed in the extracted tree and is decompressed only when seeding a new cache. Builds include it when ESM sources total at least 256 KiB. Bytecode increases the executable and cache sizes in exchange for avoiding repeated compilation; application code is never evaluated during the build.
+
 ## Process identity
 
 The outer artifact remains the application's executable identity even though the process that ends up running is Node.

@@ -10,12 +10,12 @@
     if (!cacheDir || getBuiltin("node:v8").cachedDataVersionTag() !== tag) return;
     const fs = getBuiltin("node:fs");
     const path = getBuiltin("node:path");
-    const { crc32 } = getBuiltin("node:zlib");
+    const { crc32, zstdDecompressSync } = getBuiltin("node:zlib");
     const { pathToFileURL } = getBuiltin("node:url");
     const location = crc32(pathToFileURL(__dirname).href).toString(16);
     const marker = path.join(cacheDir, `.nub-${packId}-${location}`);
     if (fs.existsSync(marker)) return;
-    const pack = fs.readFileSync(path.join(__dirname, packName));
+    const pack = zstdDecompressSync(fs.readFileSync(path.join(__dirname, packName)));
     const indexEnd = 4 + pack.readUInt32LE(0);
     const index = JSON.parse(pack.subarray(4, indexEnd));
     const temporary = fs.mkdtempSync(path.join(cacheDir, ".nub-cache-"));
