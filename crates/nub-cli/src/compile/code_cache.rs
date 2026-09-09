@@ -1,6 +1,7 @@
 //! Build-time ESM bytecode for native extracted artifacts. Node still loads the
 //! original source and owns cache validation; this only seeds its existing cache.
 
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -36,9 +37,23 @@ pub(super) fn attach(files: &mut Vec<AppFile<Vec<u8>>>, node: &Path) -> Result<b
     else {
         return Ok(false);
     };
+    let packages: HashMap<_, _> = files
+        .iter()
+        .filter_map(|file| {
+            let directory = if file.name == "package.json" {
+                ""
+            } else {
+                file.name.strip_suffix("/package.json")?
+            };
+            let module = serde_json::from_slice::<serde_json::Value>(&file.bytes)
+                .ok()
+                .is_some_and(|json| json.get("type").and_then(|v| v.as_str()) == Some("module"));
+            Some((directory, module))
+        })
+        .collect();
     let sources: Vec<_> = files
         .iter()
-        .filter(|file| file.name.ends_with(".mjs"))
+        .filter(|file| is_esm(&file.name, &packages))
         .filter_map(|file| {
             std::str::from_utf8(&file.bytes)
                 .ok()
@@ -95,8 +110,32 @@ pub(super) fn attach(files: &mut Vec<AppFile<Vec<u8>>>, node: &Path) -> Result<b
     let args = serde_json::to_string(&(PACK_NAME, id, index.version, index.arch, index.tag))?;
     let suffix = format!("\n;{INSTALLER}(...{args});\n");
     files[bootstrap].bytes.extend_from_slice(suffix.as_bytes());
+    files[bootstrap].plain_size = Some(files[bootstrap].bytes.len() as u64);
     files.push(AppFile::plain(PACK_NAME, pack));
     Ok(true)
+}
+
+fn is_esm(name: &str, packages: &HashMap<&str, bool>) -> bool {
+    if name.ends_with(".mjs") {
+        return true;
+    }
+    if !name.ends_with(".js") {
+        return false;
+    }
+    let mut directory = name.rsplit_once('/').map_or("", |(parent, _)| parent);
+    loop {
+        // A package never inherits the surrounding project's module type.
+        if directory == "node_modules" || directory.ends_with("/node_modules") {
+            return false;
+        }
+        if let Some(module) = packages.get(directory) {
+            return *module;
+        }
+        if directory.is_empty() {
+            return false;
+        }
+        directory = directory.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +178,67 @@ mod tests {
         )];
         assert!(!attach(&mut files, Path::new("nonexistent-node")).unwrap());
         assert_eq!(files[0].bytes, b"user asset");
+    }
+
+    #[test]
+    fn js_cache_entries_follow_the_nearest_package_scope() {
+        let packages = HashMap::from([
+            ("", true),
+            ("src/node_modules/esm", true),
+            ("src/node_modules/esm/common", false),
+            ("src/node_modules/cjs", false),
+        ]);
+        for name in [
+            "main.js",
+            "src/local.js",
+            "src/node_modules/esm/lib/index.js",
+            "src/node_modules/cjs/module.mjs",
+        ] {
+            assert!(is_esm(name, &packages), "{name}");
+        }
+        for name in [
+            "main.cjs",
+            "data.json",
+            "src/node_modules/unknown/index.js",
+            "src/node_modules/esm/common/index.js",
+            "src/node_modules/cjs/index.js",
+        ] {
+            assert!(!is_esm(name, &packages), "{name}");
+        }
+    }
+
+    #[test]
+    fn attaching_a_pack_updates_the_bootstrap_size_and_caches_esm_js() {
+        let version = Command::new("node")
+            .args(["-p", "Number(process.versions.node.split('.')[0]) >= 24"])
+            .env_remove("NODE_OPTIONS")
+            .output()
+            .expect("Node is required by the compile test suite");
+        assert!(version.status.success());
+        if version.stdout != b"true\n" && version.stdout != b"true\r\n" {
+            return;
+        }
+        let source: String = (0..8000)
+            .map(|i| format!("export function f{i}(x) {{ return x + {i}; }}\n"))
+            .collect();
+        let mut files = vec![
+            AppFile::plain(COMPILE_BOOTSTRAP_NAME, b"// bootstrap\n".to_vec()),
+            AppFile::plain("package.json", br#"{"type":"module"}"#.to_vec()),
+            AppFile::plain("large.js", source.into_bytes()),
+        ];
+        assert!(attach(&mut files, Path::new("node")).unwrap());
+        assert_eq!(files.len(), 4);
+        for file in &files {
+            assert_eq!(
+                file.plain_size,
+                Some(file.bytes.len() as u64),
+                "{}",
+                file.name
+            );
+        }
+        let pack = &files[3].bytes;
+        let end = 4 + u32::from_le_bytes(pack[..4].try_into().unwrap()) as usize;
+        let index: serde_json::Value = serde_json::from_slice(&pack[4..end]).unwrap();
+        assert_eq!(index["entries"][0][0], "large.js");
     }
 }
