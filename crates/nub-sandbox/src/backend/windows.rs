@@ -1643,19 +1643,25 @@ pub(super) mod launch {
         let file = match open_acl_file(path) {
             Ok(file) => file,
             Err(_) if optional => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) => return acquisition_step("file-open", Err(error)),
         };
-        let id = object_handle_id(file.as_raw_handle())?;
+        let id = acquisition_step("file-identity", object_handle_id(file.as_raw_handle()))?;
         if admitted {
-            resource.validate_admitted_object(path, &id)?;
+            acquisition_step(
+                "file-admission",
+                resource.validate_admitted_object(path, &id),
+            )?;
         }
-        resource.record_mutation_id(
-            AclMutation {
-                path: path.to_string_lossy().into_owned(),
-                kind,
-                access,
-            },
-            Some(id),
+        acquisition_step(
+            "file-journal",
+            resource.record_mutation_id(
+                AclMutation {
+                    path: path.to_string_lossy().into_owned(),
+                    kind,
+                    access,
+                },
+                Some(id),
+            ),
         )?;
         // The same open object is journaled and mutated even if its name changes.
         let result = set_ace_on_handle(
@@ -2173,10 +2179,13 @@ pub(super) mod launch {
                 crate::backend::windows_ace::current_objects(),
             )?;
             if let Some(lease) = retained.get(&identity.hash) {
-                let same_windows = timed("resource_cache_hit", || {
-                    super::windows_registry::validate_entry(&lease._state._lease.entry)?;
-                    Ok::<_, io::Error>(lease._state.window_objects == window_objects)
-                })?;
+                let same_windows = acquisition_step(
+                    "retained-validation",
+                    timed("resource_cache_hit", || {
+                        super::windows_registry::validate_entry(&lease._state._lease.entry)?;
+                        Ok::<_, io::Error>(lease._state.window_objects == window_objects)
+                    }),
+                )?;
                 if same_windows {
                     return Ok(self.bind(Arc::clone(&lease._state)));
                 }
@@ -2237,11 +2246,14 @@ pub(super) mod launch {
                     resource.record_private_path(&profile_folder),
                 )?;
                 if let Some(path) = &private_tmp {
-                    resource.record_mutation(super::windows_registry::AclMutation {
-                        path: path.to_string_lossy().into_owned(),
-                        kind: super::windows_registry::AclKind::PrivateProfile,
-                        access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                    })?;
+                    acquisition_step(
+                        "profile-temp-journal",
+                        resource.record_mutation(super::windows_registry::AclMutation {
+                            path: path.to_string_lossy().into_owned(),
+                            kind: super::windows_registry::AclKind::PrivateProfile,
+                            access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                        }),
+                    )?;
                     acquisition_step("profile-temp-create", std::fs::create_dir_all(path))?;
                     #[cfg(test)]
                     test_crash_transition("private-root-created", &name, &profile_folder);
@@ -2279,13 +2291,19 @@ pub(super) mod launch {
                 });
                 if let Some(dir) = &private {
                     // This profile name is exclusively owned by this registry entry.
-                    resource.record_private_path(dir)?;
+                    acquisition_step(
+                        "redirected-profile-journal",
+                        resource.record_private_path(dir),
+                    )?;
                     for path in [dir.clone(), dir.join("AC"), dir.join("AC/Temp")] {
-                        resource.record_mutation(super::windows_registry::AclMutation {
-                            path: path.to_string_lossy().into_owned(),
-                            kind: super::windows_registry::AclKind::PrivateProfile,
-                            access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                        })?;
+                        acquisition_step(
+                            "redirected-profile-acl-journal",
+                            resource.record_mutation(super::windows_registry::AclMutation {
+                                path: path.to_string_lossy().into_owned(),
+                                kind: super::windows_registry::AclKind::PrivateProfile,
+                                access: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                            }),
+                        )?;
                         acquisition_step(
                             "redirected-profile-create",
                             std::fs::create_dir_all(&path),
@@ -2364,7 +2382,7 @@ pub(super) mod launch {
                 }
                 #[cfg(test)]
                 test_crash_transition("acl-installed-before-ready", &name, &profile_folder);
-                resource.ready()?;
+                acquisition_step("ready", resource.ready())?;
             }
             Ok(self.bind(Arc::new(ResourceState {
                 _lease: resource,

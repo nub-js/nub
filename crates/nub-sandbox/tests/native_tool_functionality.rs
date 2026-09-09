@@ -636,10 +636,11 @@ fn run_nuget_self_proc(tooldirs: bool) {
             prepared.degradation
         );
         let output = tool_output::output(prepared);
-        if tail == ["--version"] {
-            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "10.0.100");
-        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         assert_ok(&tool, &format!("self-metadata {tail:?}"), output);
+        if tail == ["--version"] {
+            assert_eq!(version, "10.0.100");
+        }
     }
     let secret = root.path().join("secret");
     std::fs::write(&secret, "WITHHELD").unwrap();

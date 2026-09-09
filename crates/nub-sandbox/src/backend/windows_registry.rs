@@ -539,7 +539,15 @@ pub(crate) fn object_id(path: &Path) -> io::Result<Option<String>> {
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => {
+                #[cfg(test)]
+                eprintln!(
+                    "WINDOWS_REGISTRY_ERROR {} object-id {}: {error:?}",
+                    std::process::id(),
+                    path.display()
+                );
+                return Err(error);
+            }
         };
         object_handle_id(file.as_raw_handle()).map(Some)
     }
@@ -1064,7 +1072,15 @@ fn canonical_path_or_lexical(path: &Path) -> io::Result<String> {
                 _ => Ok(normalize(path)),
             }
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            #[cfg(test)]
+            eprintln!(
+                "WINDOWS_REGISTRY_ERROR {} canonical-path {}: {error:?}",
+                std::process::id(),
+                path.display()
+            );
+            Err(error)
+        }
     }
 }
 
