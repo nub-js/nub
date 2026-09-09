@@ -663,6 +663,155 @@ tool_controls!(
     bun140_tooldirs_normal_operations
 );
 
+#[cfg(windows)]
+fn run_node_adapter_control(name: &str, tooldirs: bool) {
+    let tools = tools();
+    let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+    let root = fixture();
+    let (cache, global, env) = tool_env(tool, root.path());
+    for path in [&cache, &global, &root.path().join("home/.yarn")] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    fixture_package(root.path());
+    project_manifest(root.path());
+    let canary = root.path().join("outside-secret");
+    std::fs::write(&canary, "DENIED_CANARY").unwrap();
+    let mut policy = grant_policy(tool, root.path(), &cache, &global, &env, tooldirs);
+    // Deliberate opt-in to the existing Node adapters, not backend auto-detection.
+    // The build-jail helper also carries its userland network gate; this fixture's
+    // OS policy already denies networking and never installs a registry package.
+    let options = format!(
+        "{} {}",
+        nub_sandbox::windows_build_jail_node_options(None, None),
+        nub_sandbox::realpath_shim_node_options(&[
+            root.path().join("project"),
+            cache,
+            global,
+            root.path().join("home/.yarn"),
+            tool.tool_root.clone(),
+            tool.runtime_root.clone(),
+        ])
+    );
+    policy
+        .env
+        .constructed
+        .insert("NODE_OPTIONS".into(), options);
+    let sandbox = Sandbox::acquire(&policy).expect("adapted session acquires");
+    let run = |argv: Vec<String>| {
+        eprintln!(
+            "ADAPTED {} {} {argv:?}",
+            tool.name,
+            if tooldirs { "$tooldirs" } else { "exact" }
+        );
+        let prepared = sandbox
+            .prepare(
+                CommandSpec::new(&tool.program)
+                    .args(argv)
+                    .cwd(root.path().join("project"))
+                    .redact_stdout(true)
+                    .redact_stderr(true),
+            )
+            .expect("adapted command prepares");
+        assert!(
+            prepared.degradation.lost.is_empty(),
+            "{:?}",
+            prepared.degradation
+        );
+        tool_output::output(prepared)
+    };
+    let install = ["install", "--ignore-scripts"];
+    assert_success(tool, "adapted local install", &run(args(tool, &install)));
+    assert_success(
+        tool,
+        "adapted retained reinstall",
+        &run(args(tool, &install)),
+    );
+    let exec = if tool.kind == "pnpm" { "exec" } else { "run" };
+    let output = run(args(tool, &[exec, "fixture-bin"]));
+    assert_success(tool, "adapted installed bin", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture-bin-ok"));
+    let package = root
+        .path()
+        .join("project/package")
+        .to_string_lossy()
+        .into_owned();
+    let global = if tool.kind == "pnpm" {
+        vec!["add".into(), "--global".into(), package]
+    } else {
+        vec!["global".into(), "add".into(), package]
+    };
+    assert_success(
+        tool,
+        "adapted global install",
+        &run(args_owned(tool, &global)),
+    );
+    let prune = if tool.kind == "pnpm" {
+        ["store", "prune"]
+    } else {
+        ["cache", "clean"]
+    };
+    assert_success(tool, "adapted cache prune", &run(args(tool, &prune)));
+    let check = format!(
+        "const fs=require('node:fs');try{{fs.readFileSync({});process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}};console.log('CANARY_DENIED')",
+        serde_json::to_string(&canary).unwrap()
+    );
+    let output = run(vec!["-e".into(), check]);
+    assert_success(tool, "adapted canary denial", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CANARY_DENIED"));
+    sandbox.close();
+    nub_sandbox::cleanup().expect("adapted idle resources are reclaimed");
+}
+
+#[cfg(windows)]
+macro_rules! node_adapter_controls {
+    ($tool:literal, $plain:ident, $exact:ident, $tooldirs:ident) => {
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $plain() {
+            run_tool_control($tool, ToolControl::Unconfined);
+        }
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $exact() {
+            run_node_adapter_control($tool, false);
+        }
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $tooldirs() {
+            run_node_adapter_control($tool, true);
+        }
+    };
+}
+
+#[cfg(windows)]
+node_adapter_controls!(
+    "pnpm9",
+    windows_node_adapter_pnpm9_plain,
+    windows_node_adapter_pnpm9_exact,
+    windows_node_adapter_pnpm9_tooldirs
+);
+#[cfg(windows)]
+node_adapter_controls!(
+    "pnpm10",
+    windows_node_adapter_pnpm10_plain,
+    windows_node_adapter_pnpm10_exact,
+    windows_node_adapter_pnpm10_tooldirs
+);
+#[cfg(windows)]
+node_adapter_controls!(
+    "pnpm11",
+    windows_node_adapter_pnpm11_plain,
+    windows_node_adapter_pnpm11_exact,
+    windows_node_adapter_pnpm11_tooldirs
+);
+#[cfg(windows)]
+node_adapter_controls!(
+    "yarn1",
+    windows_node_adapter_yarn1_plain,
+    windows_node_adapter_yarn1_exact,
+    windows_node_adapter_yarn1_tooldirs
+);
+
 #[test]
 #[ignore = "requires the pinned native tool matrix"]
 fn npm_cold_cache_root_remains_a_backend_limit_control() {

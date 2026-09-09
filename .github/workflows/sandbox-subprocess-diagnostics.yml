@@ -5,6 +5,7 @@ on:
     branches: [sandbox-runtime-diagnosis]
     paths:
       - crates/nub-sandbox/tests/windows_subprocess_diagnostics.rs
+      - crates/nub-sandbox/tests/tool_functionality.rs
       - .github/workflows/sandbox-subprocess-diagnostics.yml
 
 permissions:
@@ -32,6 +33,12 @@ jobs:
         with:
           python-version: '3.12.10'
           architecture: x64
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.18.0'
+      - name: Provisioning pinned package managers
+        shell: bash
+        run: node scripts/sandbox-tool-fixtures.mjs
       - name: Recording interpreter locations
         shell: pwsh
         run: |
@@ -39,6 +46,8 @@ jobs:
           git rev-parse HEAD | Out-File reports/environment.txt
           rustc -Vv | Out-File -Append reports/environment.txt
           python --version | Out-File -Append reports/environment.txt
+          node --version | Out-File -Append reports/environment.txt
+          Copy-Item $env:NUB_SANDBOX_TOOL_MATRIX_FILE reports/tool-matrix.json
           $sysroot = (rustc --print sysroot).Trim()
           $python = (Get-Command python.exe).Source
           @(
@@ -50,12 +59,18 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo clippy -p nub-sandbox --profile fast --test windows_subprocess_diagnostics -- -D warnings 2>&1 | tee reports/clippy.log
+          cargo clippy -p nub-sandbox --profile fast --test windows_subprocess_diagnostics --test tool_functionality -- -D warnings 2>&1 | tee reports/clippy.log
       - name: Comparing subprocess startup operations
         shell: bash
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test windows_subprocess_diagnostics windows_subprocess_startup_controls -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/diagnostics.log
+      - name: Exercising explicit Node adapters in retained sessions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test tool_functionality windows_node_adapter -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/node-adapters.log
       - name: Preserving diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
