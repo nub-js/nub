@@ -49,9 +49,7 @@ impl UnixGuardian {
     pub(crate) fn start() -> io::Result<Self> {
         let mut lifeline = [-1; 2];
         let mut ready = [-1; 2];
-        if let Err(error) = create_cloexec_pipe(&mut lifeline) {
-            return Err(error);
-        }
+        create_cloexec_pipe(&mut lifeline)?;
         if let Err(error) = create_cloexec_pipe(&mut ready) {
             close_fd(lifeline[0]);
             close_fd(lifeline[1]);
@@ -240,7 +238,7 @@ impl FdSweep {
                 .checked_mul(std::mem::size_of::<libc::proc_fdinfo>())
                 .and_then(|value| libc::c_int::try_from(value).ok())
                 .ok_or_else(|| io::Error::other("guardian descriptor buffer exceeds C int"))?;
-            return Ok(Self::Mac {
+            Ok(Self::Mac {
                 entries: vec![
                     libc::proc_fdinfo {
                         proc_fd: 0,
@@ -251,7 +249,7 @@ impl FdSweep {
                 bytes,
                 lifeline_read: -1,
                 ready_write: -1,
-            });
+            })
         }
 
         #[cfg(target_os = "linux")]
@@ -428,6 +426,7 @@ fn guardian_loop(lifeline_read: RawFd) -> ! {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fcntl` acts on the valid descriptor returned by `pipe`.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -449,7 +448,7 @@ fn create_cloexec_pipe(fds: &mut [RawFd; 2]) -> io::Result<()> {
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        lift_pipe_above_stdio(fds)
     }
 
     #[cfg(target_os = "macos")]
@@ -468,8 +467,30 @@ fn create_cloexec_pipe(fds: &mut [RawFd; 2]) -> io::Result<()> {
             close_fd(fds[1]);
             return Err(error);
         }
-        Ok(())
+        lift_pipe_above_stdio(fds)
     }
+}
+
+fn lift_pipe_above_stdio(fds: &mut [RawFd; 2]) -> io::Result<()> {
+    // The workload's stdio setup precedes pre_exec. A low-numbered lifeline
+    // writer would be replaced by dup2, then child_join_raw would close stdout
+    // instead of the inherited writer. Keep all guardian descriptors above it.
+    for index in 0..fds.len() {
+        if fds[index] >= 3 {
+            continue;
+        }
+        let moved = unsafe { libc::fcntl(fds[index], libc::F_DUPFD_CLOEXEC, 3) };
+        if moved < 0 {
+            let error = io::Error::last_os_error();
+            for fd in fds.iter() {
+                close_fd(*fd);
+            }
+            return Err(error);
+        }
+        close_fd(fds[index]);
+        fds[index] = moved;
+    }
+    Ok(())
 }
 
 fn read_byte(fd: RawFd) -> io::Result<u8> {
@@ -544,6 +565,39 @@ fn wait_pid(pid: libc::pid_t) {
 mod tests {
     use super::UnixGuardian;
     use std::process::Command;
+
+    #[test]
+    fn closed_standard_descriptors_do_not_alias_the_guardian_lifeline() {
+        const FLAG: &str = "SANDBOX_GUARDIAN_CLOSED_STDIO";
+        if std::env::var_os(FLAG).is_some() {
+            let guardian = UnixGuardian::start().unwrap();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf guardian-output"]);
+            guardian.join_command(&mut command);
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"guardian-output");
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "backend::unix_guardian::tests::closed_standard_descriptors_do_not_alias_the_guardian_lifeline"]);
+        command.env(FLAG, "1");
+        // Close only in this throwaway owner, never in the parallel test host.
+        unsafe {
+            command.pre_exec(|| {
+                libc::close(0);
+                libc::close(1);
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn drop_terminates_a_joined_workload() {

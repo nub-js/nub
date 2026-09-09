@@ -743,25 +743,25 @@ fn emit_tmp(policy: &SandboxPolicy, tmp_dir: Option<&std::path::Path>, out: &mut
                 out.push_str(&format!("(deny file-write* {term})\n"));
             }
         }
-        if policy.fs.tmp == TmpMode::Private {
-            // xcrun WRITES the db, not merely reads it, so this re-grant must clear BOTH denies.
-            //
-            // AND IT NEVER WRITES THE NAME IN PLACE — the trailing `*` is what makes this grant
-            // do anything at all. The toolchain stages through an `mkstemp`-suffixed sibling
-            // (`xcrun_db-pH2r2bhb`) and renames it over the real name, so a bare `(literal
-            // ".../xcrun_db")` denies the only write that ever happens. Measured on the macOS
-            // corpus break shard: 40 denials in ONE run — `c++: error: couldn't create cache file
-            // '/var/folders/<uid>/T/xcrun_db-XXXXXX' (errno=Operation not permitted)`, from `c++`,
-            // `make` and `libtool` — and every from-source native build behind them failed.
-            //
-            // Still FILE-level, which is the property this carve-out exists to hold: `*` does not
-            // span a path component, so the pattern reaches the cache and its own staging
-            // siblings and nothing else in the ~7.5k-entry shared scratch. Routed through
-            // `to_match_term` rather than a hand-written regex so it uses the same translator
-            // (and the same globset oracle tests) as every other matcher here.
-            for file in darwin_compiler_cache_files() {
-                regrant_over_tmp_deny(&emit_term(&to_match_term(&format!("{file}*"))), out);
-            }
+    }
+    if policy.fs.tmp == TmpMode::Private {
+        // xcrun WRITES the db, not merely reads it, so this re-grant must clear BOTH denies.
+        //
+        // AND IT NEVER WRITES THE NAME IN PLACE — the trailing `*` is what makes this grant
+        // do anything at all. The toolchain stages through an `mkstemp`-suffixed sibling
+        // (`xcrun_db-pH2r2bhb`) and renames it over the real name, so a bare `(literal
+        // ".../xcrun_db")` denies the only write that ever happens. Measured on the macOS
+        // corpus break shard: 40 denials in ONE run — `c++: error: couldn't create cache file
+        // '/var/folders/<uid>/T/xcrun_db-XXXXXX' (errno=Operation not permitted)`, from `c++`,
+        // `make` and `libtool` — and every from-source native build behind them failed.
+        //
+        // Still FILE-level, which is the property this carve-out exists to hold: `*` does not
+        // span a path component, so the pattern reaches the cache and its own staging
+        // siblings and nothing else in the ~7.5k-entry shared scratch. Routed through
+        // `to_match_term` rather than a hand-written regex so it uses the same translator
+        // (and the same globset oracle tests) as every other matcher here.
+        for file in darwin_compiler_cache_files() {
+            regrant_over_tmp_deny(&emit_term(&to_match_term(&format!("{file}*"))), out);
         }
     }
     if policy.fs.tmp == TmpMode::Private
@@ -1864,16 +1864,8 @@ mod tests {
         );
     }
 
-    /// THE REACHABILITY VERDICT for the withhold branch above: it cannot fire under the BUILD
-    /// JAIL, which is why the residual abort it leaves is a `nub sandbox` shape and not a
-    /// lifecycle-script one. `preset::enforce_pure_allowlist` strips every deny from a
-    /// build-jail policy and [`policy_denies`] reads only explicit `Effect::Deny` entries, so
-    /// the grant is emitted whatever the child's stdio points at.
-    ///
-    /// The `nub sandbox` arm is the control, and it is what stops this passing hollow: the same
-    /// paths through the same call ARE withheld there, so a regression that simply stopped
-    /// withholding would fail here rather than sail through the build-jail half. The paths are
-    /// chosen to sit on the generous-read secret floor for the same reason.
+    /// Pure-allowlist policies never withhold inherited stdio metadata. An explicit
+    /// legacy IR deny is the discriminating control, not an implicit secret floor.
     #[test]
     fn the_build_jail_never_withholds_an_inherited_stdio_grant() {
         use crate::compiler::{CompileCtx, ScopeCapabilities, compile, compile_build_jail};
@@ -1897,7 +1889,7 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("build-jail compiles");
-        let sandbox = compile(
+        let mut sandbox = compile(
             &json!(true),
             &CompileCtx::new(
                 homes(),
@@ -1906,7 +1898,15 @@ mod tests {
                 BTreeMap::new(),
             ),
         )
-        .expect("generous-read wrapper compiles");
+        .expect("general wrapper compiles");
+        for target in ["/proj/.env.log", "/testhome/.ssh/out.log"] {
+            assert!(!policy_denies(&sandbox, target));
+            sandbox
+                .fs
+                .rules
+                .entries
+                .push(rule(target, Effect::Deny, FsAccess::Read));
+        }
 
         for target in ["/proj/.env.log", "/testhome/.ssh/out.log"] {
             assert!(
@@ -1916,7 +1916,7 @@ mod tests {
             );
             assert!(
                 policy_denies(&sandbox, target),
-                "control: the generous-read wrapper must deny {target}, else the build-jail \
+                "control: the explicit legacy rule must deny {target}, else the build-jail \
                  assertion above proves nothing"
             );
         }
@@ -2777,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn private_tmp_carves_the_confstr_compiler_scratch_but_hides_private_tmp() {
+    fn private_tmp_grants_compiler_cache_without_shared_tmp_subtrees() {
         // $tmp:rw (Private) hides the world-shared /private/tmp but KEEPS the confstr TEMP
         // scratch (the Apple toolchain's fixed xcrun_db cache) granted so native builds work
         // — the doc's "granting $tmp also grants Apple's fixed compiler-cache directory".
@@ -2788,20 +2788,21 @@ mod tests {
         p.fs.tmp = TmpMode::Private;
         let prof = build_profile(&p, &spec(), None, None, None);
         assert!(
-            prof.contains("(deny file-read* (subpath \"/private/tmp\"))"),
-            "Private must hide the world-shared /private/tmp"
+            prof.contains("(deny default)"),
+            "positive grants need a deny-default profile"
         );
+        assert!(!prof.contains("(allow file-read* (subpath \"/private/tmp\"))"));
         // The confstr scratch is HIDDEN like the rest of the shared tmp. `$TMPDIR` is a
         // long-lived per-user directory holding every application's scratch state, so
         // granting the whole subpath handed a lifecycle script read+write over all of it —
         // far broader than "a private per-run dir plus Apple's fixed compiler cache".
         for dir in confstr_scratch_dirs() {
             assert!(
-                prof.contains(&format!("(deny file-read* (subpath \"{dir}\"))")),
+                !prof.contains(&format!("(allow file-read* (subpath \"{dir}\"))")),
                 "Private must hide the confstr scratch, not grant it wholesale"
             );
             assert!(
-                prof.contains(&format!("(deny file-write* (subpath \"{dir}\"))")),
+                !prof.contains(&format!("(allow file-write* (subpath \"{dir}\"))")),
                 "...for writes as well as reads"
             );
         }
@@ -2810,7 +2811,6 @@ mod tests {
         // Each grant must sit in the SAME operation node as the deny it re-opens and AFTER it
         // — a general `(allow file* …)` loses to a specific `file-write*` deny at any position.
         for file in darwin_compiler_cache_files() {
-            let dir = file.trim_end_matches("/xcrun_db");
             // The grant is the name PLUS its mkstemp staging siblings — the toolchain only
             // ever writes `xcrun_db-XXXXXX` and renames, so asserting the bare literal here
             // is what let a completely inert carve-out look correct for as long as it did.
@@ -2820,10 +2820,6 @@ mod tests {
                 assert!(
                     prof.contains(&grant),
                     "the compiler-cache carve-out must be granted back per-op: {grant}"
-                );
-                assert!(
-                    prof.find(&grant) > prof.find(&format!("(deny {op} (subpath \"{dir}\"))")),
-                    "the {op} carve-out grant must follow the {op} deny it re-opens"
                 );
             }
         }
@@ -2925,10 +2921,11 @@ mod tests {
         );
         p.fs.tmp = TmpMode::Deny;
         let prof = build_profile(&p, &spec(), None, None, None);
-        assert!(prof.contains("(deny file-read* (subpath \"/private/tmp\"))"));
+        assert!(prof.contains("(deny default)"));
+        assert!(!prof.contains("(allow file-read* (subpath \"/private/tmp\"))"));
         for dir in confstr_scratch_dirs() {
             assert!(
-                prof.contains(&format!("(deny file-read* (subpath \"{dir}\"))")),
+                !prof.contains(&format!("(allow file-read* (subpath \"{dir}\"))")),
                 "Deny must hide the confstr scratch too (no carve-out)"
             );
         }
@@ -3243,7 +3240,14 @@ mod tests {
     #[test]
     fn a_label_reaches_every_deny_the_profile_carries() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = tmp_confined_policy(dir.path());
+        let mut policy = tmp_confined_policy(dir.path());
+        // Keep a legacy IR deny in this backend control so synthesized denials
+        // are exercised without claiming the public grammar still emits them.
+        policy
+            .fs
+            .rules
+            .entries
+            .push(rule("/omitted", Effect::Deny, FsAccess::Read));
         let label = "NUBPKG:pkg@1.0.0:7-1";
         let profile = build_profile_with_stdio(
             &policy,

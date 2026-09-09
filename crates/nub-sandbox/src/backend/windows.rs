@@ -2484,9 +2484,97 @@ pub(super) mod launch {
         Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
     }
 
+    /// Standard child streams require overlapped parent handles on Windows.
+    /// `std::io::pipe` uses synchronous CreatePipe handles, which cannot satisfy
+    /// ChildStdin/ChildStdout's ReadFileEx/WriteFileEx completion contract.
+    fn child_stdio_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_PIPE_CONNECTED};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+            PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
+        };
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS,
+        };
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let name = to_wide(&format!(
+            r"\\.\pipe\nub-stdio-{}-{nonce}",
+            std::process::id()
+        ));
+        let server = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                FILE_FLAG_OVERLAPPED
+                    | FILE_FLAG_FIRST_PIPE_INSTANCE
+                    | if ours_readable {
+                        PIPE_ACCESS_INBOUND
+                    } else {
+                        PIPE_ACCESS_OUTBOUND
+                    },
+                PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                64 * 1024,
+                64 * 1024,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if server == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: each successful creation returns a uniquely owned handle.
+        let ours = unsafe { OwnedHandle::from_raw_handle(server) };
+        let client = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                if ours_readable {
+                    GENERIC_WRITE
+                } else {
+                    GENERIC_READ
+                },
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if client == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let client = unsafe { OwnedHandle::from_raw_handle(client) };
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let event = HandleGuard(event);
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event.0;
+        if unsafe { ConnectNamedPipe(server, &mut overlapped) } == 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_PIPE_CONNECTED) => {}
+                Some(ERROR_IO_PENDING) => {
+                    let mut transferred = 0;
+                    if unsafe { GetOverlappedResult(server, &overlapped, &mut transferred, 1) } == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                _ => return Err(error),
+            }
+        }
+        let theirs = inheritable_duplicate(client.as_raw_handle())?;
+        Ok((ours, theirs))
+    }
+
     impl NativeStdio {
         fn new(modes: [WindowsStdio; 3]) -> io::Result<Self> {
-            use std::os::windows::io::IntoRawHandle;
             let mut result = Self {
                 triple: [std::ptr::null_mut(); 3],
                 inherit_list: Vec::new(),
@@ -2504,38 +2592,28 @@ pub(super) mod launch {
             for (index, mode) in modes.into_iter().enumerate() {
                 let raw = parent[index];
                 let relay = mode == WindowsStdio::Inherit && index > 0 && is_console_handle(raw);
-                let handle = if mode == WindowsStdio::Piped || relay {
-                    let (reader, writer) = std::io::pipe()?;
+                let handle = if mode == WindowsStdio::Piped {
+                    let (ours, theirs) = child_stdio_pipe(index != 0)?;
                     if index == 0 {
-                        let child = inheritable_duplicate(reader.as_raw_handle())?;
-                        // SAFETY: ownership transfers from the pipe into the public std stream.
-                        result.stdin = Some(std::process::ChildStdin::from(unsafe {
-                            OwnedHandle::from_raw_handle(writer.into_raw_handle())
-                        }));
-                        child
+                        result.stdin = Some(ours.into());
+                    } else if index == 1 {
+                        result.stdout = Some(ours.into());
                     } else {
-                        let child = inheritable_duplicate(writer.as_raw_handle())?;
-                        if relay {
-                            result.relays.push((
-                                reader,
-                                if index == 1 {
-                                    RelayTarget::Stdout
-                                } else {
-                                    RelayTarget::Stderr
-                                },
-                            ));
-                        } else {
-                            // SAFETY: the reader's unique handle transfers to the std stream.
-                            let reader =
-                                unsafe { OwnedHandle::from_raw_handle(reader.into_raw_handle()) };
-                            if index == 1 {
-                                result.stdout = Some(reader.into());
-                            } else {
-                                result.stderr = Some(reader.into());
-                            }
-                        }
-                        child
+                        result.stderr = Some(ours.into());
                     }
+                    theirs
+                } else if relay {
+                    let (reader, writer) = std::io::pipe()?;
+                    let child = inheritable_duplicate(writer.as_raw_handle())?;
+                    result.relays.push((
+                        reader,
+                        if index == 1 {
+                            RelayTarget::Stdout
+                        } else {
+                            RelayTarget::Stderr
+                        },
+                    ));
+                    child
                 } else if mode == WindowsStdio::Null || raw.is_null() || raw == INVALID_HANDLE_VALUE
                 {
                     let file = std::fs::OpenOptions::new()
@@ -2589,6 +2667,9 @@ pub(super) mod launch {
             if self.status.is_some() {
                 return Ok(());
             }
+            // Keep synchronization handles before termination removes members
+            // from the Job's active list. Termination itself is asynchronous.
+            let snapshot = self.track_job_members();
             if let Some(helper) = &self.helper {
                 helper.terminate();
             }
@@ -2597,21 +2678,10 @@ pub(super) mod launch {
             {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            snapshot
         }
 
-        pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            if let Some(status) = self.status {
-                return Ok(Some(status));
-            }
-            match unsafe { WaitForSingleObject(self.process.0, 0) } {
-                WAIT_OBJECT_0 => {}
-                windows_sys::Win32::Foundation::WAIT_TIMEOUT => return Ok(None),
-                _ => return Err(io::Error::last_os_error()),
-            }
-            // A lifecycle shell may exit before its trailing command. Sample and
-            // retain those process handles until the whole Job drains; no blocking
-            // thread impersonates this native nonblocking status operation.
+        fn track_job_members(&mut self) -> io::Result<()> {
             const MAX_TRACKED: usize = 4096;
             let mut ids = vec![0usize; 2 + MAX_TRACKED];
             let listed = unsafe {
@@ -2642,12 +2712,38 @@ pub(super) mod launch {
                     unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
                 if !handle.is_null() {
                     self.tracked.push((pid, HandleGuard(handle)));
+                } else {
+                    let error = io::Error::last_os_error();
+                    // The member may have exited between enumeration and open.
+                    if error.raw_os_error() != Some(87) {
+                        return Err(error);
+                    }
                 }
+            }
+            Ok(())
+        }
+
+        pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            if let Some(status) = self.status {
+                return Ok(Some(status));
+            }
+            // A lifecycle shell may exit before its trailing command. Sample
+            // while the root is live too, and retain handles until signaled.
+            self.track_job_members()?;
+            match unsafe { WaitForSingleObject(self.process.0, 0) } {
+                WAIT_OBJECT_0 => {}
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT => return Ok(None),
+                _ => return Err(io::Error::last_os_error()),
             }
             let mut error = None;
             self.tracked.retain(|(_, process)| {
-                if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
-                    return true;
+                match unsafe { WaitForSingleObject(process.0, 0) } {
+                    WAIT_OBJECT_0 => {}
+                    windows_sys::Win32::Foundation::WAIT_TIMEOUT => return true,
+                    _ => {
+                        error = Some(io::Error::last_os_error());
+                        return true;
+                    }
                 }
                 let mut code = 0;
                 let mut creation: FILETIME = unsafe { std::mem::zeroed() };
@@ -2685,7 +2781,7 @@ pub(super) mod launch {
             {
                 return Err(io::Error::last_os_error());
             }
-            if accounting.ActiveProcesses != 0 {
+            if accounting.ActiveProcesses != 0 || !self.tracked.is_empty() {
                 return Ok(None);
             }
             let mut code = 0;

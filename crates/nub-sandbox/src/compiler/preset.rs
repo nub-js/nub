@@ -1883,7 +1883,9 @@ mod tests {
     fn a_full_disk_grant_opens_the_filesystem_for_that_package_and_no_other() {
         // Outside every baseline grant and every curated one: not the project, not the
         // package dir, not the private jail home, not an interpreter path.
-        let probe = Path::new(fx!("/testhome/.ssh/id_ed25519"));
+        // A home-scoped catalog grant is literal now, so use a path outside home
+        // as well as outside the project to distinguish it from whole-disk access.
+        let probe = Path::new(fx!("/outside-home-and-project/input"));
         let decide = |name: &str| {
             let policy = build_jail_policy_for_package(name);
             let effect = crate::matcher::PathMatcher::new(&policy.fs.rules)
@@ -2530,6 +2532,9 @@ mod tests {
     /// also what keeps `materialize_home_path` off the developer's own `$HOME`.
     #[test]
     fn a_home_cache_grant_is_withheld_from_a_package_the_v2_catalog_names() {
+        // Older Windows Cypress bands explicitly grant userHome. The current
+        // cache-only band is the discriminating control for v1 home-path leakage.
+        const VERSION: &str = "15.20.1";
         let user_home = tempfile::tempdir().expect("user home");
         let cache = tempfile::tempdir().expect("cache home");
         let home = crate::matcher::path::canonicalize_including_nonexistent(user_home.path());
@@ -2540,7 +2545,7 @@ mod tests {
         // The premise. If `cypress` ever loses its v2 entry this test proves nothing, and it must
         // say so here rather than passing for the wrong reason.
         assert!(
-            crate::catalog_override::v2_grant_for("cypress", Some("1.0.0")).is_some(),
+            crate::catalog_override::v2_grant_for("cypress", Some(VERSION)).is_some(),
             "`cypress` is this test's v2-covered fixture and the baked catalog no longer names it \
              — re-point at another `homePaths` carrier v2 measures"
         );
@@ -2554,7 +2559,7 @@ mod tests {
             },
             &package_dir,
             Some("cypress"),
-            Some("1.0.0"),
+            Some(VERSION),
             Vec::new(),
             Vec::new(),
             [("HOME".to_string(), "/the/users/home".to_string())]
@@ -2694,12 +2699,10 @@ mod tests {
         }
     }
 
-    /// The strip is BUILD-JAIL ONLY. A general policy still carries the secret floor, and
-    /// must — it has no narrow compiler-authored grant set to withhold secrets by shape, so
-    /// its `.env` protection genuinely is the deny band. Guards against the `name` gate being
-    /// dropped or `enforce_pure_allowlist` being hoisted into the shared compile path.
+    /// General policies use the same positive-only filesystem grammar. A granted
+    /// project includes its dotfiles; omitted home credentials remain ungranted.
     #[test]
-    fn a_general_policy_keeps_its_secret_floor() {
+    fn a_general_policy_has_literal_grants_without_a_secret_floor() {
         let ctx = CompileCtx::new(
             Homes {
                 home: PathBuf::from(fx!("/testhome")),
@@ -2719,14 +2722,18 @@ mod tests {
                     .rules
                     .entries
                     .iter()
-                    .any(|r| r.effect == Effect::Deny),
-                "a general policy ({surface}) must keep its denies — only build-jail is stripped"
+                    .all(|r| r.effect == Effect::Allow),
+                "general policy ({surface}) must contain only positive grants"
             );
             let m = crate::matcher::PathMatcher::new(&policy.fs.rules);
             assert_eq!(
                 m.decide(Path::new(fx!("/proj/.env"))).effect,
-                Effect::Deny,
-                "the `.env` floor must still hold for a general policy ({surface})"
+                Effect::Allow,
+                "project grant includes its `.env` in general policy ({surface})"
+            );
+            assert_eq!(
+                m.decide(Path::new(fx!("/testhome/.ssh/id_ed25519"))).effect,
+                Effect::Deny
             );
         }
     }

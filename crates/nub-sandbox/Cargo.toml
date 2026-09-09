@@ -102,6 +102,7 @@ features = [
   # console apart from a pipe, a file and `NUL` — `GetFileType == FILE_TYPE_CHAR` also matches `NUL`.
   "Win32_System_Console",
   "Win32_System_Pipes",
+  "Win32_System_IO",
   "Win32_System_RemoteDesktop",
   "Win32_System_Com",
 ]

@@ -2120,149 +2120,6 @@ fn pipe_owned() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((above_stdio(read)?, above_stdio(write)?))
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::time::Duration;
-
-    fn policy(host: &str) -> EgressPolicy {
-        EgressPolicy {
-            allow_all: false,
-            allow: vec![host.into()],
-            write_policy: None,
-            proxy_port: None,
-            proxy_token: None,
-        }
-    }
-
-    #[test]
-    fn policies_and_observed_dns_do_not_cross_launches() {
-        let mut first = SupState::new(policy("first.example"));
-        first.record("first.example", libc::AF_INET, &[192, 0, 2, 1]);
-        let second = SupState::new(policy("second.example"));
-        assert!(first.allowed(first.lookup(libc::AF_INET, &[192, 0, 2, 1]).as_deref()));
-        assert!(!second.allowed(Some("first.example")));
-        assert_eq!(second.lookup(libc::AF_INET, &[192, 0, 2, 1]), None);
-    }
-
-    #[test]
-    fn cancellation_wakes_an_idle_worker_and_stays_cancelled() {
-        let (read, _write) = pipe_owned().unwrap();
-        let control = Arc::new(WorkerControl::new().unwrap());
-        let worker_control = Arc::clone(&control);
-        let worker =
-            std::thread::spawn(move || worker_control.wait(read.as_raw_fd(), libc::POLLIN, None));
-        control.cancel();
-        assert!(!worker.join().unwrap().unwrap());
-        let (read, _write) = pipe_owned().unwrap();
-        assert!(
-            !control
-                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn worker_observes_readiness_timeout_and_hangup() {
-        let control = WorkerControl::new().unwrap();
-        let (read, write) = pipe_owned().unwrap();
-        let mut writer = std::fs::File::from(write);
-        assert!(
-            !control
-                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
-                .unwrap()
-        );
-        writer.write_all(b"x").unwrap();
-        assert!(
-            control
-                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
-                .unwrap()
-        );
-        std::fs::File::from(read).read_exact(&mut [0u8]).unwrap();
-        let (read, write) = pipe_owned().unwrap();
-        drop(write);
-        assert!(!control.wait(read.as_raw_fd(), libc::POLLIN, None).unwrap());
-    }
-
-    #[test]
-    fn launch_pipe_descriptors_are_private_and_close_on_exec() {
-        let (read, write) = pipe_owned().unwrap();
-        for fd in [read, write] {
-            assert!(fd.as_raw_fd() >= 3);
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-                0
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a Linux runner permitting unprivileged seccomp notification and pidfd_getfd"]
-    fn native_supervised_streams_status_and_repeated_launches() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("must-not-execute");
-        let argv = [
-            CString::new("/usr/bin/touch").unwrap(),
-            CString::new(marker.as_os_str().as_encoded_bytes()).unwrap(),
-        ];
-        let launch = SupervisedLaunch {
-            argv: &argv,
-            envp: &[],
-            cwd: None,
-            ruleset_fd: -1,
-            seccomp_ceiling: None,
-            stdin: SupervisedStdio::Null,
-            stdout: SupervisedStdio::Null,
-            stderr: SupervisedStdio::Null,
-        };
-        let result = spawn_supervised_with_ready(policy("example.test"), launch, |_| {
-            Err(io::Error::other("ready callback rejected launch"))
-        });
-        assert!(result.is_err());
-        assert!(
-            !marker.exists(),
-            "ready failure must precede workload execution"
-        );
-        for _ in 0..24 {
-            let argv = [
-                CString::new("/bin/sh").unwrap(),
-                CString::new("-c").unwrap(),
-                CString::new("read line; printf 'out:%s' \"$line\"; printf err >&2; exit 7")
-                    .unwrap(),
-            ];
-            let launch = SupervisedLaunch {
-                argv: &argv,
-                envp: &[],
-                cwd: None,
-                ruleset_fd: -1,
-                seccomp_ceiling: None,
-                stdin: SupervisedStdio::Piped,
-                stdout: SupervisedStdio::Piped,
-                stderr: SupervisedStdio::Piped,
-            };
-            let mut child = spawn_supervised(policy("example.test"), launch).unwrap();
-            child.take_stdin().unwrap().write_all(b"hello\n").unwrap();
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            child
-                .take_stdout()
-                .unwrap()
-                .read_to_string(&mut stdout)
-                .unwrap();
-            child
-                .take_stderr()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            assert_eq!(child.wait().unwrap().code(), Some(7));
-            assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
-            assert_eq!(stdout, "out:hello");
-            assert_eq!(stderr, "err");
-        }
-    }
-}
-
 fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     if fd.as_raw_fd() >= 3 {
         return Ok(fd);
@@ -2641,4 +2498,147 @@ pub(super) fn install_target_seccomp(
         return Err(unsafe { *libc::__errno_location() });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    fn policy(host: &str) -> EgressPolicy {
+        EgressPolicy {
+            allow_all: false,
+            allow: vec![host.into()],
+            write_policy: None,
+            proxy_port: None,
+            proxy_token: None,
+        }
+    }
+
+    #[test]
+    fn policies_and_observed_dns_do_not_cross_launches() {
+        let mut first = SupState::new(policy("first.example"));
+        first.record("first.example", libc::AF_INET, &[192, 0, 2, 1]);
+        let second = SupState::new(policy("second.example"));
+        assert!(first.allowed(first.lookup(libc::AF_INET, &[192, 0, 2, 1]).as_deref()));
+        assert!(!second.allowed(Some("first.example")));
+        assert_eq!(second.lookup(libc::AF_INET, &[192, 0, 2, 1]), None);
+    }
+
+    #[test]
+    fn cancellation_wakes_an_idle_worker_and_stays_cancelled() {
+        let (read, _write) = pipe_owned().unwrap();
+        let control = Arc::new(WorkerControl::new().unwrap());
+        let worker_control = Arc::clone(&control);
+        let worker =
+            std::thread::spawn(move || worker_control.wait(read.as_raw_fd(), libc::POLLIN, None));
+        control.cancel();
+        assert!(!worker.join().unwrap().unwrap());
+        let (read, _write) = pipe_owned().unwrap();
+        assert!(
+            !control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_observes_readiness_timeout_and_hangup() {
+        let control = WorkerControl::new().unwrap();
+        let (read, write) = pipe_owned().unwrap();
+        let mut writer = std::fs::File::from(write);
+        assert!(
+            !control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+        writer.write_all(b"x").unwrap();
+        assert!(
+            control
+                .wait(read.as_raw_fd(), libc::POLLIN, Some(Duration::ZERO))
+                .unwrap()
+        );
+        std::fs::File::from(read).read_exact(&mut [0u8]).unwrap();
+        let (read, write) = pipe_owned().unwrap();
+        drop(write);
+        assert!(!control.wait(read.as_raw_fd(), libc::POLLIN, None).unwrap());
+    }
+
+    #[test]
+    fn launch_pipe_descriptors_are_private_and_close_on_exec() {
+        let (read, write) = pipe_owned().unwrap();
+        for fd in [read, write] {
+            assert!(fd.as_raw_fd() >= 3);
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Linux runner permitting unprivileged seccomp notification and pidfd_getfd"]
+    fn native_supervised_streams_status_and_repeated_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-execute");
+        let argv = [
+            CString::new("/usr/bin/touch").unwrap(),
+            CString::new(marker.as_os_str().as_encoded_bytes()).unwrap(),
+        ];
+        let launch = SupervisedLaunch {
+            argv: &argv,
+            envp: &[],
+            cwd: None,
+            ruleset_fd: -1,
+            seccomp_ceiling: None,
+            stdin: SupervisedStdio::Null,
+            stdout: SupervisedStdio::Null,
+            stderr: SupervisedStdio::Null,
+        };
+        let result = spawn_supervised_with_ready(policy("example.test"), launch, |_| {
+            Err(io::Error::other("ready callback rejected launch"))
+        });
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "ready failure must precede workload execution"
+        );
+        for _ in 0..24 {
+            let argv = [
+                CString::new("/bin/sh").unwrap(),
+                CString::new("-c").unwrap(),
+                CString::new("read line; printf 'out:%s' \"$line\"; printf err >&2; exit 7")
+                    .unwrap(),
+            ];
+            let launch = SupervisedLaunch {
+                argv: &argv,
+                envp: &[],
+                cwd: None,
+                ruleset_fd: -1,
+                seccomp_ceiling: None,
+                stdin: SupervisedStdio::Piped,
+                stdout: SupervisedStdio::Piped,
+                stderr: SupervisedStdio::Piped,
+            };
+            let mut child = spawn_supervised(policy("example.test"), launch).unwrap();
+            child.take_stdin().unwrap().write_all(b"hello\n").unwrap();
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .take_stdout()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .take_stderr()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(7));
+            assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
+            assert_eq!(stdout, "out:hello");
+            assert_eq!(stderr, "err");
+        }
+    }
 }

@@ -1909,7 +1909,8 @@ mod tests {
 
     #[test]
     fn secure_default_fs_is_positive_project_read_with_private_tmp() {
-        let homes = homes();
+        let mut homes = homes();
+        homes.project = crate::matcher::path::canonicalize_including_nonexistent(&homes.project);
         let ctx = crate::compiler::CompileCtx::new(
             homes.clone(),
             homes.project.clone(),

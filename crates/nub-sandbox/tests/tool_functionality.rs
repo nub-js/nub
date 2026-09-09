@@ -51,6 +51,21 @@ fn env_for(root: &Path, extra: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 fn policy(root: &Path, fs: Value, extra_env: &[(&str, &str)]) -> nub_sandbox::SandboxPolicy {
+    let mut fs = match fs {
+        Value::Object(entries) => entries,
+        Value::Array(entries) => entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.as_str().unwrap().to_string(),
+                    Value::String("rw".into()),
+                )
+            })
+            .collect(),
+        _ => panic!("fixture filesystem policy must be an object or array"),
+    };
+    fs.insert("./".into(), Value::String("rw".into()));
+    fs.insert("$tmp".into(), Value::String("rw".into()));
     let homes = Homes {
         home: root.join("home"),
         cache: root.join("cache"),
@@ -277,9 +292,20 @@ fn npm_cold_cache_creation_requires_a_materialized_parent_grant() {
             &[("NPM_CONFIG_CACHE", &tool_cache_string)],
         ),
     );
+    // Seatbelt authorizes future names; inode/ACL-backed grants require an
+    // existing root. This is a backend-limit control, not a functionality pass.
+    if cfg!(target_os = "macos") {
+        assert!(
+            tool_dirs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tool_dirs.stderr)
+        );
+        assert!(tool_cache.exists());
+        return;
+    }
     assert!(
         !tool_dirs.status.success(),
-        "cold speculative npm cache unexpectedly worked"
+        "cold speculative cache unexpectedly worked"
     );
     let stderr = String::from_utf8_lossy(&tool_dirs.stderr);
     assert!(

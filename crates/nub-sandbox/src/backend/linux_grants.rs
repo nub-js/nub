@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_root_rule_resets_earlier_literal_grants() {
+    fn whole_root_read_unions_with_literal_write_grants() {
         let dir = tempdir().unwrap();
         let before = dir.path().join("before");
         let after = dir.path().join("after");
@@ -400,8 +400,12 @@ mod tests {
             allow(after.to_string_lossy(), FsAccess::ReadWrite),
         ]))
         .unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].path, after);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].path, before);
+        assert_eq!(plan[1].path, Path::new("/"));
+        assert_eq!(plan[1].access, MountAccess::ReadOnly);
+        assert_eq!(plan[2].path, after);
+        assert_eq!(plan[2].access, MountAccess::ReadWrite);
     }
 
     #[test]

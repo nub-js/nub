@@ -74,6 +74,18 @@ fn is_running(pid: u32) -> bool {
     running
 }
 
+struct OwnerFixture(std::process::Child);
+
+impl Drop for OwnerFixture {
+    fn drop(&mut self) {
+        // A readiness/assertion failure must not strand an owner waiting on
+        // stdin or acquiring a resource, with the CI log stream still open.
+        self.0.stdin.take();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn windows_native_child_fixture() {
     let Ok(mode) = std::env::var(MODE) else {
@@ -97,7 +109,7 @@ fn windows_native_child_fixture() {
             println!("managed-temp:{}", path.display());
             println!("{}", super::windows_token_report());
         }
-        "tree" => {
+        "tree" | "tree-hold" => {
             // Deliberately orphan this helper to test Job ownership after its
             // immediate parent exits; waiting here would defeat the regression.
             #[allow(clippy::zombie_processes)]
@@ -106,8 +118,14 @@ fn windows_native_child_fixture() {
                 .env(MODE, "hold")
                 .spawn()
                 .unwrap();
-            std::fs::write(root.join("descendant"), child.id().to_string()).unwrap();
+            std::fs::write(root.join("descendant.pending"), child.id().to_string()).unwrap();
+            std::fs::rename(root.join("descendant.pending"), root.join("descendant")).unwrap();
             // Return without waiting: the native Job, not this direct child, owns the tree.
+            if mode == "tree-hold" {
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
         }
         "hold" => {
             std::fs::write(root.join(format!("ready-{}", std::process::id())), b"ready").unwrap();
@@ -160,8 +178,11 @@ fn windows_native_streams_are_caller_owned_and_status_is_cached() {
         "stdin keeps the native child live"
     );
     let mut input = child.take_stdin().unwrap();
-    input.write_all(b"pipe-contract").unwrap();
+    let payload = "pipe-contract".repeat(16 * 1024);
+    eprintln!("NATIVE_PIPE_PHASE streams: writing stdin");
+    input.write_all(payload.as_bytes()).unwrap();
     drop(input);
+    eprintln!("NATIVE_PIPE_PHASE streams: stdin closed");
     let mut out = child.take_stdout().unwrap();
     let mut err = child.take_stderr().unwrap();
     let stdout = std::thread::spawn(move || {
@@ -175,13 +196,16 @@ fn windows_native_streams_are_caller_owned_and_status_is_cached() {
         bytes
     });
     drop(resource);
+    eprintln!("NATIVE_PIPE_PHASE streams: waiting for Job");
     let status = child.wait().unwrap();
+    eprintln!("NATIVE_PIPE_PHASE streams: Job reaped, joining readers");
     assert!(status.success());
     assert_eq!(child.try_wait().unwrap(), Some(status));
     let stdout = stdout.join().unwrap();
-    assert!(stdout.contains("native-stdout:pipe-contract"));
+    assert!(stdout.contains(&format!("native-stdout:{payload}")));
     assert!(stdout.contains("is_appcontainer=true"));
     assert!(stderr.join().unwrap().contains("native-stderr"));
+    eprintln!("NATIVE_PIPE_PHASE streams: readers joined");
 }
 
 #[test]
@@ -217,23 +241,30 @@ fn windows_native_equivalent_resources_reuse_identity_but_not_jobs() {
 
 #[test]
 fn windows_native_drop_reaps_a_handed_off_descendant() {
-    let root = tempfile::tempdir().unwrap();
-    let resource = plan(root.path(), "tree").acquire().unwrap();
-    let mut child = resource
-        .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
-        .unwrap();
-    wait_for_file(&root.path().join("descendant"));
-    let descendant: u32 = std::fs::read_to_string(root.path().join("descendant"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    wait_for_file(&root.path().join(format!("ready-{descendant}")));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "a root exit is not Job completion"
-    );
-    drop(child);
-    assert!(!is_running(descendant));
+    for mode in ["tree", "tree-hold"] {
+        let root = tempfile::tempdir().unwrap();
+        let resource = plan(root.path(), mode).acquire().unwrap();
+        let mut child = resource
+            .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
+            .unwrap();
+        let pid = child.id();
+        wait_for_file(&root.path().join("descendant"));
+        let descendant: u32 = std::fs::read_to_string(root.path().join("descendant"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        wait_for_file(&root.path().join(format!("ready-{descendant}")));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a root exit is not Job completion"
+        );
+        drop(child);
+        assert!(
+            !is_running(descendant),
+            "Drop left a live descendant: {mode}"
+        );
+        assert!(!is_running(pid), "Drop left a live root: {mode}");
+    }
 }
 
 #[test]
@@ -266,8 +297,8 @@ fn windows_native_independent_owner_death_reaps_only_its_command() {
             .spawn()
             .unwrap()
     };
-    let mut a = owner();
-    let mut b = owner();
+    let mut a = OwnerFixture(owner());
+    let mut b = OwnerFixture(owner());
     let record = |owner: &std::process::Child| {
         let path = root.path().join(format!("owner-{}", owner.id()));
         wait_for_file(&path);
@@ -279,12 +310,12 @@ fn windows_native_independent_owner_death_reaps_only_its_command() {
             PathBuf::from(lines.next().unwrap()),
         )
     };
-    let (profile_a, child_a, tmp_a) = record(&a);
-    let (profile_b, child_b, tmp_b) = record(&b);
+    let (profile_a, child_a, tmp_a) = record(&a.0);
+    let (profile_b, child_b, tmp_b) = record(&b.0);
     assert_eq!(profile_a, profile_b);
     assert_eq!(tmp_a, tmp_b);
-    a.kill().unwrap();
-    a.wait().unwrap();
+    a.0.kill().unwrap();
+    a.0.wait().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while is_running(child_a) {
         assert!(
@@ -297,14 +328,41 @@ fn windows_native_independent_owner_death_reaps_only_its_command() {
         is_running(child_b),
         "another owner's same-policy Job must remain alive"
     );
-    drop(b.stdin.take());
-    assert!(b.wait().unwrap().success());
+    drop(b.0.stdin.take());
+    assert!(b.0.wait().unwrap().success());
     assert!(!is_running(child_b));
     let mut launch = plan(root.path(), "hold");
     launch.private_tmp = true;
     let resource = launch.acquire().unwrap();
     assert_eq!(resource.profile_name(), profile_a);
     assert_eq!(resource.private_tmp(), Some(tmp_a.as_path()));
+}
+
+#[test]
+fn windows_native_owner_guard_reaps_on_fixture_panic() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = OwnerFixture(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FIXTURE, "--nocapture", "--test-threads=1"])
+            .env(MODE, "hold")
+            .env("__NUB_WINDOWS_FIXTURE_ROOT", root.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = owner.0.id();
+    wait_for_file(&root.path().join(format!("ready-{pid}")));
+    let failure = std::panic::catch_unwind(move || {
+        let _owner = owner;
+        panic!("simulated owner readiness assertion failure");
+    });
+    assert!(failure.is_err());
+    assert!(
+        !is_running(pid),
+        "fixture panic must kill and reap its owner"
+    );
 }
 
 #[test]
@@ -349,12 +407,15 @@ fn windows_native_managed_tmp_reuses_slot_without_retaining_command_environment(
         )
         .unwrap();
     let mut stdout = String::new();
+    eprintln!("NATIVE_PIPE_PHASE managed-tmp: reading stdout");
     child
         .take_stdout()
         .unwrap()
         .read_to_string(&mut stdout)
         .unwrap();
+    eprintln!("NATIVE_PIPE_PHASE managed-tmp: stdout EOF, waiting for Job");
     assert!(child.wait().unwrap().success());
+    eprintln!("NATIVE_PIPE_PHASE managed-tmp: Job reaped");
     assert!(stdout.contains("is_appcontainer=true"));
     assert_eq!(
         std::fs::read(slot.join("managed-marker")).unwrap(),

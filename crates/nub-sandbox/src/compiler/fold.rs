@@ -63,7 +63,7 @@ pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, 
     // tmp — so its value is a plain fs permission: a truthy grant (`"r"`/`"rw"`/`true`) →
     // `Private` (fresh per-run dir, shared tmp hidden); `false` → `Deny` (no tmp). The backend
     // owns the private-dir creation + whole-subtree grant + shared-tmp denial at spawn time (the
-    // per-run path is not knowable at compile time), so a `$tmp`-prefixed entry sets only the
+    // session path is not knowable at compile time), so a `$tmp`-prefixed entry sets only the
     // MODE and emits no ordinary fs rule. Shared system tmp is a SEPARATE literal path, reached
     // only by granting `/tmp` — never via this sentinel; `Shared` (the default when `$tmp` is
     // absent) means "no tmp confinement, host tmp per fs rules".
@@ -102,8 +102,8 @@ pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, 
     Ok(FsPolicy { rules: set, tmp })
 }
 
-/// `$tmp` is a managed per-run directory. A suffix cannot name a stable path, so reject it.
-const MALFORMED_TMP_MSG: &str = "`$tmp` is a managed per-run directory and takes no suffix — use bare `$tmp`; grant a literal path for a specific shared-temp location";
+/// `$tmp` is managed session storage. Suffixes do not define separate grants.
+const MALFORMED_TMP_MSG: &str = "`$tmp` is managed session storage and takes no suffix — use bare `$tmp`; grant a literal path for a specific shared-temp location";
 
 /// Classify a trimmed key/entry against the `$tmp` sentinel. Identifier-boundary aware
 /// (via [`split_fs_sentinel`]) so `$tmpx` remains the different `$name` `tmpx`; only bare
@@ -137,7 +137,7 @@ fn parse_tmp_mode(key: &str, val: &Value, path: &str) -> Result<Option<TmpMode>,
         _ => {
             return Err(CompileError::shape(
                 path,
-                "`$tmp` takes only \"rw\"/`true` (a fresh per-run private tmp dir) or `false` (no tmp); read-only cannot use a fresh writable scratch directory",
+                "`$tmp` takes only \"rw\"/`true` (private session storage) or `false` (no tmp); read-only cannot provide writable scratch storage",
             ));
         }
     };

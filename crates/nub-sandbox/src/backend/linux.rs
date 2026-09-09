@@ -143,14 +143,6 @@ pub(crate) struct LinuxPreflight {
     landlock: Option<LandlockPreflight>,
 }
 
-impl LinuxPreflight {
-    /// Whether this launch will take the Landlock arm. Read by [`super::apply`] BEFORE it
-    /// starts the egress proxy, because this mechanism can never route a child through one.
-    pub(crate) fn uses_landlock(&self) -> bool {
-        self.landlock.is_some()
-    }
-}
-
 struct LandlockPreflight {
     abi: u32,
 }

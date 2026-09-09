@@ -291,22 +291,12 @@ pub struct CommandSpec {
     pub redact_stdout: bool,
     /// Pipe the child's stderr for host-side redaction. See [`redact_stdout`](Self::redact_stdout).
     pub redact_stderr: bool,
-    /// Put the child in its OWN process group so its whole descendant tree can be
-    /// signalled as `-pgid`. For third-party code the host cannot supervise any other way:
-    /// a lifecycle shell's `node-gyp` → `make` → `cc` are unreachable from its pid, so
-    /// killing the shell alone leaves them reparented to init and still writing.
-    ///
-    /// THE CANONICAL ACCOUNT OF WHO REAPS WHAT — the other sites reference this one. Each
-    /// Linux takes a process group unconditionally (its `setsid` is also
-    /// its terminal hardening), the Windows AppContainer through a `KILL_ON_JOB_CLOSE` job
-    /// object the child is assigned to while still suspended. So this flag is honored by the
-    /// macOS backend alone, and as an OPT-IN rather than a default: leaving nub's process group
-    /// is what forfeits a terminal Ctrl-C by membership, so only a caller that arranges its
-    /// own signal reach should pay for it. Default `false` = today's behavior, byte-for-byte.
-    ///
-    /// A REQUEST, not a guarantee. A macOS launch with nothing to confine emits no profile
-    /// and no hook, so it silently declines; `Prepared::spawn_with_signal_target` declines
-    /// again if the kernel does not confirm the group, and warns when it does.
+    /// Legacy backend grouping hint, retained for existing embedders. Reusable
+    /// launches always own their commands: Unix uses a private guardian process
+    /// group, and Windows uses a kill-on-close Job assigned during process creation.
+    /// This flag cannot request detached commands. Hosts should forward signals
+    /// through [`Prepared::spawn_with_signal_target`] rather than assume that the
+    /// command remains in the host's terminal process group.
     pub reap_descendants: bool,
     /// A label naming THIS launch in the kernel's own denial records, so a failed script can be
     /// told what the jail refused instead of only that it failed.
@@ -429,19 +419,9 @@ pub struct Prepared {
     /// `command` is spawned.
     #[cfg(target_os = "linux")]
     pub(crate) _inherited_files: Vec<std::fs::File>,
-    /// Signal and reap the child's whole PROCESS GROUP rather than just the child.
-    ///
-    /// Set by the two paths whose `pre_exec` makes the child its own group leader: the
-    /// Landlock build jail (`setsid`) and the macOS Seatbelt wrap when the caller asked
-    /// for [`CommandSpec::reap_descendants`] (`setpgid(0, 0)`). It is the only handle
-    /// either has on descendants — neither runs a PID-1 monitor, so without it a Ctrl-C
-    /// reaches the script but not the compiler it spawned, and a normal return leaves
-    /// that compiler writing into a package dir the installer already reported on.
-    ///
-    /// A REQUEST, not a fact: [`Prepared::spawn_with_signal_target`] downgrades it when
-    /// the kernel does not confirm the child leads its own group. MUST stay false for
-    /// every other path, where the child shares nub's own process group and a negative
-    /// target would signal nub itself.
+    /// Legacy backend request for an additional membership check. Supported Unix
+    /// launches join an owned guardian regardless; other Unix targets only signal
+    /// a process group after the kernel confirms the backend's requested grouping.
     #[cfg(unix)]
     pub(crate) signal_process_group: bool,
     /// Windows launch plan — the backend owns spawn+wait+teardown when this is `Some`.
@@ -655,9 +635,8 @@ impl PreparedChild {
         self.child_id
     }
 
-    /// The child's process GROUP id — `Some` only when this launch put the child in its
-    /// own group AND the kernel confirmed it leads one, which is the only state in which
-    /// `-pgid` names the child's tree and nothing else.
+    /// The command's owned process-group id. On Linux/macOS the guardian, not
+    /// necessarily the direct child, leads this group. Windows uses a Job instead.
     ///
     /// Exposed so a host can register the group with its own terminate-signal reaper: a
     /// signal whose default action kills nub never runs this handle's `Drop`, so the
@@ -1100,9 +1079,8 @@ impl Prepared {
         // can close the moment the child holds it (the `pre_exec` hook consumes it after fork).
         #[cfg(target_os = "linux")]
         self._inherited_files.clear();
-        // A REQUEST until the kernel confirms it. `confirm_group_leader` is what turns it
-        // into a fact, and everything downstream — the negative signal target, the reap in
-        // `wait`, the pgid handed to the host — keys on the confirmed value.
+        // A failed guardian pre-exec hook fails spawn. Retain the backend's
+        // requested membership cross-check before handing a negative target out.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.signal_process_group
             && !confirm_group_membership(child.id() as i32, guardian.process_group_id())
@@ -1115,9 +1093,7 @@ impl Prepared {
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         let signal_process_group = self.signal_process_group
             && confirm_group_membership(child.id() as i32, child.id() as i32);
-        // Negative = the whole process group, and only ever after `confirm_group_leader`; see
-        // `signal_process_group`. The retained-monitor launch that used to fork here was removed
-        // with `linux_monitor` (epic 1.1); the Landlock path signals its child's group directly.
+        // Negative targets name the private guardian group, never the host group.
         #[cfg(unix)]
         let signal_target = {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
