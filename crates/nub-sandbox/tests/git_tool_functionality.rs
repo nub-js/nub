@@ -147,7 +147,8 @@ fn policy(
 
 fn output_message(output: &Output) -> String {
     format!(
-        "stdout:\n{}\nstderr:\n{}",
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )

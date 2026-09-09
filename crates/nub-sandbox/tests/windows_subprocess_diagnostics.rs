@@ -132,7 +132,7 @@ fn windows_subprocess_startup_controls() {
     let mut targets: Vec<Target> = serde_json::from_slice(&std::fs::read(matrix).unwrap()).unwrap();
     assert!(
         targets.len() >= 2,
-        "rustc and Python controls must be supplied"
+        "at least two independent program controls must be supplied"
     );
     let exe = std::env::current_exe().unwrap();
     targets.push(Target {

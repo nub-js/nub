@@ -42,11 +42,24 @@ jobs:
       - name: Checking Git fixture
         run: |
           set -o pipefail
-          cargo clippy -p nub-sandbox --profile fast --test git_tool_functionality -- -D warnings 2>&1 | tee reports/clippy.log
-      - name: Comparing explicit Git installation grants
+          cargo clippy -p nub-sandbox --profile fast --test git_tool_functionality --test windows_subprocess_diagnostics -- -D warnings 2>&1 | tee reports/clippy.log
+      - name: Preparing shell startup controls
+        shell: pwsh
+        run: |
+          $execPath = (git --exec-path).Trim()
+          $install = Split-Path (Split-Path (Split-Path $execPath))
+          $sh = Join-Path $install 'usr/bin/sh.exe'
+          if (!(Test-Path $sh)) { throw "Git shell missing: $sh" }
+          @(
+            @{name='git'; program=(Get-Command git.exe).Source; args=@('--version'); root=$install},
+            @{name='sh-builtin'; program=$sh; args=@('-c','printf SHELL_BUILTIN_OK'); root=$install},
+            @{name='sh-child'; program=$sh; args=@('-c','git --version'); root=$install}
+          ) | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 reports/interpreters.json
+          "SANDBOX_DIAG_MATRIX=$env:GITHUB_WORKSPACE\reports\interpreters.json" >> $env:GITHUB_ENV
+      - name: Comparing Git and shell startup
         run: |
           set -o pipefail
-          cargo test -p nub-sandbox --profile fast --test git_tool_functionality git_windows_complete_runtime -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/git-runtime.log
+          cargo test -p nub-sandbox --profile fast --test windows_subprocess_diagnostics windows_subprocess_startup_controls -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/git-startup.log
       - name: Preserving Git evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
