@@ -571,10 +571,8 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     paths
 }
 
-/// Expand `$tooldirs` into fs rules under the resolved home anchors — one rule per
-/// subtree glob per pattern, mirroring [`super::defaults::secret_read_denies`] and the
-/// [`super::fold::push_fs_rules`] funnel (a Deny normalizes to the inert `FsAccess::DENY`,
-/// so two denies differing only in access don't yield divergent IR — D20).
+/// Expand the default roots without environment relocations for unit controls.
+#[cfg(test)]
 pub fn tooldirs_fs_rules(homes: &Homes, effect: Effect, access: FsAccess) -> Vec<FsRule> {
     tooldirs_fs_rules_with_env(homes, &BTreeMap::new(), effect, access)
         .expect("the audited static $tooldirs roots are never filesystem roots")

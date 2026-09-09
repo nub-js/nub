@@ -56,7 +56,7 @@ fn catalog_user_home_grant_includes_a_credential_canary() {
                 && rule
                     .matcher
                     .as_str()
-                    .contains(&homes.home.to_string_lossy())
+                    .contains(homes.home.to_string_lossy().as_ref())
         }),
         "the userHome catalog grant must remain writable"
     );

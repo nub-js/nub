@@ -115,7 +115,7 @@ enum TmpKey {
 }
 fn classify_tmp_key(k: &str) -> TmpKey {
     match crate::matcher::path::split_fs_sentinel(k) {
-        Some(("tmp", rest)) if rest.is_empty() => TmpKey::Sentinel,
+        Some(("tmp", "")) => TmpKey::Sentinel,
         Some(("tmp", _)) => TmpKey::Malformed,
         _ => TmpKey::NotTmp,
     }

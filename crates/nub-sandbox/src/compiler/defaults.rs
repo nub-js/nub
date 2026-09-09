@@ -3,6 +3,7 @@
 
 /// Legacy classifier retained for the Windows pure-allowlist control test. It is not
 /// emitted by the compiler: broad filesystem grants are literal positive grants.
+#[cfg(test)]
 pub(crate) const ENV_DENY_LEAF_GLOBS: &[&str] = &[
     "**/.env*",
     ".env*",
@@ -59,6 +60,7 @@ pub fn subtree_globs(expanded: &str) -> Vec<String> {
 }
 
 /// Kernel trees the Linux backend handles without granting a literal subtree.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const RESERVED_KERNEL_TREES: &[&str] = &["/proc", "/sys", "/dev"];
 
 /// Non-secret operational env keys that pass through in the `sandbox: true`

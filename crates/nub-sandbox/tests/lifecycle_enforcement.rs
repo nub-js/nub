@@ -53,16 +53,13 @@ fn native_child() {
         }
         #[cfg(unix)]
         "descendants" => {
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "native_child", "--nocapture"])
                 .env(CASE, "sleep")
                 .spawn()
                 .unwrap();
             std::fs::write(root.join("project/descendant-pid"), child.id().to_string()).unwrap();
-            // The sandbox's guardian, rather than this direct child, owns reaping.
-            loop {
-                std::thread::park();
-            }
+            child.wait().unwrap();
         }
         #[cfg(unix)]
         "sleep" => loop {

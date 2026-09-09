@@ -575,7 +575,7 @@ pub struct Sandbox {
 
 /// Session-owned state deliberately kept private: callers can submit commands, not mutate
 /// policy, credentials, proxy identity, or the managed temporary root after acquisition.
-struct SessionResources {
+pub(crate) struct SessionResources {
     policy: SandboxPolicy,
     proxy: Option<EgressProxy>,
     private_tmp: Option<tempfile::TempDir>,
@@ -1290,14 +1290,14 @@ fn start_session_proxy(
         if policy.build_jail && policy.net.brokers.is_empty() {
             return Ok(None);
         }
-        return start_proxy_if_needed(policy, runtime_brokers);
+        start_proxy_if_needed(policy, runtime_brokers)
     }
     #[cfg(target_os = "windows")]
     {
         if windows::uses_egress_funnel(policy) {
             return Ok(None);
         }
-        return start_proxy_if_needed(policy, runtime_brokers);
+        start_proxy_if_needed(policy, runtime_brokers)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     start_proxy_if_needed(policy, runtime_brokers)

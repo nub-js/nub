@@ -678,7 +678,7 @@ fn registry_root() -> io::Result<PathBuf> {
             Err(error) => return Err(error),
         };
         protect_registry_root(&root, sid.as_ptr().cast_mut().cast(), created)?;
-        return Ok(root);
+        Ok(root)
     }
     #[cfg(not(windows))]
     {

@@ -413,7 +413,7 @@ fn guardian_loop(lifeline_read: RawFd) -> ! {
     loop {
         // SAFETY: raw read into a one-byte stack buffer. EINTR is the only retryable
         // result; EOF and any other error represent owner loss.
-        let read = unsafe { libc::read(lifeline_read, (&mut byte).cast(), 1) };
+        let read = unsafe { libc::read(lifeline_read, (&raw mut byte).cast(), 1) };
         if read < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
             continue;
         }
@@ -476,7 +476,7 @@ fn read_byte(fd: RawFd) -> io::Result<u8> {
     let mut byte = 0u8;
     loop {
         // SAFETY: read exactly one byte into stack storage.
-        let count = unsafe { libc::read(fd, (&mut byte).cast(), 1) };
+        let count = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
         if count == 1 {
             return Ok(byte);
         }
@@ -496,7 +496,7 @@ fn read_byte(fd: RawFd) -> io::Result<u8> {
 fn write_byte(fd: RawFd, byte: u8) -> libc::c_int {
     loop {
         // SAFETY: write one byte from stack storage to the guardian-ready pipe.
-        let count = unsafe { libc::write(fd, (&byte).cast(), 1) };
+        let count = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
         if count == 1 {
             return 0;
         }

@@ -123,7 +123,7 @@ pub(crate) struct AppContainerLaunch {
 /// Native command stream configuration; pipes remain owned by the submitting caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) enum WindowsStdio {
+pub(crate) enum WindowsStdio {
     Inherit,
     Piped,
     Null,

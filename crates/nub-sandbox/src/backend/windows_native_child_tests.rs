@@ -98,6 +98,9 @@ fn windows_native_child_fixture() {
             println!("{}", super::windows_token_report());
         }
         "tree" => {
+            // Deliberately orphan this helper to test Job ownership after its
+            // immediate parent exits; waiting here would defeat the regression.
+            #[allow(clippy::zombie_processes)]
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", FIXTURE, "--nocapture", "--test-threads=1"])
                 .env(MODE, "hold")
