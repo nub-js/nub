@@ -76,6 +76,7 @@ pub(super) fn attach(files: &mut Vec<AppFile<Vec<u8>>>, node: &Path) -> Result<b
     input.seek(SeekFrom::Start(0))?;
     let output = Command::new(node)
         .args([
+            "--predictable",
             "--experimental-vm-modules",
             "--no-warnings",
             "-e",

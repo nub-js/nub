@@ -26,7 +26,7 @@ function fixture(t, additional = []) {
     ["main.mjs", "import {f1999} from './nested%20%23/%CE%BB%25.mjs'; await Promise.resolve(); console.log(f1999(1),import.meta.url);"],
     ...additional,
   ];
-  const build = spawnSync(process.execPath, ["--experimental-vm-modules", generator], {
+  const build = spawnSync(process.execPath, ["--predictable", "--experimental-vm-modules", generator], {
     input: JSON.stringify(files), env, maxBuffer: 10 * 1024 * 1024,
   });
   assert.equal(build.status, 0, build.stderr.toString());
@@ -161,4 +161,18 @@ test("cached modules preserve dynamic imports, cycles, workers and source locati
   const result = f.run();
   assert.equal(result.stdout.toString().trim(), "semantics preserved");
   assert.match(result.stderr.toString(), /V8 code cache for ESM .*dynamic\.mjs was accepted/);
+});
+
+test("identical sources produce identical packs in separate build processes", { skip: !supported }, () => {
+  const source = Array.from({ length: 12000 }, (_, i) => `export function f${i}(x){return x+${i}}`).join("\n");
+  const input = JSON.stringify([["main.mjs", source]]);
+  const builds = Array.from({ length: 3 }, () => {
+    const result = spawnSync(process.execPath, ["--predictable", "--experimental-vm-modules", generator], {
+      input, env, maxBuffer: 20 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, result.stderr.toString());
+    return result.stdout;
+  });
+  assert.deepEqual(builds[0], builds[1]);
+  assert.deepEqual(builds[1], builds[2]);
 });

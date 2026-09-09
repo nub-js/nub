@@ -1,6 +1,8 @@
 // The helper runs in a separate target-Node process and never links or evaluates
 // a module. Restoring laziness before serialization retains the runtime's flag
 // hash without making the runtime eagerly compile its builtins and other code.
+// Only the build helper uses --predictable. V8 deliberately excludes it from
+// the cache flag hash; the application's runtime retains its normal randomness.
 const fs = require("node:fs");
 const vm = require("node:vm");
 const v8 = require("node:v8");
