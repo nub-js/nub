@@ -681,13 +681,25 @@ fn acquire_at(root: PathBuf, identity: PolicyIdentity) -> io::Result<Acquired> {
 /// object identity at the mutation boundary.  A failed removal is left journaled as
 /// `RecoveryNeeded`, never silently discarded.
 pub(crate) fn begin_recovery(all: bool, reserve_slot: bool) -> io::Result<Vec<Entry>> {
-    let root = registry_root()?;
+    let root = registry_root().inspect_err(|error| {
+        #[cfg(test)]
+        eprintln!("WINDOWS_REGISTRY_ERROR recovery-root: {error:?}");
+        tracing::warn!(%error, "sandbox recovery registry root failed");
+    })?;
     begin_recovery_at(&root, all, reserve_slot)
 }
 
 fn begin_recovery_at(root: &Path, all: bool, reserve_slot: bool) -> io::Result<Vec<Entry>> {
-    let _lock = MutationLock::acquire(root)?;
-    let mut file = load(root)?;
+    let _lock = MutationLock::acquire(root).inspect_err(|error| {
+        #[cfg(test)]
+        eprintln!("WINDOWS_REGISTRY_ERROR recovery-lock: {error:?}");
+        tracing::warn!(%error, "sandbox recovery journal lock failed");
+    })?;
+    let mut file = load(root).inspect_err(|error| {
+        #[cfg(test)]
+        eprintln!("WINDOWS_REGISTRY_ERROR recovery-load: {error:?}");
+        tracing::warn!(%error, "sandbox recovery journal read failed");
+    })?;
     prune_with(&mut file, Lease::live);
     let now = now_secs();
     for entry in file
@@ -695,10 +707,21 @@ fn begin_recovery_at(root: &Path, all: bool, reserve_slot: bool) -> io::Result<V
         .values_mut()
         .filter(|entry| entry.leases.is_empty())
     {
-        entry.owned_bytes = owned_bytes(&entry.private_paths)?;
+        entry.owned_bytes = owned_bytes(&entry.private_paths).inspect_err(|error| {
+            #[cfg(test)]
+            eprintln!(
+                "WINDOWS_REGISTRY_ERROR recovery-size {:?}: {error:?}",
+                entry.private_paths
+            );
+            tracing::warn!(%error, "sandbox recovery owned-data measurement failed");
+        })?;
     }
     let selected = select_recovery(&mut file, all, reserve_slot, now);
-    save(root, &file)?;
+    save(root, &file).inspect_err(|error| {
+        #[cfg(test)]
+        eprintln!("WINDOWS_REGISTRY_ERROR recovery-save: {error:?}");
+        tracing::warn!(%error, "sandbox recovery journal write failed");
+    })?;
     Ok(selected)
 }
 

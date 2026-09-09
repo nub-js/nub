@@ -75,7 +75,7 @@ This establishes that the tested Gradle workflow works with the narrower capabil
 
 ### OS restrictions
 
-- **Linux procfs:** the backend rejects explicit grants under the reserved `/proc` tree. Ordinary static path grants cannot express each descendant's own dynamically created process files. [Syscall traces](https://github.com/nubjs/nub/actions/runs/34353404495) record denied `/proc/self/maps` reads in Bun 1.4 and CoreCLR, plus denied process metadata and private FIFO creation in CoreCLR. A test-only procfs grant was rejected before launch, so it does not prove which denial caused the runtime failure. No procfs fallback is enabled.
+- **Linux procfs:** ordinary grants under `/proc` are rejected. The two explicit read-only [self-metadata permissions](README.md#explicit-linux-process-metadata) provide the requesting process's maps or statistics without granting another process's files. Neither is enabled by default.
 - **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.
@@ -85,10 +85,10 @@ This establishes that the tested Gradle workflow works with the narrower capabil
 The [selective syscall-injection run](https://github.com/nubjs/nub/actions/runs/34404715809) tests otherwise unconfined tools, with both plain and tracing-only controls. All controls pass. A separate file-read probe verifies that injection denies only the selected procfs path while ordinary file reads still work.
 
 - Denying only `/proc/self/maps` reproduces Bun 1.4.0's JSON nesting/stack-overflow error during a local install.
-- The same isolated denial reproduces .NET SDK 10.0.100's CoreCLR initialization error, `0x8007000E`, during restore. Denying FIFO creation alone does **not** prevent that restore.
+- The same isolated denial reproduces CoreCLR initialization error `0x8007000E` during restore. This run selected SDK 10.0.400 and runtime 10.0.12, as recorded by the loaded paths in its trace; the provisioning version did not pin the workload. Denying FIFO creation alone does **not** prevent that restore.
 - Denying only `/proc/self/stat` reproduces Node 22.18.0's `uv_resident_set_memory` error from `process.memoryUsage()`, the call made by Yarn Classic's unconditional memory reporter.
 
-These denials are sufficient to reproduce the reported failures; fixing one does not prove no further restriction will be encountered. The [diagnostic harness](../../scripts/sandbox-procfs-diagnostics.py) changes no sandbox policy. The production procfs restriction remains in place.
+These denials are sufficient to reproduce the reported failures; fixing one does not prove no further restriction will be encountered. The [diagnostic harness](../../scripts/sandbox-procfs-diagnostics.py) changes no sandbox policy. Default policies still exclude procfs.
 
 ### Windows subprocess controls
 

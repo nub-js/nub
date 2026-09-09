@@ -53,6 +53,27 @@ A whole-home grant is literal:
 
 It includes SSH keys, package-manager credentials and other readable home files. Neither home grants nor tool-directory grants promise secret-free contents.
 
+### Explicit Linux process metadata
+
+Some runtimes inspect their own memory map or process statistics. Linux policies can request either file explicitly:
+
+```json
+{
+  "fs": {
+    "./": "rw",
+    "$tooldirs": "rw",
+    "$tmp": "rw",
+    "/proc/self/maps": "r",
+    "/proc/self/stat": "r"
+  },
+  "net": false
+}
+```
+
+These two paths refer to the requesting process, including child processes and threads, rather than the process compiling the policy. They grant read access only. Neither is included in the convenience sets or the default policy. Other procfs paths, including environment files and numeric-PID aliases, remain excluded.
+
+This option requires Linux 5.14 or newer with seccomp user notifications and atomic file-descriptor injection. Unsupported hosts refuse acquisition. macOS and Windows reject these Linux-specific permissions. Policies without either grant do not add read-open notifications; opt-in policies route read opens through the supervisor before ordinary paths continue under Landlock.
+
 ## Tool directories
 
 The set includes package caches, stores, global installations and user-level tool state. Its members cover Nub, npm, pnpm, Yarn, Bun, pip, uv, Cargo/rustup, Go, Gradle, Maven, NuGet, Composer and Git. The [member table and environment mapping](src/compiler/builtin_sets.rs) are the implementation reference.

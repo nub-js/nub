@@ -604,10 +604,10 @@ fn run_nuget_self_proc(tooldirs: bool) {
     let env = env_for(root.path(), &tool);
     write_projects(root.path());
     let mut policy = policy(root.path(), &tool, env, tooldirs);
-    policy
-        .fs
-        .self_proc
-        .insert(nub_sandbox::policy::SelfProcFile::Maps);
+    policy.fs.self_proc.extend([
+        nub_sandbox::policy::SelfProcFile::Maps,
+        nub_sandbox::policy::SelfProcFile::Stat,
+    ]);
     let sandbox = Sandbox::acquire(&policy).unwrap();
     for tail in [
         &["--version"][..],
