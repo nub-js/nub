@@ -36,7 +36,19 @@ The fixtures also grant the tested interpreter's installation files and supply i
 
 The JavaScript fixtures use Node 22.18.0. Bun 1.3.2 uses x64 emulation on Windows arm64. These are recorded versions, not minimum supported versions. Distinct pnpm and Yarn versions exercise their different storage layouts; adding a directory member does not imply that an older or newer runtime was tested.
 
+## Explicit Windows Node adapters
+
+The raw results above do not include runtime preloads. The [explicit-adapter run](https://github.com/nubjs/nub/actions/runs/34400945240), at `585cb0ee26`, tests `windows_node_compat_options` with Node 22.18.0 on Server 2022 x86-64 and Windows 11 arm64. Both hosts pass 14 cases, including four unconfined controls and two intentional root-only cache-cleanup denials.
+
+| Tool | Explicit-grant and tool-directory results |
+| --- | --- |
+| pnpm 9.15.9 / 10.18.3 / 11.26.0 | Local install, retained reinstall, installed-bin execution, global install, cache prune and another reinstall pass in one session. Denied-file canaries and explicit cleanup pass. |
+| Yarn 1.22.22 | Install, reinstall, bin execution and global install pass. Root-only grants correctly refuse cache-root recreation. With an explicit dedicated writable cache parent, cleanup and another reinstall pass in the same session. Denied-file canaries and explicit cleanup pass. |
+
+The [fixture](tests/tool_functionality.rs) retains both cache-grant variants. This is opt-in Node adaptation, not a filesystem permission expansion or a change to raw execution. The helper includes no build-jail package-network policy. See the [setup and behavioral limits](README.md#explicit-windows-node-compatibility).
+
 ## Git
+
 
 The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. Windows sequences remain incomplete because of device and subprocess access restrictions.
 

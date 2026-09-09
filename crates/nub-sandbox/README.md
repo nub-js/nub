@@ -170,6 +170,43 @@ sandbox.close();
 nub_sandbox::cleanup()?;
 ```
 
+### Explicit Windows Node compatibility
+
+Raw execution does not detect runtimes or inject compatibility code. Windows embedders can opt into the Node stdio and realpath adapters before acquiring a session:
+
+```rust,ignore
+let mut policy = nub_sandbox::compile(&permissions, &context)?;
+#[cfg(windows)]
+policy.env.constructed.insert(
+    "NODE_OPTIONS".into(),
+    nub_sandbox::windows_node_compat_options(&[
+        project.clone(),
+        node_installation.clone(),
+        package_manager_installation.clone(),
+        tool_cache.clone(),
+    ]),
+);
+let sandbox = nub_sandbox::Sandbox::acquire(&policy)?;
+```
+
+The paths must already be granted; the helper adds no permissions. It replaces, rather than appends to, an ambient `NODE_OPTIONS` value. It requires Node 18.18+ or 19+ and includes no package-specific network gate. OS network restrictions still apply.
+
+The adapters change runtime behavior: asynchronous subprocess streams use AppContainer-local pipes, synchronous captured output is file-backed, and advanced IPC serialization and handle passing are rejected. Realpath traversal tolerates inaccessible ancestors of the supplied roots; dependency symlinks still resolve. The main entry uses `--preserve-symlinks-main`, so supply its resolved path. These adapters do not repair native programs' device opens or protected directory ACLs. The [compatibility matrix](COMPATIBILITY.md#explicit-windows-node-adapters) records the tested sequences.
+
+Deleting and recreating a cache root requires write access to its parent. For a cache at `$cache/agent-tools/yarn`, grant a dedicated parent explicitly:
+
+```json
+{
+  "fs": {"./":"rw", "$tooldirs":"rw", "$cache/agent-tools":"rw", "$tmp":"rw"},
+  "vars": {"YARN_CACHE_FOLDER":true},
+  "net": false
+}
+```
+
+The embedder supplies `YARN_CACHE_FOLDER` pointing to that cache. Neither an environment relocation nor `$tooldirs` silently grants the relocated path's parent.
+
+### Lifetime and cleanup
+
 Each prepared/running command retains its resource lease. Closing the session releases that caller's handle; it does not invalidate commands already prepared through it. A running command owns its streams, cancellation and exit status. There is no detach or reconnect operation.
 
 | OS | Enforcement | Persistent changes |
