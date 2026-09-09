@@ -85,6 +85,22 @@ jobs:
           (cd dist && shasum -a 256 nub-before nub-after nub-launcher nub-native.node > SHA256SUMS)
           dist/nub-before compile --help
           dist/nub-after compile --help
+      - name: Build an on-demand wrapping control
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path('crates/nub-cli/src/compile/bundle.rs')
+          source = file.read_text()
+          needle = '        strict_execution_order: Some(true),'
+          assert source.count(needle) == 1
+          file.write_text(source.replace(needle, needle + '\n        experimental: Some(rolldown_common::ExperimentalOptions { on_demand_wrapping: Some(true), ..Default::default() }),'))
+          PY
+          git diff -- crates/nub-cli/src/compile/bundle.rs > dist/ondemand.patch
+          cargo build -p nub-cli --profile fast --features compile,embed-runtime
+          cp target/fast/nub dist/nub-ondemand
+          codesign --verify dist/nub-ondemand
+          (cd dist && shasum -a 256 nub-ondemand ondemand.patch >> SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: compile-cache-macos
