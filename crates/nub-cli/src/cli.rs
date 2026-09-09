@@ -2858,7 +2858,7 @@ fn run_sandbox(args: &[String]) -> Result<i32> {
             .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         println!(
-            "Usage: nub sandbox cleanup\n\nRemove idle Windows sandbox profiles and owned grants; recover interrupted cleanup.\nActive sandboxes and caller-owned files are retained. Unix has no persistent OS grants."
+            "Usage: nub sandbox cleanup\n\nRemove idle Windows profiles and owned grants, or abandoned Unix private temp directories.\nRecover interrupted cleanup; retain active sandboxes and caller-owned files."
         );
         return Ok(0);
     }
@@ -2867,11 +2867,7 @@ fn run_sandbox(args: &[String]) -> Result<i32> {
     }
     nub_sandbox::cleanup()
         .context("sandbox cleanup failed; ownership records retained for retry")?;
-    if cfg!(windows) {
-        println!("Idle sandbox cleanup completed. Active sandboxes were retained.");
-    } else {
-        println!("No persistent sandbox OS grants on this platform.");
-    }
+    println!("Idle sandbox cleanup completed. Active sandboxes were retained.");
     Ok(0)
 }
 

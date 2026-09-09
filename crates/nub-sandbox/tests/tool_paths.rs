@@ -92,6 +92,42 @@ fn tooldirs_adds_nonempty_documented_environment_relocations() {
 }
 
 #[test]
+fn tooldirs_covers_neutral_pm_storage_overrides() {
+    for variable in [
+        "NUB_CACHE_DIR",
+        "npm_config_cache_dir",
+        "NPM_CONFIG_CACHE_DIR",
+        "npm_config_store_dir",
+        "NPM_CONFIG_STORE_DIR",
+        "npm_config_virtual_store_dir",
+        "NPM_CONFIG_VIRTUAL_STORE_DIR",
+        "npm_config_global_virtual_store_dir",
+        "NPM_CONFIG_GLOBAL_VIRTUAL_STORE_DIR",
+    ] {
+        let policy = compile(
+            &json!({"fs": {"$tooldirs": "rw"}}),
+            &ctx(&[(variable, "/relocated/pm-storage")]),
+        )
+        .unwrap();
+        assert!(
+            policy.fs.rules.entries.iter().any(|rule| {
+                rule.matcher.as_str() == "/relocated/pm-storage/**"
+                    && rule.access == FsAccess::ReadWrite
+            }),
+            "missing {variable}"
+        );
+        assert!(
+            !policy
+                .fs
+                .rules
+                .entries
+                .iter()
+                .any(|rule| { rule.matcher.as_str() == "/relocated/**" })
+        );
+    }
+}
+
+#[test]
 fn tooldirs_preserves_literal_whitespace_and_anchors_relative_relocations_once() {
     let policy = compile(
         &json!({"fs": ["$tooldirs"]}),
@@ -183,6 +219,9 @@ fn tooldirs_includes_nuget_under_both_redirected_windows_roots() {
         }));
         assert!(!policy.fs.rules.entries.iter().any(|rule| {
             rule.matcher.as_str() == root || rule.matcher.as_str() == format!("{root}/**")
+        }));
+        assert!(policy.fs.rules.entries.iter().any(|rule| {
+            rule.matcher.as_str() == format!("{root}/nub/**") && rule.access == FsAccess::Read
         }));
     }
 }

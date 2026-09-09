@@ -84,6 +84,18 @@ fn native_child() {
             std::fs::write(root.join("project/later/nested/output"), b"later").unwrap();
             assert!(std::env::var_os("SANDBOX_PARENT_SECRET").is_none());
         }
+        "tooldirs" => {
+            for path in tool_roots(&root) {
+                let output = path.join("created");
+                std::fs::write(&output, b"tool-state").unwrap();
+                assert_eq!(std::fs::read(&output).unwrap(), b"tool-state");
+                std::fs::remove_file(&output).unwrap();
+            }
+            for path in ["omitted/.ssh/key", "relocated-cache/unrelated/canary"] {
+                assert!(std::fs::read(root.join(path)).is_err());
+                assert!(std::fs::write(root.join(path), b"forbidden").is_err());
+            }
+        }
         #[cfg(target_os = "macos")]
         "sharedtmp" => {
             let canary = std::fs::read_to_string(root.join("project/canary-path")).unwrap();
@@ -158,7 +170,7 @@ fn fixture() -> tempfile::TempDir {
 
 fn sandbox(root: &std::path::Path, case: &str) -> Sandbox {
     let project = root.join("project");
-    let ctx = CompileCtx::new(
+    let mut ctx = CompileCtx::new(
         Homes {
             home: root.join("omitted"),
             cache: root.join("cache"),
@@ -169,7 +181,23 @@ fn sandbox(root: &std::path::Path, case: &str) -> Sandbox {
         ScopeCapabilities::approved(),
         BTreeMap::new(),
     );
-    let mut policy = compile(&json!({"fs": {(root.join("project").to_string_lossy()): "rw", (root.join("readable").to_string_lossy()): "r", "$tmp": "rw"}, "net": false}), &ctx).unwrap();
+    let permissions = if case == "tooldirs" {
+        for (key, suffix) in [
+            ("XDG_CACHE_HOME", "relocated-cache"),
+            ("XDG_DATA_HOME", "relocated-data"),
+            ("XDG_CONFIG_HOME", "relocated-config"),
+            ("NPM_CONFIG_GLOBAL_VIRTUAL_STORE_DIR", "relocated-store"),
+            ("LOCALAPPDATA", "local-app-data"),
+            ("APPDATA", "roaming-app-data"),
+        ] {
+            ctx.ambient_env
+                .insert(key.into(), root.join(suffix).to_string_lossy().into());
+        }
+        json!({"fs": ["./", "$tooldirs", "$tmp"], "net": false})
+    } else {
+        json!({"fs": {(root.join("project").to_string_lossy()): "rw", (root.join("readable").to_string_lossy()): "r", "$tmp": "rw"}, "net": false})
+    };
+    let mut policy = compile(&permissions, &ctx).unwrap();
     for key in [
         "PATH",
         "SystemRoot",
@@ -192,6 +220,38 @@ fn sandbox(root: &std::path::Path, case: &str) -> Sandbox {
         std::process::id().to_string(),
     );
     Sandbox::new(&policy).unwrap()
+}
+
+fn tool_roots(root: &std::path::Path) -> Vec<PathBuf> {
+    let roots = [
+        "omitted/.cache/nub",
+        "omitted/.config/nub",
+        "relocated-cache/nub",
+        "relocated-data/nub/store",
+        "relocated-config/nub",
+        "relocated-store",
+    ];
+    #[cfg(windows)]
+    let roots = roots
+        .into_iter()
+        .chain(["local-app-data/nub", "roaming-app-data/nub"]);
+    roots.into_iter().map(|path| root.join(path)).collect()
+}
+
+#[test]
+fn tooldirs_grants_nub_storage_without_granting_its_parents() {
+    let root = fixture();
+    for path in tool_roots(root.path()) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    for path in ["project", "omitted/.ssh", "relocated-cache/unrelated"] {
+        std::fs::create_dir_all(root.path().join(path)).unwrap();
+    }
+    for path in ["omitted/.ssh/key", "relocated-cache/unrelated/canary"] {
+        std::fs::write(root.path().join(path), b"not-granted").unwrap();
+    }
+    let sandbox = sandbox(root.path(), "tooldirs");
+    run(&sandbox, root.path(), "tooldirs");
 }
 
 fn run(sandbox: &Sandbox, root: &std::path::Path, case: &str) {

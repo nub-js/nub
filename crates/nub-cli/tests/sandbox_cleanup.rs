@@ -38,10 +38,10 @@ fn cleanup_rejects_unknown_operations_and_extra_arguments() {
 
 #[cfg(unix)]
 #[test]
-fn cleanup_is_a_noop_without_persistent_os_grants() {
+fn cleanup_runs_without_project_configuration() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("nub.jsonc"), "not json").unwrap();
     let output = invoke(&["sandbox", "cleanup"], root.path());
     assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("No persistent sandbox OS grants"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Idle sandbox cleanup completed"));
 }

@@ -64,11 +64,9 @@
 //!   target OS (the fold runs on the machine it enforces on), so the set is
 //!   `#[cfg]`-selected — same precedent as `defaults::OS_ESSENTIAL_ENV`.
 //!
-//! Runtime-resolved dirs (`gem environment gemdir`, `pnpm store path`) ship STATIC
-//! home-anchored defaults ONLY — the engine never shells out to build this set (that
-//! would be a nub-authored command-exec surface, unconditional even in an untrusted
-//! `dependenciesMeta` scope, and a missing tool would hard-fail the compile). True
-//! runtime resolution is deferred to a host-provided `CompileCtx` field, fail-soft.
+//! The set combines conventional roots with documented environment locations from the
+//! supplied compile snapshot. It never shells out to a tool or parses its config files;
+//! locations configured only in those files need explicit grants.
 
 use crate::matcher::path::{Homes, canonicalize_glob_prefix, expand_symbolic, normalize_slashes};
 use crate::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule, NetRule, NetTarget};
@@ -318,16 +316,16 @@ pub fn download_net_rules(effect: Effect) -> Vec<NetRule> {
 // `NUB` embedder profile (crates/nub-cli/src/pm_engine/identity.rs) and
 // vendor/aube/crates/aube-store/src/dirs.rs: `data_namespace = "nub"` →
 // `~/.local/share/nub/store/…`; `cache_namespace = "nub/pm"` → `<cache>/nub/pm`.
-// `$cache` is the platform cache home (XDG_CACHE_HOME else `~/.cache`), which matches
-// aube's own `cache_dir()` base on POSIX; the nub store is anchored at the literal
-// `~/.local/share` per the deferred-runtime-resolution decision (no XDG_DATA_HOME
-// capture in `Homes`). Third-party paths are documented defaults. The expansion below also
-// accepts documented, already-approved environment relocations; it never discovers config.
+// The runtime/bootstrap cache follows `.cache/nub` on every OS, independently of the
+// supplied `$cache` anchor. Environment expansion below adds redirected XDG/app-data
+// roots and explicit cache/store settings without reading tool configuration files.
 
 #[cfg(target_os = "macos")]
 const TOOLDIR_PATTERNS: &[&str] = &[
     // nub (own engine)
     "~/.local/share/nub/store",
+    "~/.cache/nub",
+    "~/.config/nub",
     "$cache/nub/pm",
     // JS package managers
     "~/.npm",
@@ -373,6 +371,10 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     // nub (own engine) — %LOCALAPPDATA% is `~/AppData/Local` by default
     "~/AppData/Local/nub/store",
     "~/AppData/Local/nub/pm",
+    "~/AppData/Local/nub",
+    "~/AppData/Roaming/nub",
+    "~/.cache/nub",
+    "~/.config/nub",
     // JS package managers
     "~/AppData/Local/npm-cache",
     "~/AppData/Roaming/npm",
@@ -417,6 +419,8 @@ const TOOLDIR_PATTERNS: &[&str] = &[
 const TOOLDIR_PATTERNS: &[&str] = &[
     // nub (own engine)
     "~/.local/share/nub/store",
+    "~/.cache/nub",
+    "~/.config/nub",
     "$cache/nub/pm",
     // JS package managers
     "~/.npm",
@@ -489,6 +493,12 @@ fn env_subpaths(
 fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for name in [
+        // Existing embedder cache override and neutral PM storage settings.
+        "NUB_CACHE_DIR",
+        "NPM_CONFIG_CACHE_DIR",
+        "NPM_CONFIG_STORE_DIR",
+        "NPM_CONFIG_VIRTUAL_STORE_DIR",
+        "NPM_CONFIG_GLOBAL_VIRTUAL_STORE_DIR",
         // JavaScript package managers.
         "NPM_CONFIG_CACHE",
         "NPM_CONFIG_PREFIX",
@@ -557,6 +567,10 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         "npm_config_prefix",
         "npm_config_userconfig",
         "npm_config_globalconfig",
+        "npm_config_cache_dir",
+        "npm_config_store_dir",
+        "npm_config_virtual_store_dir",
+        "npm_config_global_virtual_store_dir",
     ] {
         env_path(env, name, &mut paths);
     }
@@ -564,19 +578,19 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_subpaths(
         env,
         "XDG_CACHE_HOME",
-        &["pnpm", "yarn", "pip", "uv", "go-build", "composer"],
+        &["nub", "pnpm", "yarn", "pip", "uv", "go-build", "composer"],
         &mut paths,
     );
     env_subpaths(
         env,
         "XDG_DATA_HOME",
-        &["pnpm", "yarn/berry", "pip", "uv", "NuGet"],
+        &["nub/store", "pnpm", "yarn/berry", "pip", "uv", "NuGet"],
         &mut paths,
     );
     env_subpaths(
         env,
         "XDG_CONFIG_HOME",
-        &["pnpm", "yarn", "pip", "uv", "composer", "git"],
+        &["nub", "pnpm", "yarn", "pip", "uv", "composer", "git"],
         &mut paths,
     );
     env_subpaths(env, "XDG_STATE_HOME", &["pnpm"], &mut paths);
@@ -592,6 +606,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         env,
         "LOCALAPPDATA",
         &[
+            "nub",
             "npm-cache",
             "pnpm",
             "pnpm-cache",
@@ -609,7 +624,9 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_subpaths(
         env,
         "APPDATA",
-        &["npm", "Yarn", "pip", "Python", "uv", "NuGet", "Composer"],
+        &[
+            "nub", "npm", "Yarn", "pip", "Python", "uv", "NuGet", "Composer",
+        ],
         &mut paths,
     );
     paths
@@ -946,9 +963,11 @@ mod tests {
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        for tool in ["pnpm", "yarn", "pip", "uv", "go-build", "composer"] {
+        for tool in ["nub", "pnpm", "yarn", "pip", "uv", "go-build", "composer"] {
             assert!(paths.contains(&cache.join(tool)));
         }
+        assert!(paths.contains(&data.join("nub/store")));
+        assert!(paths.contains(&config.join("nub")));
         assert!(paths.contains(&data.join("pip")));
         assert!(paths.contains(&data.join("../bin")));
         assert!(paths.contains(&config.join("yarn")));
