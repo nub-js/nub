@@ -69,6 +69,7 @@ fn environment(root: &Path, extra: &[(&str, String)]) -> BTreeMap<String, String
     for (key, value) in extra {
         env.insert((*key).to_owned(), value.clone());
     }
+    env.insert("GIT_TRACE".into(), "1".into());
     env
 }
 
@@ -417,8 +418,11 @@ fn run_conventional_config_write(control: Control) {
 }
 
 fn run_operations(control: Control) {
+    run_operations_with_runtime(control, git_runtime_paths());
+}
+
+fn run_operations_with_runtime(control: Control, runtime: Vec<PathBuf>) {
     require_git();
-    let runtime = git_runtime_paths();
     let runtime: Vec<_> = runtime.iter().map(|path| (path.as_path(), "r")).collect();
     let root = fixture();
     prepare_remote(root.path());
@@ -684,9 +688,12 @@ fn git_lfs_program() -> PathBuf {
 }
 
 fn run_lfs(control: Control) {
+    run_lfs_with_runtime(control, git_runtime_paths());
+}
+
+fn run_lfs_with_runtime(control: Control, mut runtime: Vec<PathBuf>) {
     require_git();
     let lfs = git_lfs_program();
-    let mut runtime = git_runtime_paths();
     runtime.push(lfs);
     runtime.sort();
     runtime.dedup();
@@ -837,3 +844,65 @@ fn git_lfs_native_exact_when_available() {
 fn git_lfs_native_tooldirs_when_available() {
     run_lfs(Control::ToolDirs);
 }
+
+#[cfg(windows)]
+fn complete_git_runtime_paths() -> Vec<PathBuf> {
+    let mut paths = git_runtime_paths();
+    let installation = paths
+        .iter()
+        .flat_map(|path| path.ancestors())
+        .find(|path| path.join("cmd/git.exe").is_file() && path.join("usr/bin/sh.exe").is_file())
+        .expect("Git for Windows installation containing both Git and its shell")
+        .to_path_buf();
+    eprintln!("EXPLICIT GIT INSTALLATION READ {}", installation.display());
+    paths.push(installation);
+    paths
+}
+
+#[cfg(windows)]
+macro_rules! complete_runtime_case {
+    ($name:ident, $control:ident, $run:ident) => {
+        #[test]
+        #[ignore = "requires native Git tool functionality job"]
+        fn $name() {
+            $run(Control::$control, complete_git_runtime_paths());
+        }
+    };
+}
+
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_plain,
+    Unconfined,
+    run_operations_with_runtime
+);
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_exact,
+    Exact,
+    run_operations_with_runtime
+);
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_tooldirs,
+    ToolDirs,
+    run_operations_with_runtime
+);
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_lfs_plain,
+    Unconfined,
+    run_lfs_with_runtime
+);
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_lfs_exact,
+    Exact,
+    run_lfs_with_runtime
+);
+#[cfg(windows)]
+complete_runtime_case!(
+    git_windows_complete_runtime_lfs_tooldirs,
+    ToolDirs,
+    run_lfs_with_runtime
+);
