@@ -1797,6 +1797,10 @@ pub(super) mod launch {
             .open(path)
     }
 
+    fn acl_error(stage: impl std::fmt::Display, error: io::Error) -> io::Error {
+        io::Error::new(error.kind(), format!("{stage}: {error}"))
+    }
+
     fn set_ace_on_handle(
         handle: HANDLE,
         sid: PSID,
@@ -1829,7 +1833,10 @@ pub(super) mod launch {
             )
         };
         if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+            return Err(acl_error(
+                "GetSecurityInfo",
+                io::Error::from_raw_os_error(rc as i32),
+            ));
         }
         let _sd = LocalFreeGuard(sd);
         // A NULL DACL is already unrestricted; replacing it with only our grant
@@ -1850,7 +1857,10 @@ pub(super) mod launch {
         let mut control = 0u16;
         let mut revision = 0u32;
         if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(acl_error(
+                "GetSecurityDescriptorControl",
+                io::Error::last_os_error(),
+            ));
         }
 
         let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
@@ -1873,7 +1883,10 @@ pub(super) mod launch {
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
         let rc = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
         if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+            return Err(acl_error(
+                "SetEntriesInAclW",
+                io::Error::from_raw_os_error(rc as i32),
+            ));
         }
         let _new = LocalFreeGuard(new_dacl.cast());
 
@@ -1892,7 +1905,10 @@ pub(super) mod launch {
             return if rc == 0 {
                 Ok(())
             } else {
-                Err(io::Error::from_raw_os_error(rc as i32))
+                Err(acl_error(
+                    "SetSecurityInfo",
+                    io::Error::from_raw_os_error(rc as i32),
+                ))
             };
         }
 
@@ -1908,7 +1924,10 @@ pub(super) mod launch {
                     == 0
                 || SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, psd) == 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(acl_error(
+                    "SetKernelObjectSecurity/descriptor setup",
+                    io::Error::last_os_error(),
+                ));
             }
         }
         Ok(())
@@ -3483,15 +3502,32 @@ pub(super) mod launch {
                 let sid = derive_appcontainer(&entry.profile_name)?;
                 let _sid = SidGuard(sid);
                 for object in &entry.window_objects {
-                    crate::backend::windows_ace::revoke_persistent(object, sid)?;
+                    crate::backend::windows_ace::revoke_persistent(object, sid).map_err(
+                        |error| acl_error(format!("revoke window object {object:?}"), error),
+                    )?;
                 }
                 for mutation in &entry.mutations {
-                    revoke_recorded_ace(&entry, mutation, sid)?;
+                    revoke_recorded_ace(&entry, mutation, sid).map_err(|error| {
+                        acl_error(
+                            format!(
+                                "revoke {:?} ACL {} (recorded ID {:?})",
+                                mutation.kind,
+                                mutation.path,
+                                entry.object_ids.get(&mutation.path)
+                            ),
+                            error,
+                        )
+                    })?;
                 }
                 for path in &entry.private_paths {
                     if Path::new(path).exists() {
-                        super::windows_registry::validate_private_path(&entry, Path::new(path))?;
-                        std::fs::remove_dir_all(path)?;
+                        super::windows_registry::validate_private_path(&entry, Path::new(path))
+                            .map_err(|error| {
+                                acl_error(format!("validate private directory {path}"), error)
+                            })?;
+                        std::fs::remove_dir_all(path).map_err(|error| {
+                            acl_error(format!("remove private directory {path}"), error)
+                        })?;
                         #[cfg(test)]
                         test_crash_transition(
                             "cleanup-private-removed",
@@ -3508,7 +3544,8 @@ pub(super) mod launch {
                     )));
                 }
                 Ok(())
-            })();
+            })()
+            .map_err(|error| acl_error(format!("recover profile {}", entry.profile_name), error));
             if let Err(error) = &result {
                 first_error.get_or_insert_with(|| io::Error::other(error.to_string()));
             }
@@ -3537,8 +3574,13 @@ pub(super) mod launch {
             GetVolumeInformationByHandleW, OpenFileById,
         };
 
-        if object_id(path)?.as_deref() == Some(expected) {
-            let file = open_acl_file(path)?;
+        if object_id(path)
+            .map_err(|error| acl_error("read current path identity", error))?
+            .as_deref()
+            == Some(expected)
+        {
+            let file =
+                open_acl_file(path).map_err(|error| acl_error("open original named ACL", error))?;
             if object_handle_id(file.as_raw_handle())? == expected {
                 return Ok(Some(file));
             }
@@ -3593,7 +3635,10 @@ pub(super) mod launch {
                 )
             } == 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(acl_error(
+                    format!("GetVolumeInformationByHandleW hint {}", ancestor.display()),
+                    io::Error::last_os_error(),
+                ));
             }
             let len = filesystem
                 .iter()
@@ -3625,7 +3670,14 @@ pub(super) mod launch {
                 return if matches!(error.raw_os_error(), Some(2 | 3)) {
                     Ok(None)
                 } else {
-                    Err(error)
+                    Err(acl_error(
+                        format!(
+                            "OpenFileById ID {expected}, path {}, hint {}",
+                            path.display(),
+                            ancestor.display()
+                        ),
+                        error,
+                    ))
                 };
             }
             // SAFETY: OpenFileById returned an owned file handle.
@@ -3659,7 +3711,7 @@ pub(super) mod launch {
             let file = match open_acl_file(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
+                Err(error) => return Err(acl_error("open private ACL", error)),
             };
             if let Some(expected) = expected
                 && &object_handle_id(file.as_raw_handle())? != expected
@@ -3699,7 +3751,7 @@ pub(super) mod launch {
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+            Err(error) => Err(acl_error("open replacement named ACL", error)),
         }
     }
 

@@ -166,6 +166,27 @@ fn tooldirs_uses_redirected_windows_profile_roots() {
     }));
 }
 
+#[cfg(windows)]
+#[test]
+fn tooldirs_includes_nuget_under_both_redirected_windows_roots() {
+    let policy = compile(
+        &json!({"fs": {"$tooldirs": "r"}}),
+        &ctx(&[
+            ("LOCALAPPDATA", "C:/redirected/local"),
+            ("APPDATA", "C:/redirected/roaming"),
+        ]),
+    )
+    .expect("redirected NuGet roots compile");
+    for root in ["C:/redirected/local", "C:/redirected/roaming"] {
+        assert!(policy.fs.rules.entries.iter().any(|rule| {
+            rule.matcher.as_str() == format!("{root}/NuGet/**") && rule.access == FsAccess::Read
+        }));
+        assert!(!policy.fs.rules.entries.iter().any(|rule| {
+            rule.matcher.as_str() == root || rule.matcher.as_str() == format!("{root}/**")
+        }));
+    }
+}
+
 #[test]
 fn managed_tmp_and_user_denies_fail_loudly() {
     for surface in [

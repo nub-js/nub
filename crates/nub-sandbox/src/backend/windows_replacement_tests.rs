@@ -60,12 +60,114 @@ fn isolated(mode: &str) {
     );
     let status = child.0.wait().unwrap();
     if !status.success() {
+        for directory in std::fs::read_dir(&state).unwrap() {
+            let journal = directory.unwrap().path().join("registry.json");
+            if journal.is_file() {
+                // The runner's temp directory is not an uploaded artifact. Emit
+                // ownership records into the captured log before retaining it.
+                eprintln!(
+                    "REPLACEMENT_JOURNAL {}\n{}",
+                    journal.display(),
+                    std::fs::read_to_string(&journal).unwrap()
+                );
+            }
+        }
         let root = root.keep();
         panic!(
             "{mode} failed ({status}); journal retained at {}",
             root.display()
         );
     }
+}
+
+fn lookup_states(root: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType, OpenFileById,
+    };
+
+    let path = root.join("package.json");
+    let moved = root.join("moved.json");
+    let link = root.join("link.json");
+    let expected = windows_registry::object_id(&path).unwrap().unwrap();
+    let parts: Vec<u32> = expected
+        .split(':')
+        .map(|part| part.parse().unwrap())
+        .collect();
+    let lookup = |stage: &str, malformed: bool| {
+        as_file_owner(|| {
+            let hint = std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(root)
+                .unwrap();
+            let descriptor = FILE_ID_DESCRIPTOR {
+                dwSize: if malformed {
+                    0
+                } else {
+                    std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32
+                },
+                Type: FileIdType,
+                Anonymous: FILE_ID_DESCRIPTOR_0 {
+                    FileId: ((u64::from(parts[1]) << 32) | u64::from(parts[2])) as i64,
+                },
+            };
+            let handle = unsafe {
+                OpenFileById(
+                    hint.as_raw_handle(),
+                    &descriptor,
+                    0x0002_0000 | 0x0004_0000,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                )
+            };
+            let result = if handle == INVALID_HANDLE_VALUE {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                let file = unsafe { std::fs::File::from_raw_handle(handle) };
+                assert_eq!(
+                    windows_registry::object_handle_id(file.as_raw_handle()).unwrap(),
+                    expected
+                );
+                Ok(())
+            };
+            eprintln!(
+                "FILE_ID_LOOKUP stage={stage} id={expected} malformed={malformed} result={result:?}"
+            );
+            result
+        })
+    };
+    assert_eq!(lookup("live", false), Ok(()));
+    assert_eq!(lookup("invalid-descriptor", true), Err(87));
+    std::fs::rename(&path, &moved).unwrap();
+    assert_eq!(lookup("renamed", false), Ok(()));
+    std::fs::hard_link(&moved, &link).unwrap();
+    std::fs::remove_file(&moved).unwrap();
+    assert_eq!(lookup("hardlink-only", false), Ok(()));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&link)
+        .unwrap();
+    let wide: Vec<_> = link.as_os_str().encode_wide().chain(Some(0)).collect();
+    assert_ne!(
+        unsafe { DeleteFileW(wide.as_ptr()) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // Keep the named handle open to distinguish delete-pending from a completed
+    // unlink. Neither failure is classified as missing by this evidence probe.
+    assert!(lookup("delete-pending", false).is_err());
+    drop(held);
+    assert!(lookup("deleted", false).is_err());
+    eprintln!(
+        "FILE_ID_RECOVERY deleted={:?}",
+        super::launch::open_recorded_acl_file(&path, &expected)
+    );
 }
 
 fn replace(root: &Path, value: &str) {
@@ -365,6 +467,7 @@ fn windows_replacement_fixture() {
         "churn" => churn(&root),
         "crash" => crash_recovery(&root),
         "binding" => opened_object_binding(&root),
+        "lookup-states" => lookup_states(&root),
         "fault" => {
             let _resource = plan(&root, "hold").acquire().unwrap();
             panic!("fault was not reached");
@@ -408,4 +511,9 @@ fn windows_replacement_recovers_a_crashed_preparing_owner() {
 #[test]
 fn windows_recorded_object_lookup_and_acl_write_need_only_file_owner_access() {
     isolated("binding");
+}
+
+#[test]
+fn windows_recorded_object_lookup_distinguishes_link_and_deletion_states() {
+    isolated("lookup-states");
 }

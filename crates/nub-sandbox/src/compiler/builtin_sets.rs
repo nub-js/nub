@@ -405,6 +405,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.nuget",
     "~/.dotnet",
     "~/AppData/Local/NuGet",
+    "~/AppData/Roaming/NuGet",
     "~/AppData/Local/Composer",
     "~/AppData/Roaming/Composer",
     "~/.config/git",
@@ -608,7 +609,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_subpaths(
         env,
         "APPDATA",
-        &["npm", "Yarn", "pip", "Python", "uv", "Composer"],
+        &["npm", "Yarn", "pip", "Python", "uv", "NuGet", "Composer"],
         &mut paths,
     );
     paths
@@ -979,6 +980,7 @@ mod tests {
             "~/.pnpm-state",
             "~/pip",
             "~/AppData/Roaming/Python",
+            "~/AppData/Roaming/NuGet",
             "~/.config/git",
             "~/.git-credential-cache",
         ];

@@ -117,10 +117,21 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
         ),
     );
     env.extend(tool.tool_env.clone());
+    if tool.name == "nuget" {
+        std::fs::create_dir_all(nuget_config(root)).expect("NuGet user configuration root");
+    }
     if let Some(seed) = &tool.maven_seed {
         copy_directory(seed, &home.join(".m2/repository"));
     }
     env
+}
+
+fn nuget_config(root: &Path) -> PathBuf {
+    root.join(if cfg!(windows) {
+        "home/AppData/Roaming/NuGet"
+    } else {
+        "home/.nuget/NuGet"
+    })
 }
 
 fn copy_directory(source: &Path, destination: &Path) {
@@ -173,6 +184,12 @@ fn policy(
             root.join("home/.m2").to_string_lossy().into(),
             Value::String("rw".into()),
         );
+        if tool.name == "nuget" {
+            fs.insert(
+                nuget_config(root).to_string_lossy().into(),
+                Value::String("rw".into()),
+            );
+        }
     }
     fs.insert("./".into(), Value::String("rw".into()));
     fs.insert("$tmp".into(), Value::String("rw".into()));

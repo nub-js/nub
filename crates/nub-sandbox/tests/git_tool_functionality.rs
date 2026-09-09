@@ -72,17 +72,6 @@ fn environment(root: &Path, extra: &[(&str, String)]) -> BTreeMap<String, String
     env
 }
 
-fn exact_grants(paths: &[(&Path, &str)]) -> Value {
-    let mut entries = Map::new();
-    for (path, access) in paths {
-        entries.insert(
-            path.to_string_lossy().into_owned(),
-            Value::String((*access).into()),
-        );
-    }
-    Value::Object(entries)
-}
-
 fn policy(
     root: &Path,
     control: Control,

@@ -64,7 +64,7 @@ Examples of conventional roots:
 | Cargo/rustup | `~/.cargo`, `~/.rustup` | `~/.cargo`, `~/.rustup` | `~/.cargo`, `~/.rustup` |
 | Go | `~/go`, `$cache/go-build` | `~/go`, `~/Library/Caches/go-build` | `~/go`, `~/AppData/Local/go-build` |
 | Gradle/Maven | `~/.gradle`, `~/.m2` | `~/.gradle`, `~/.m2` | `~/.gradle`, `~/.m2` |
-| .NET/NuGet | `~/.dotnet`, `~/.nuget`, `~/.local/share/NuGet` | The Linux roots | `~/.dotnet`, `~/.nuget`, `~/AppData/Local/NuGet` |
+| .NET/NuGet | `~/.dotnet`, `~/.nuget`, `~/.local/share/NuGet` | The Linux roots | `~/.dotnet`, `~/.nuget`, `~/AppData/Local/NuGet`, `~/AppData/Roaming/NuGet` |
 | Composer | `~/.cache/composer`, `~/.composer`, `~/.config/composer` | `~/.composer`, `~/Library/Caches/composer`, `~/Library/Application Support/Composer` | `~/AppData/Local/Composer`, `~/AppData/Roaming/Composer` |
 | Git | `~/.config/git`, `~/.git-credential-cache`; files `~/.gitconfig`, `~/.gitconfig.lock`, `~/.git-credentials` | Same | Same |
 
