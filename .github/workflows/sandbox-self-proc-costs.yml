@@ -1,0 +1,52 @@
+name: Sandbox metadata release costs
+on:
+  push:
+    branches: [sandbox-self-proc-costs]
+    paths:
+      - crates/nub-sandbox/**
+      - .github/workflows/sandbox-self-proc-costs.yml
+permissions:
+  contents: read
+jobs:
+  costs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: sandbox-self-proc-release
+      - name: Binding current and baseline artifacts
+        run: |
+          mkdir -p reports
+          git rev-parse HEAD > reports/environment.txt
+          uname -a >> reports/environment.txt
+          rustc -Vv >> reports/environment.txt
+          git worktree add --detach "$RUNNER_TEMP/sandbox-baseline" 45d5be8b26b456c15c094b107cb6cd725bce8032
+          cp crates/nub-sandbox/tests/self_proc_costs.rs "$RUNNER_TEMP/sandbox-baseline/crates/nub-sandbox/tests/self_proc_costs.rs"
+          sha256sum crates/nub-sandbox/tests/self_proc_costs.rs >> reports/environment.txt
+      - name: Measuring current policy costs and enforcement
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --release --test self_proc_costs metadata_costs -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/current.log
+          cargo test -p nub-sandbox --release --test self_proc -- --nocapture --test-threads=1 2>&1 | tee reports/enforcement.log
+      - name: Measuring the identical workload on the preceding engine
+        env:
+          SELF_PROC_BASELINE: '1'
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/sandbox-baseline"
+          cargo test -p nub-sandbox --release --test self_proc_costs metadata_costs -- --ignored --nocapture --test-threads=1 2>&1 | tee "$GITHUB_WORKSPACE/reports/baseline.log"
+      - name: Preserving performance artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: self-proc-costs-linux
+          path: reports

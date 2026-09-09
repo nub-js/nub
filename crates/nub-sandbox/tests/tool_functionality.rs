@@ -311,7 +311,12 @@ fn tool_env(tool: &Tool, root: &Path) -> (PathBuf, PathBuf, Vec<(String, String)
                 ),
             ),
         ],
-        "yarn1" | "yarn" => vec![
+        "yarn1" => vec![
+            ("YARN_CACHE_FOLDER".into(), cache_text),
+            ("YARN_GLOBAL_FOLDER".into(), global_text.clone()),
+            ("NPM_CONFIG_PREFIX".into(), global_text),
+        ],
+        "yarn" => vec![
             ("YARN_CACHE_FOLDER".into(), cache_text),
             ("YARN_GLOBAL_FOLDER".into(), global_text),
         ],
@@ -600,6 +605,11 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
     // Cache cleanup removes/recreates the configured cache root. This is an
     // explicit dedicated parent grant, not a widening of $tooldirs.
     fs[cache.parent().unwrap().to_string_lossy().as_ref()] = json!("rw");
+    // The explicit parent replaces the redundant required child grant: after
+    // prune, an authored missing leaf would correctly fail preparation.
+    fs.as_object_mut()
+        .unwrap()
+        .remove(cache.to_string_lossy().as_ref());
     fs["/proc/self/maps"] = json!("r");
     fs["/proc/self/stat"] = json!("r");
     let env_refs: Vec<_> = env

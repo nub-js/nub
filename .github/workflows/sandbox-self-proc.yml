@@ -82,6 +82,10 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/js-tools.log
+      - name: Exercising explicit metadata grants with the .NET SDK
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.tools.outcome == 'success' }}
+        run: |
+          set -o pipefail
           cargo test -p nub-sandbox --profile fast --test native_tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/dotnet.log
       - name: Preserving native evidence
         if: always()
