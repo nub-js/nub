@@ -1248,6 +1248,12 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // Yarn PnP token BEFORE nub's preload token, mirroring the argv order
         // above so hardcoded-path `node` invocations inherit PnP-first ordering.
         // Quoted so a `.pnp.cjs` under a spacey path survives the tokenizer.
+        // The threadpool sidecar goes AHEAD of PnP: it loads nothing PnP resolves,
+        // and a consumer that keeps one `--require` per name (Next.js,
+        // vercel/next.js#96582, last wins) then keeps PnP's, losing only the demotion.
+        if let Some(token) = injection.as_ref().and_then(PreloadInjection::sidecar_token) {
+            node_opts_parts.push(token);
+        }
         if let Some(pnp) = config.pnp {
             node_opts_parts.push(format!(
                 "--require={}",
@@ -1255,15 +1261,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             ));
         }
         if let Some(ref inj) = injection {
-            // At most one `--require` and one `--import` survive a consumer that
-            // re-parses NODE_OPTIONS by flag name (Next.js, vercel/next.js#96582),
-            // and PnP's `--require` outranks the sidecar's: beside PnP the compat
-            // tier forgoes the sidecar rather than risk PnP's token.
-            if config.pnp.is_some() {
-                node_opts_parts.push(inj.node_options_token());
-            } else {
-                node_opts_parts.extend(inj.node_options_tokens());
-            }
+            node_opts_parts.push(inj.node_options_token());
         }
         // Project-config `nodeOptions` entries are quoted like every other value nub
         // writes here. The CLI-side validator rejects whitespace and NUL but NOT a
@@ -2219,17 +2217,17 @@ pub fn compute_augmentation_env(
     // Yarn PnP `--require <.pnp.cjs>` BEFORE nub's preload token so PnP's
     // resolver installs first in script-runner child shells too. Quoted: a
     // `.pnp.cjs` under a spacey project path would otherwise fragment.
+    // The threadpool sidecar ahead of PnP, as at the direct-spawn site.
+    if let Some(token) = injection.sidecar_token() {
+        node_opts_parts.push(token);
+    }
     if let Some(pnp) = pnp {
         node_opts_parts.push(format!(
             "--require={}",
             node_options_token(&pnp.display().to_string())
         ));
-        // Same rule as the direct-spawn site: PnP's `--require` outranks the
-        // threadpool sidecar's, so beside PnP the compat tier forgoes the sidecar.
-        node_opts_parts.push(injection.node_options_token());
-    } else {
-        node_opts_parts.extend(injection.node_options_tokens());
     }
+    node_opts_parts.push(injection.node_options_token());
     // Quoted for the same reason as the direct-spawn site: the CLI validator lets a
     // double quote through, and an unmatched one aborts Node's NODE_OPTIONS parse.
     node_opts_parts.extend(
@@ -3306,9 +3304,9 @@ pub struct PreloadInjection {
     /// A `--require` sidecar that runs before the preload: the compat tier on Linux
     /// carries `runtime/threadpool-snapshot.cjs`, because the `--import` preload is
     /// read through the very threadpool the policy needs to build itself (see that
-    /// file). Its own NODE_OPTIONS token, ahead of the preload's, and never part
-    /// of the re-entrancy key: a consumer that re-parses NODE_OPTIONS by flag name
-    /// may drop it, which costs the demotion and nothing else.
+    /// file). Its own NODE_OPTIONS token, ahead of PnP's and the preload's, and
+    /// never part of the re-entrancy key: a consumer that re-parses NODE_OPTIONS by
+    /// flag name may drop it, which costs the demotion and nothing else.
     pub sidecar: Option<String>,
 }
 
@@ -3327,12 +3325,18 @@ impl PreloadInjection {
         format!("{}={}", self.flag, node_options_token(&self.value))
     }
 
+    /// The sidecar's own `--require` token, when there is one.
+    pub fn sidecar_token(&self) -> Option<String> {
+        self.sidecar
+            .as_deref()
+            .map(|path| format!("--require={}", node_options_token(path)))
+    }
+
     /// Every token nub writes for this injection: the sidecar's `--require`, when
     /// there is one, then [`Self::node_options_token`].
     pub fn node_options_tokens(&self) -> Vec<String> {
-        self.sidecar
-            .iter()
-            .map(|path| format!("--require={}", node_options_token(path)))
+        self.sidecar_token()
+            .into_iter()
             .chain(std::iter::once(self.node_options_token()))
             .collect()
     }
