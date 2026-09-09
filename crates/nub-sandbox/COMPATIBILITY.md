@@ -78,6 +78,16 @@ This establishes that the tested Gradle workflow works with the narrower capabil
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **macOS shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. An explicit shared-path grant changes isolation and is not silently added by the tool-directory set.
 
+### Linux failure isolation
+
+The [selective syscall-injection run](https://github.com/nubjs/nub/actions/runs/34404715809) tests otherwise unconfined tools, with both plain and tracing-only controls. All controls pass. A separate file-read probe verifies that injection denies only the selected procfs path while ordinary file reads still work.
+
+- Denying only `/proc/self/maps` reproduces Bun 1.4.0's JSON nesting/stack-overflow error during a local install.
+- The same isolated denial reproduces .NET SDK 10.0.100's CoreCLR initialization error, `0x8007000E`, during restore. Denying FIFO creation alone does **not** prevent that restore.
+- Denying only `/proc/self/stat` reproduces Node 22.18.0's `uv_resident_set_memory` error from `process.memoryUsage()`, the call made by Yarn Classic's unconditional memory reporter.
+
+These denials are sufficient to reproduce the reported failures; fixing one does not prove no further restriction will be encountered. The [diagnostic harness](../../scripts/sandbox-procfs-diagnostics.py) changes no sandbox policy. The production procfs restriction remains in place.
+
 ### Windows subprocess controls
 
 The [focused subprocess run](https://github.com/nubjs/nub/actions/runs/34369854867) separates executable access from stream setup. It tests Rust 1.98.1, Python 3.12.10 and the diagnostic executable with seven descriptor configurations, each confined and unconfined. All unconfined cases pass. The confined cases retain a denied-file canary.
