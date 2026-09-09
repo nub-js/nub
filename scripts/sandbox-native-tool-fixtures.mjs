@@ -20,6 +20,7 @@ function find(command) {
   throw new Error(`${command} is missing; provision it before this fixture`);
 }
 function output(program, args, options = {}) {
+  if (!existsSync(program)) throw new Error(`provisioned executable is missing: ${program}`);
   const command = windows && /\.(cmd|bat)$/i.test(program) ? process.env.COMSPEC ?? 'cmd.exe' : program;
   const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
   const commandArgs = command === program ? args : ['/d', '/s', '/c', `"${[program, ...args].map(quote).join(' ')}"`];
@@ -77,7 +78,7 @@ async function installJvmTools() {
   await downloadChecked(`https://archive.apache.org/dist/maven/maven-3/${pins.maven}/binaries/apache-maven-${pins.maven}-bin.zip`, `https://archive.apache.org/dist/maven/maven-3/${pins.maven}/binaries/apache-maven-${pins.maven}-bin.zip.sha512`, 'sha512', mavenArchive); extractArchive(mavenArchive, join(root, 'maven-dist'));
   const ext = windows ? '.bat' : '';
   const mavenRoot = join(root, 'maven-dist', `apache-maven-${pins.maven}`);
-  const maven = join(mavenRoot, 'bin', `mvn${ext}`);
+  const maven = join(mavenRoot, 'bin', windows ? 'mvn.cmd' : 'mvn');
   const seedProject = join(root, 'maven-seed-project');
   const seedRepository = join(root, 'maven-seed-repository');
   mkdirSync(seedProject, { recursive: true });

@@ -116,7 +116,20 @@ fn join_root(base: &Path, rest: &str) -> String {
 /// The matcher works entirely in forward-slash space; the candidate path is
 /// normalized the same way before matching.
 pub fn normalize_slashes(s: &str) -> String {
-    s.replace('\\', "/")
+    let normalized = s.replace('\\', "/");
+    // Authored canonical Windows paths must lose their device prefix before the
+    // compiler decides whether `?` denotes a glob. Candidate canonicalization alone
+    // is too late: the grant has already been classified as an embedded wildcard.
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = normalized.strip_prefix("//?/") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/" {
+            return rest.to_string();
+        }
+    }
+    normalized
 }
 
 /// Canonicalize a path INCLUDING components that do not yet exist.
@@ -410,6 +423,19 @@ mod tests {
                 PathBuf::from(want),
                 "strip_verbatim_prefix({input:?})"
             );
+        }
+    }
+
+    #[test]
+    fn authored_verbatim_paths_normalize_before_glob_classification() {
+        for (input, expected) in [
+            (r"\\?\C:\Users\me\cache", "C:/Users/me/cache"),
+            ("//?/D:/cache/**", "D:/cache/**"),
+            (r"\\?\UNC\server\share\cache", "//server/share/cache"),
+            (r"\\?\Volume{abc}\cache", "//?/Volume{abc}/cache"),
+            ("/work/*/cache", "/work/*/cache"),
+        ] {
+            assert_eq!(normalize_slashes(input), expected);
         }
     }
 }
