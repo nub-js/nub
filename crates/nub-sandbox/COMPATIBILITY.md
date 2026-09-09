@@ -19,16 +19,17 @@ The fixtures also grant the tested interpreter's installation files and supply i
 | Tool version | Linux x86-64 | macOS arm64 | Windows | Tested sequence or limit |
 | --- | --- | --- | --- | --- |
 | npm 11.6.2 | Pass | Pass | Pass | Install, reinstall, installed-bin execution, user-global operations and cache maintenance, with existing cache roots. |
-| pnpm 9.15.9 / 10.18.3 / 11.26.0 | Pass | Pass | Blocked | Windows raw-runtime named-pipe access prevents completion. |
+| pnpm 9.15.9 / 10.18.3 | Pass | Pass | Blocked | Windows confined commands reach the deadline; raw Node's global named-pipe behavior is an established backend incompatibility. |
+| pnpm 11.26.0 | Pass | Pass | Blocked | Windows local installation fails with `EPERM` from `realpath` on the project directory. This is distinct from the older versions' timeout. |
 | Yarn 1.22.22 | Blocked | Pass | Blocked | Linux process-memory inspection needs per-process procfs access; Windows IPC prevents completion. |
 | Yarn 2.4.2 / 3.8.7 / 4.17.0 | Pass | Pass | Pass | Install, reinstall and execution through the configured store. |
 | Bun 1.3.2 | Blocked | Blocked | Blocked | Installed-bin execution reports `CouldntReadCurrentDirectory`; a readable project does not grant arbitrary ancestors. |
 | Bun 1.4.0 | Blocked | Blocked | Blocked | Linux reports a JSON stack-depth error; macOS cache deletion needs a writable parent. Windows does not complete the confined sequence. |
-| pip 26.2.1 / uv 0.12.11 | Pass | Pass | Blocked | Windows private-directory ACLs and uv interpreter/trampoline access prevent completion. Unix uv also passes with its default cache location. |
+| pip 26.2.1 / uv 0.12.11 | Pass | Pass | Blocked | Windows pip cannot write inside its newly created private temp directory. Uv separately receives access denied while querying its interpreter; the exact denied operation is not established. Unix uv also passes with its default cache location. |
 | Cargo 1.91.1 | Pass with project target | Pass | Blocked | Build and clean pass with the default project-local target on Unix. Deleting a separately granted target root requires its parent's write permission. Windows compiler subprocess access is denied. |
 | rustup 1.29.0 | Pass | Pass | Pass | Installed toolchain and home queries; this does not certify installation of every toolchain. |
 | Go 1.25.1 | Pass | Pass | Blocked | User config write/read, build, install and cache cleanup. Server passes config write/read but compilation fails opening `NUL`. |
-| Gradle 8.14 | Pass | Pass | Blocked | Offline task, repeated task and daemon cleanup. Windows lock coordination reports networking degradation, which the test rejects. |
+| Gradle 8.14 | Pass | Pass | Blocked | Offline task, repeated task and daemon cleanup. On Windows, preparation reports that full networking cannot be supplied. The fixture rejects this before launching the workload; this is not a measured Gradle runtime failure. |
 | Maven 3.9.11 | Pass | Pass | Pass | Offline validation and clean; both commands execute the user startup file. |
 | .NET SDK 10.0.100 / NuGet | Blocked | Blocked | Pass | Restore, build and cache cleanup. Linux CoreCLR initialization fails; macOS requires shared `/tmp` coordination outside private temp. |
 | Composer 2.8.12 | Pass | Pass | Blocked | Cold/warm install without plugins or scripts, then cache cleanup. Windows confined subprocess access is denied. |
