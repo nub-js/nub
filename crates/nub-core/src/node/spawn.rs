@@ -6182,21 +6182,27 @@ mod tests {
 
     #[test]
     fn threadpool_size_is_cores_floored_at_four_and_clamped_to_headroom() {
-        // The rule nodejs/performance#193 proposes: max(4, cores).
-        assert_eq!(threadpool_size_from(1, None), 4);
-        assert_eq!(threadpool_size_from(4, None), 4);
-        assert_eq!(threadpool_size_from(10, None), 10);
-        assert_eq!(threadpool_size_from(64, None), 64);
+        // The rule nodejs/performance#193 proposes: max(4, cores). Pinned off
+        // Windows: the platform wrapper caps there, and this test runs on every OS.
+        let unix = |cores, headroom| threadpool_size_from_on(cores, headroom, false);
+        assert_eq!(unix(1, None), 4);
+        assert_eq!(unix(4, None), 4);
+        assert_eq!(unix(10, None), 10);
+        assert_eq!(unix(64, None), 64);
         // A detected thread ceiling clamps it — libuv aborts if one pool thread
         // cannot be created — but never below the default plain Node would ask for.
-        assert_eq!(threadpool_size_from(64, Some(16)), 16);
-        assert_eq!(threadpool_size_from(64, Some(2)), 4);
-        assert_eq!(threadpool_size_from(8, Some(100)), 8);
+        assert_eq!(unix(64, Some(16)), 16);
+        assert_eq!(unix(64, Some(2)), 4);
+        assert_eq!(unix(8, Some(100)), 8);
         // Windows commits 8 MB per pool thread, so the pool stops at 8 there.
         assert_eq!(threadpool_size_from_on(64, None, true), 8);
         assert_eq!(threadpool_size_from_on(6, None, true), 6);
         assert_eq!(threadpool_size_from_on(64, Some(6), true), 6);
-        assert_eq!(threadpool_size_from_on(64, None, false), 64);
+        // The platform wrapper picks the branch this host is on.
+        assert_eq!(
+            threadpool_size_from(64, None),
+            if cfg!(windows) { 8 } else { 64 }
+        );
         // A restorable-var slot exists for it, so a compat boundary removes it.
         assert!(RestorableVar::lookup(THREADPOOL_SIZE_ENV).is_some());
     }
