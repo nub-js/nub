@@ -332,14 +332,20 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     // JS package managers
     "~/.npm",
     "~/Library/pnpm",
+    "~/Library/Caches/pnpm",
     "~/Library/Preferences/pnpm",
+    "~/.local/state/pnpm",
     "~/Library/Caches/Yarn",
+    "~/.config/yarn",
     "~/.yarn",
     "~/.bun/install",
     // Python
     "~/Library/Caches/pip",
     "~/Library/Caches/uv",
     "~/Library/Application Support/pip",
+    "~/.config/pip",
+    "~/.pip",
+    "~/Library/Python",
     "~/.local/share/uv",
     "~/.config/uv",
     "~/.local/bin",
@@ -347,12 +353,16 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.cargo",
     "~/.rustup",
     "~/go",
+    "~/Library/Caches/go-build",
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
+    "~/.local/share/NuGet",
     "~/.composer",
+    "~/Library/Caches/composer",
     "~/Library/Application Support/Composer",
     "~/.config/git",
+    "~/.git-credential-cache",
 ];
 
 #[cfg(target_os = "windows")]
@@ -365,6 +375,11 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/AppData/Roaming/npm",
     "~/AppData/Local/pnpm",
     "~/AppData/Local/pnpm-cache",
+    "~/AppData/Local/pnpm-state",
+    "~/.pnpm",
+    "~/.pnpm-cache",
+    "~/.pnpm-state",
+    "~/.config/pnpm",
     "~/AppData/Local/Yarn",
     "~/AppData/Roaming/Yarn",
     "~/.yarn",
@@ -372,6 +387,8 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     // Python
     "~/AppData/Local/pip",
     "~/AppData/Roaming/pip",
+    "~/pip",
+    "~/AppData/Roaming/Python",
     "~/AppData/Local/uv",
     "~/AppData/Roaming/uv",
     "~/.local/bin",
@@ -386,6 +403,8 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/AppData/Local/NuGet",
     "~/AppData/Local/Composer",
     "~/AppData/Roaming/Composer",
+    "~/.config/git",
+    "~/.git-credential-cache",
 ];
 
 // Linux + any other unix (freebsd, …): the XDG layout.
@@ -401,12 +420,15 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.config/pnpm",
     "~/.local/state/pnpm",
     "~/.cache/yarn",
+    "~/.config/yarn",
     "~/.yarn",
     "~/.bun/install",
     // Python
     "~/.cache/pip",
     "~/.cache/uv",
     "~/.config/pip",
+    "~/.pip",
+    "~/.local/lib",
     "~/.local/share/uv",
     "~/.config/uv",
     "~/.local/bin",
@@ -423,6 +445,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.composer",
     "~/.config/composer",
     "~/.config/git",
+    "~/.git-credential-cache",
 ];
 
 /// File-shaped state is exact, rather than a subtree root: Git replaces the global config
@@ -479,6 +502,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         // Other package-manager families.
         "PIP_CACHE_DIR",
         "PIP_CONFIG_FILE",
+        "PYTHONUSERBASE",
         "UV_CACHE_DIR",
         "UV_TOOL_DIR",
         "UV_TOOL_BIN_DIR",
@@ -526,18 +550,23 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     ] {
         env_path(env, name, &mut paths);
     }
-    // `$cache` already follows XDG_CACHE_HOME through Homes. These are the other
-    // documented XDG roots used by the covered package-manager families.
+    // Standard roots add their tool-specific children, never the whole root.
+    env_subpaths(
+        env,
+        "XDG_CACHE_HOME",
+        &["pnpm", "yarn", "pip", "uv", "go-build", "composer"],
+        &mut paths,
+    );
     env_subpaths(
         env,
         "XDG_DATA_HOME",
-        &["pnpm", "yarn/berry", "uv", "NuGet"],
+        &["pnpm", "yarn/berry", "pip", "uv", "NuGet"],
         &mut paths,
     );
     env_subpaths(
         env,
         "XDG_CONFIG_HOME",
-        &["pnpm", "pip", "uv", "composer", "git"],
+        &["pnpm", "yarn", "pip", "uv", "composer", "git"],
         &mut paths,
     );
     env_subpaths(env, "XDG_STATE_HOME", &["pnpm"], &mut paths);
@@ -552,6 +581,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
             "npm-cache",
             "pnpm",
             "pnpm-cache",
+            "pnpm-state",
             "Yarn",
             "pip",
             "uv",
@@ -565,7 +595,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_subpaths(
         env,
         "APPDATA",
-        &["npm", "Yarn", "pip", "uv", "Composer"],
+        &["npm", "Yarn", "pip", "Python", "uv", "Composer"],
         &mut paths,
     );
     paths
@@ -884,6 +914,64 @@ mod tests {
                     r.matcher.as_str()
                 )
             });
+        }
+    }
+
+    #[test]
+    fn relocated_os_roots_grant_tool_children_not_the_entire_root() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let data = root.path().join("data");
+        let config = root.path().join("config");
+        let env = BTreeMap::from([
+            ("XDG_CACHE_HOME".into(), cache.display().to_string()),
+            ("XDG_DATA_HOME".into(), data.display().to_string()),
+            ("XDG_CONFIG_HOME".into(), config.display().to_string()),
+        ]);
+        let paths = environment_tooldirs(&env);
+        for tool in ["pnpm", "yarn", "pip", "uv", "go-build", "composer"] {
+            assert!(paths.contains(&cache.join(tool).display().to_string()));
+        }
+        assert!(paths.contains(&data.join("pip").display().to_string()));
+        assert!(paths.contains(&config.join("yarn").display().to_string()));
+        for root in [&cache, &data, &config] {
+            assert!(!paths.contains(&root.display().to_string()));
+        }
+        let rules =
+            tooldirs_fs_rules_with_env(&homes(), &env, Effect::Allow, FsAccess::Read).unwrap();
+        assert!(rules.iter().all(|rule| rule.access == FsAccess::Read));
+    }
+
+    #[test]
+    fn conventional_tool_state_includes_noncache_operations() {
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "~/Library/Caches/pnpm",
+            "~/.local/state/pnpm",
+            "~/Library/Python",
+            "~/Library/Caches/go-build",
+            "~/.local/share/NuGet",
+            "~/Library/Caches/composer",
+            "~/.git-credential-cache",
+        ];
+        #[cfg(target_os = "windows")]
+        let expected = [
+            "~/AppData/Local/pnpm-state",
+            "~/.pnpm-state",
+            "~/pip",
+            "~/AppData/Roaming/Python",
+            "~/.config/git",
+            "~/.git-credential-cache",
+        ];
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let expected = [
+            "~/.config/yarn",
+            "~/.pip",
+            "~/.local/lib",
+            "~/.git-credential-cache",
+        ];
+        for path in expected {
+            assert!(tooldir_patterns().contains(&path), "missing {path}");
         }
     }
 

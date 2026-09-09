@@ -213,8 +213,15 @@ impl WindowsLaunch {
         }
     }
     pub(super) fn acquire(self) -> std::io::Result<WindowsResource> {
+        self.acquire_reusing(&BTreeMap::new())
+    }
+
+    pub(crate) fn acquire_reusing(
+        self,
+        retained: &BTreeMap<String, WindowsLease>,
+    ) -> std::io::Result<WindowsResource> {
         match self {
-            Self::AppContainer(plan) => plan.acquire(),
+            Self::AppContainer(plan) => plan.acquire_reusing(retained),
             Self::Plain(plan) => Ok(WindowsResource::plain(plan)),
         }
     }
@@ -2000,6 +2007,7 @@ pub(super) mod launch {
         _lease: super::windows_registry::Acquired,
         sid: SidGuard,
         private_tmp: Option<PathBuf>,
+        window_objects: Vec<super::windows_registry::WindowObject>,
     }
 
     impl Drop for ResourceState {
@@ -2035,19 +2043,45 @@ pub(super) mod launch {
         pub(crate) fn is_live(&self) -> bool {
             self._state._lease.has_live_lease()
         }
+
+        #[cfg(test)]
+        pub(crate) fn shares_resource(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self._state, &other._state)
+        }
     }
 
     impl AppContainerLaunch {
-        pub(crate) fn acquire(mut self) -> io::Result<WindowsResource> {
+        #[cfg(test)]
+        pub(crate) fn acquire(self) -> io::Result<WindowsResource> {
+            self.acquire_reusing(&BTreeMap::new())
+        }
+
+        pub(crate) fn acquire_reusing(
+            mut self,
+            retained: &BTreeMap<String, WindowsLease>,
+        ) -> io::Result<WindowsResource> {
             if let Some(env) = self.env.as_mut() {
                 ensure_appcontainer_environment(env)?;
             }
-            let _operation = super::windows_registry::OperationLock::acquire("resources")?;
+            let identity = timed("resource_identity", || reusable_identity(&self))?;
+            let window_objects = crate::backend::windows_ace::current_objects()?;
+            if let Some(lease) = retained.get(&identity.hash) {
+                let same_windows = timed("resource_cache_hit", || {
+                    super::windows_registry::validate_entry(&lease._state._lease.entry)?;
+                    Ok::<_, io::Error>(lease._state.window_objects == window_objects)
+                })?;
+                if same_windows {
+                    return Ok(self.bind(Arc::clone(&lease._state)));
+                }
+            }
+            // An equivalent retained resource already passed this check. Repeating
+            // it on a hit would rewrite the protected registry DACL per grant.
             for path in self.read_grants.iter().chain(&self.write_grants) {
                 super::windows_registry::reject_registry_grant(path)?;
             }
+            let _operation = super::windows_registry::OperationLock::acquire("resources")?;
             recover_idle_resources(false, true)?;
-            let mut resource = super::windows_registry::acquire(reusable_identity(&self)?)?;
+            let mut resource = super::windows_registry::acquire(identity)?;
             if !resource.fresh {
                 super::windows_registry::validate_entry(&resource.entry)?;
             }
@@ -2078,9 +2112,9 @@ pub(super) mod launch {
             }
             // Window objects are session-local, whereas profiles are user-global.
             // Journal each session's station/desktop before changing either DACL.
-            for object in crate::backend::windows_ace::current_objects()? {
+            for object in &window_objects {
                 resource.record_window_object(object.clone())?;
-                crate::backend::windows_ace::grant_persistent(&object, ac_sid)?;
+                crate::backend::windows_ace::grant_persistent(object, ac_sid)?;
             }
 
             if resource.fresh {
@@ -2159,7 +2193,16 @@ pub(super) mod launch {
                 }
                 resource.ready()?;
             }
-            Ok(WindowsResource {
+            Ok(self.bind(Arc::new(ResourceState {
+                _lease: resource,
+                sid,
+                private_tmp,
+                window_objects,
+            })))
+        }
+
+        fn bind(self, state: Arc<ResourceState>) -> WindowsResource {
+            WindowsResource {
                 plan: PlainLaunch {
                     program: self.program,
                     args: self.args,
@@ -2170,12 +2213,8 @@ pub(super) mod launch {
                 },
                 allow_internet: self.allow_internet,
                 egress_funnel: self.egress_funnel,
-                state: Some(Arc::new(ResourceState {
-                    _lease: resource,
-                    sid,
-                    private_tmp,
-                })),
-            })
+                state: Some(state),
+            }
         }
     }
 
@@ -2472,9 +2511,14 @@ pub(super) mod launch {
                     &mut pi,
                 )
             };
-            let ok = launch();
-            if ok == 0 {
-                let error = io::Error::last_os_error();
+            let result = timed("native_spawn", || {
+                if launch() == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result {
                 return Err(io::Error::new(
                     error.kind(),
                     format!(

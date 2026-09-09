@@ -7,7 +7,7 @@
  * traffic belongs to a native-enforcement assertion. Version pins are intentionally explicit:
  * pnpm 9/10/11 are separate compatibility targets, Yarn 1 is Classic, and Yarn 2/3/4 are Berry.
  */
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -54,7 +54,11 @@ const matrix = [];
 for (const [name, spec, relativeProgram, kind] of packages) {
   const prefix = join(root, name);
   install(prefix, spec);
-  const program = join(prefix, relativeProgram);
+  // Bun publishes bin/bun.exe on Unix too; use the installed manifest rather
+  // than assuming an OS-specific filename across release layouts.
+  const program = kind === 'bun'
+    ? join(prefix, 'node_modules/bun', JSON.parse(readFileSync(join(prefix, 'node_modules/bun/package.json'), 'utf8')).bin.bun)
+    : join(prefix, relativeProgram);
   if (!existsSync(program)) throw new Error(`${name} ${spec} did not provide ${program}`);
   const output = execFileSync(kind === 'bun' ? program : node, kind === 'bun' ? ['--version'] : [program, '--version'], { encoding: 'utf8' }).trim();
   if (!output) throw new Error(`${name} did not report a version`);

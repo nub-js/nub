@@ -949,18 +949,22 @@ fn try_wait_child_eintr(
 
 impl Prepared {
     #[cfg(windows)]
-    fn retain_windows_lease(&self, resource: &windows::WindowsResource) -> std::io::Result<()> {
-        if let (Some(session), Some(identity), Some(lease)) =
-            (&self.session, resource.identity(), resource.lease())
-        {
-            session
-                .windows_leases
-                .lock()
-                .map_err(|_| std::io::Error::other("sandbox session lease lock poisoned"))?
-                .entry(identity.to_owned())
-                .or_insert(lease);
+    fn acquire_windows_resource(
+        &self,
+        launch: windows::WindowsLaunch,
+    ) -> std::io::Result<windows::WindowsResource> {
+        let Some(session) = &self.session else {
+            return launch.acquire();
+        };
+        let mut retained = session
+            .windows_leases
+            .lock()
+            .map_err(|_| std::io::Error::other("sandbox session lease lock poisoned"))?;
+        let resource = launch.acquire_reusing(&retained)?;
+        if let (Some(identity), Some(lease)) = (resource.identity(), resource.lease()) {
+            retained.insert(identity.to_owned(), lease);
         }
-        Ok(())
+        Ok(resource)
     }
     /// Spawn the child without exposing the backend command. The returned handle
     /// owns every launch resource and kills/reaps on an early drop.
@@ -987,8 +991,7 @@ impl Prepared {
             let launch = self.launch.take().ok_or_else(|| {
                 std::io::Error::other("Windows command is missing its owned launch plan")
             })?;
-            let resource = launch.acquire()?;
-            self.retain_windows_lease(&resource)?;
+            let resource = self.acquire_windows_resource(launch)?;
             let child = resource.spawn()?;
             let child_id = child.id();
             let _ = ready;
@@ -1139,8 +1142,7 @@ impl Prepared {
     pub fn output(mut self) -> std::io::Result<std::process::Output> {
         #[cfg(target_os = "windows")]
         if let Some(launch) = self.launch.take() {
-            let resource = launch.acquire()?;
-            self.retain_windows_lease(&resource)?;
+            let resource = self.acquire_windows_resource(launch)?;
             let child = resource.spawn_with_stdio(
                 windows::WindowsStdio::Null,
                 windows::WindowsStdio::Piped,

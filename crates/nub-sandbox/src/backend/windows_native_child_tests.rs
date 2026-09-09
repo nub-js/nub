@@ -116,6 +116,12 @@ fn windows_native_child_fixture() {
             assert!(std::env::var_os("PATH").is_none());
             println!("scrubbed-env-ok");
         }
+        "cached-env" => {
+            println!(
+                "command-env:{}",
+                std::env::var("__NUB_COMMAND_VALUE").unwrap()
+            );
+        }
         "tmp" => {
             let tmp = std::env::var("TMP").unwrap();
             assert_eq!(std::env::var("TEMP").unwrap(), tmp);
@@ -426,6 +432,128 @@ fn windows_native_scrubbed_environment_supplies_only_required_profile_metadata()
         .unwrap();
     assert!(child.wait().unwrap().success(), "{output}");
     assert!(output.contains("scrubbed-env-ok"), "{output}");
+}
+
+#[test]
+fn windows_native_retained_resource_keeps_lease_but_not_command_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let mut first = plan(root.path(), "cached-env");
+    first
+        .env
+        .as_mut()
+        .unwrap()
+        .insert("__NUB_COMMAND_VALUE".into(), "first".into());
+    let mut second = first.clone();
+    second
+        .env
+        .as_mut()
+        .unwrap()
+        .insert("__NUB_COMMAND_VALUE".into(), "second".into());
+    let first = first.acquire().unwrap();
+    let lease = first.lease().unwrap();
+    let retained = BTreeMap::from([(first.identity().unwrap().to_string(), lease.clone())]);
+    drop(first);
+    let second = second.acquire_reusing(&retained).unwrap();
+    assert!(lease.shares_resource(&second.lease().unwrap()));
+    let mut child = second
+        .spawn_with_stdio(
+            WindowsStdio::Null,
+            WindowsStdio::Piped,
+            WindowsStdio::Inherit,
+        )
+        .unwrap();
+    let mut output = String::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "{output}");
+    assert!(output.contains("command-env:second"), "{output}");
+    assert!(!output.contains("command-env:first"), "{output}");
+    assert!(lease.is_live());
+}
+
+#[test]
+fn windows_native_retained_resource_refuses_replaced_grant_and_private_root() {
+    let root = tempfile::tempdir().unwrap();
+    let grant = root.path().join("grant");
+    std::fs::create_dir(&grant).unwrap();
+    let mut launch = plan(&grant, "hold");
+    launch.private_tmp = true;
+    let resource = launch.clone().acquire().unwrap();
+    let retained = BTreeMap::from([(
+        resource.identity().unwrap().to_string(),
+        resource.lease().unwrap(),
+    )]);
+    let private = resource.private_tmp().unwrap().to_path_buf();
+    for path in [grant, private] {
+        let original = path.with_extension("cache-original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let result = launch.clone().acquire_reusing(&retained);
+        // Restore the owned object before assertions or resource cleanup.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&original, &path).unwrap();
+        assert!(result.is_err(), "replaced {} was reused", path.display());
+    }
+}
+
+#[test]
+fn windows_native_retained_resource_misses_for_different_resolved_grants() {
+    let root = tempfile::tempdir().unwrap();
+    let first_root = root.path().join("first");
+    let second_root = root.path().join("second");
+    std::fs::create_dir(&first_root).unwrap();
+    std::fs::create_dir(&second_root).unwrap();
+    let first = plan(&first_root, "hold").acquire().unwrap();
+    let retained = BTreeMap::from([(
+        first.identity().unwrap().to_string(),
+        first.lease().unwrap(),
+    )]);
+    let second = plan(&second_root, "hold")
+        .acquire_reusing(&retained)
+        .unwrap();
+    assert_ne!(first.identity(), second.identity());
+    assert!(
+        !first
+            .lease()
+            .unwrap()
+            .shares_resource(&second.lease().unwrap())
+    );
+}
+
+#[test]
+fn windows_native_retained_resource_owns_independent_command_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = plan(root.path(), "hold");
+    let first = launch.clone().acquire().unwrap();
+    let retained = BTreeMap::from([(
+        first.identity().unwrap().to_string(),
+        first.lease().unwrap(),
+    )]);
+    let second = launch.acquire_reusing(&retained).unwrap();
+    assert!(
+        first
+            .lease()
+            .unwrap()
+            .shares_resource(&second.lease().unwrap())
+    );
+    let a = first
+        .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
+        .unwrap();
+    let mut b = second
+        .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
+        .unwrap();
+    wait_for_file(&root.path().join(format!("ready-{}", a.id())));
+    wait_for_file(&root.path().join(format!("ready-{}", b.id())));
+    let a_id = a.id();
+    drop(a);
+    assert!(!is_running(a_id));
+    assert!(is_running(b.id()));
+    assert!(b.try_wait().unwrap().is_none());
+    b.kill().unwrap();
+    b.wait().unwrap();
 }
 
 #[test]

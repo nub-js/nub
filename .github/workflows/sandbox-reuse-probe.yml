@@ -9,6 +9,7 @@ on:
       - Cargo.lock
       - Cargo.toml
       - scripts/sandbox-tool-fixtures.mjs
+      - scripts/sandbox-python-fixtures.mjs
 
 permissions:
   contents: read
@@ -58,6 +59,8 @@ jobs:
           cargo test -p nub-sandbox --profile fast native_supervised_streams_status_and_repeated_launches -- --ignored --nocapture 2>&1 | tee reports/linux-notification.log
       - name: Measuring native acquisition and reuse
         if: success() || failure()
+        env:
+          NUB_SANDBOX_WIN_TIMING: '1'
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test lifecycle_costs native_session_costs_and_unique_policy_churn -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/costs.log
@@ -69,10 +72,24 @@ jobs:
           node scripts/sandbox-tool-fixtures.mjs 2>&1 | tee reports/tools-provision.log
           cp .sandbox-tool-fixtures/matrix.json reports/tools-matrix.json
       - name: Exercising package-manager functionality
+        timeout-minutes: 8
         if: (success() || failure()) && steps.tools.outcome == 'success'
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/tools.log
+      - name: Provisioning pinned Python tools
+        id: python-tools
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          node scripts/sandbox-python-fixtures.mjs 2>&1 | tee reports/python-provision.log
+          cp .sandbox-python-fixtures/matrix.json reports/python-matrix.json
+      - name: Exercising Python tool functionality
+        timeout-minutes: 8
+        if: (success() || failure()) && steps.python-tools.outcome == 'success'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test python_tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/python-tools.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

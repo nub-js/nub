@@ -421,7 +421,7 @@ pub(crate) fn validate_private_path(entry: &Entry, path: &Path) -> io::Result<()
     let Some(actual) = object_id(path)? else {
         return Ok(());
     };
-    if entry.object_ids.get(&normalize(path)) != Some(&actual) {
+    if entry.object_ids.get(&canonical_path_or_lexical(path)?) != Some(&actual) {
         return Err(io::Error::other(format!(
             "sandbox resource {} requires recovery: private path {} has no matching ownership identity",
             entry.profile_name,
@@ -432,7 +432,7 @@ pub(crate) fn validate_private_path(entry: &Entry, path: &Path) -> io::Result<()
 }
 
 pub(crate) fn validate_object(entry: &Entry, path: &Path) -> io::Result<()> {
-    let path_text = normalize(path);
+    let path_text = canonical_path_or_lexical(path)?;
     if let Some(expected) = entry.object_ids.get(&path_text)
         && object_id(path)?
             .as_ref()
@@ -1227,7 +1227,11 @@ mod tests {
             .entries
             .remove(&acquired.entry.identity)
             .unwrap();
-        assert!(recorded.object_ids.contains_key(&normalize(&path)));
+        assert!(
+            recorded
+                .object_ids
+                .contains_key(&canonical_path(&path).unwrap())
+        );
         std::fs::rename(&path, dir.path().join("original")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(validate_object(&recorded, &path).is_err());

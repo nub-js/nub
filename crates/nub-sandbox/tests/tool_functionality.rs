@@ -102,6 +102,7 @@ fn confined(
     root: &Path,
     policy: &nub_sandbox::SandboxPolicy,
 ) -> Output {
+    eprintln!("CONFINED {program} {args:?}");
     let sandbox = Sandbox::new(policy).expect("tool sandbox acquires");
     let prepared = sandbox
         .prepare(
@@ -119,6 +120,7 @@ fn confined(
 }
 
 fn unconfined(program: &str, args: &[&str], root: &Path, extra_env: &[(&str, &str)]) -> Output {
+    eprintln!("UNCONFINED {program} {args:?}");
     let mut command = Command::new(program);
     command.args(args).current_dir(root.join("project"));
     command.env_clear();
@@ -510,30 +512,134 @@ fn run_global_install_and_cache_prune(
     );
 }
 
-#[test]
-#[ignore = "requires the pinned native tool matrix"]
-fn pinned_js_package_managers_support_tooldir_backed_normal_operations() {
-    for tool in tools() {
-        eprintln!("TOOL {} {} ({})", tool.name, tool.version, tool.spec);
-        for (label, tooldirs) in [
-            ("unconfined", None),
-            ("exact", Some(false)),
-            ("$tooldirs", Some(true)),
-        ] {
-            let root = fixture();
-            let (cache, global, env) = tool_env(&tool, root.path());
-            // Precondition for native inode/ACL backends: these existing roots are what their
-            // grants can name. Cold-root denial is covered separately below.
-            std::fs::create_dir_all(&cache).expect("materialized cache precondition");
-            std::fs::create_dir_all(&global).expect("materialized global precondition");
-            let policy = tooldirs
-                .map(|tooldirs| grant_policy(&tool, root.path(), &cache, &global, &env, tooldirs));
-            eprintln!("TOOL {} {} control", tool.name, label);
-            run_normal_operations(&tool, root.path(), &env, policy.as_ref());
-            run_global_install_and_cache_prune(&tool, root.path(), &env, policy.as_ref());
+#[derive(Clone, Copy)]
+enum ToolControl {
+    Unconfined,
+    Exact,
+    Tooldirs,
+}
+
+impl ToolControl {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unconfined => "unconfined",
+            Self::Exact => "exact",
+            Self::Tooldirs => "$tooldirs",
+        }
+    }
+
+    fn tooldirs(self) -> Option<bool> {
+        match self {
+            Self::Unconfined => None,
+            Self::Exact => Some(false),
+            Self::Tooldirs => Some(true),
         }
     }
 }
+
+fn run_tool_control(name: &str, control: ToolControl) {
+    let tools = tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("tool matrix omitted {name}"));
+    eprintln!("TOOL {} {} ({})", tool.name, tool.version, tool.spec);
+    let root = fixture();
+    let (cache, global, env) = tool_env(tool, root.path());
+    // Precondition for native inode/ACL backends: these existing roots are what their grants
+    // can name. Cold-root denial is covered separately below.
+    std::fs::create_dir_all(&cache).expect("materialized cache precondition");
+    std::fs::create_dir_all(&global).expect("materialized global precondition");
+    let policy = control
+        .tooldirs()
+        .map(|tooldirs| grant_policy(tool, root.path(), &cache, &global, &env, tooldirs));
+    eprintln!("TOOL {} {} control", tool.name, control.label());
+    run_normal_operations(tool, root.path(), &env, policy.as_ref());
+    run_global_install_and_cache_prune(tool, root.path(), &env, policy.as_ref());
+}
+
+macro_rules! tool_controls {
+    ($tool:literal, $unconfined:ident, $exact:ident, $tooldirs:ident) => {
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $unconfined() {
+            run_tool_control($tool, ToolControl::Unconfined);
+        }
+
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $exact() {
+            run_tool_control($tool, ToolControl::Exact);
+        }
+
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $tooldirs() {
+            run_tool_control($tool, ToolControl::Tooldirs);
+        }
+    };
+}
+
+tool_controls!(
+    "npm",
+    npm_unconfined_normal_operations,
+    npm_exact_normal_operations,
+    npm_tooldirs_normal_operations
+);
+tool_controls!(
+    "pnpm9",
+    pnpm9_unconfined_normal_operations,
+    pnpm9_exact_normal_operations,
+    pnpm9_tooldirs_normal_operations
+);
+tool_controls!(
+    "pnpm10",
+    pnpm10_unconfined_normal_operations,
+    pnpm10_exact_normal_operations,
+    pnpm10_tooldirs_normal_operations
+);
+tool_controls!(
+    "pnpm11",
+    pnpm11_unconfined_normal_operations,
+    pnpm11_exact_normal_operations,
+    pnpm11_tooldirs_normal_operations
+);
+tool_controls!(
+    "yarn1",
+    yarn1_unconfined_normal_operations,
+    yarn1_exact_normal_operations,
+    yarn1_tooldirs_normal_operations
+);
+tool_controls!(
+    "yarn2",
+    yarn2_unconfined_normal_operations,
+    yarn2_exact_normal_operations,
+    yarn2_tooldirs_normal_operations
+);
+tool_controls!(
+    "yarn3",
+    yarn3_unconfined_normal_operations,
+    yarn3_exact_normal_operations,
+    yarn3_tooldirs_normal_operations
+);
+tool_controls!(
+    "yarn4",
+    yarn4_unconfined_normal_operations,
+    yarn4_exact_normal_operations,
+    yarn4_tooldirs_normal_operations
+);
+tool_controls!(
+    "bun132",
+    bun132_unconfined_normal_operations,
+    bun132_exact_normal_operations,
+    bun132_tooldirs_normal_operations
+);
+tool_controls!(
+    "bun140",
+    bun140_unconfined_normal_operations,
+    bun140_exact_normal_operations,
+    bun140_tooldirs_normal_operations
+);
 
 #[test]
 #[ignore = "requires the pinned native tool matrix"]
