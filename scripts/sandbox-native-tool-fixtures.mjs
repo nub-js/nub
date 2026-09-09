@@ -56,6 +56,9 @@ function extractArchive(archive, destination) {
 async function installRust() {
   const hostRustup = find('rustup');
   const toolEnv = { RUSTUP_HOME: join(root, 'rustup'), CARGO_HOME: join(root, 'cargo') };
+  if (process.env.RUSTUP_OVERRIDE_HOST_TRIPLE) {
+    toolEnv.RUSTUP_OVERRIDE_HOST_TRIPLE = process.env.RUSTUP_OVERRIDE_HOST_TRIPLE;
+  }
   mkdirSync(toolEnv.RUSTUP_HOME, { recursive: true });
   mkdirSync(toolEnv.CARGO_HOME, { recursive: true });
   output(hostRustup, ['toolchain', 'install', pins.cargo, '--profile', 'minimal', '--no-self-update'], { env: { ...process.env, ...toolEnv } });

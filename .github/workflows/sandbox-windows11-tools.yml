@@ -13,6 +13,10 @@ jobs:
   native:
     runs-on: windows-11-arm
     timeout-minutes: 35
+    env:
+      # The runner is ARM64; this matrix deliberately exercises x64 tools under
+      # Windows emulation with the matching MSVC libraries.
+      RUSTUP_OVERRIDE_HOST_TRIPLE: x86_64-pc-windows-msvc
     defaults:
       run:
         shell: bash
@@ -44,6 +48,7 @@ jobs:
           php-version: '8.4'
           coverage: none
       - name: Provisioning pinned native toolchains
+        id: tools
         run: |
           set -o pipefail
           mkdir -p reports
@@ -61,7 +66,7 @@ jobs:
           set -o pipefail
           cargo clippy -p nub-sandbox --profile fast --test native_tool_functionality -- -D warnings 2>&1 | tee reports/clippy.log
       - name: Exercising native tool families
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test native_tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-tools.log
