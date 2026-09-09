@@ -56,10 +56,16 @@ test("parseArgs reads job and fanout", () => {
   assert.equal(a.fanout, 10);
 });
 
+test("parseArgs reads the adhoc job and its script path", () => {
+  const a = parseArgs(["--job", "adhoc", "--script", "/tmp/probe.sh"]);
+  assert.equal(a.job, "adhoc");
+  assert.equal(a.script, "/tmp/probe.sh");
+});
+
 // Every job runs on a fresh clone, so every job needs the prerequisites. A regression
 // that drops the node guard from ONE job type would produce a silently degraded binary
 // from that path only — which is exactly the kind of bug that survives a smoke test.
-for (const job of ["clippy", "test"]) {
+for (const job of ["clippy", "test", "adhoc"]) {
   test(`jobScript(${job}) guards the prerequisites a fresh clone lacks`, () => {
     const s = jobScript(job, "fast");
     assert.match(s, /command -v node/, "must fail loudly without node (else the primer silently empties)");
@@ -79,11 +85,19 @@ for (const job of ["clippy", "test"]) {
 // to be verified against ci.yml, so the job built a second dependency graph under `dev` and
 // could not reuse the golden image's artifacts. And it asserted THREE legs after
 // `check-path-literals.sh` (ci.yml:237) had joined `check-env-reads.sh`, so that lint was
-// missing from every remote clippy run.
-test("jobScript(clippy) reproduces all four legs of the CI clippy gate", () => {
+// missing from every remote clippy run. And a THIRD time: it asserted FOUR legs while
+// ci.yml also runs `cd crates/nub-launcher && cargo clippy --locked --all-targets -- -D warnings
+// && cargo build --locked && cargo test --locked` — its own workspace, invisible to the root gate, and the half
+// that ships inside every compiled artifact. Count the legs in ci.yml, do not trust this name.
+test("jobScript(clippy) reproduces every leg of the CI clippy gate", () => {
   const s = jobScript("clippy", "fast");
   assert.match(s, /cargo clippy --all-targets --all-features --profile fast -- -D warnings/);
   assert.match(s, /crates\/nub-native && cargo clippy --all-features --profile fast -- -D warnings/, "root clippy does NOT cover nub-native");
+  assert.match(
+    s,
+    /crates\/nub-launcher && cargo clippy --locked --all-targets -- -D warnings && cargo build --locked && cargo test --locked/,
+    "ci.yml:258 gates nub-launcher, a separate workspace the root clippy never sees",
+  );
   assert.match(s, /tests\/brand-lint\/check-env-reads\.sh/);
   assert.match(s, /tests\/brand-lint\/check-path-literals\.sh/, "ci.yml:237 runs a second brand lint");
 });
@@ -93,7 +107,10 @@ test("jobScript(clippy) reproduces all four legs of the CI clippy gate", () => {
 // make them fail on a malformed library rather than skip.
 test("jobScript(test) matches CI: whole workspace, real addon staged over the placeholder", () => {
   const s = jobScript("test", "fast");
-  assert.match(s, /\ncargo test$/, "CI runs the whole workspace, not -p nub-cli");
+  // Its own line, not the end of the script: the compile-feature line legitimately
+  // follows it. The claim being pinned is still that the whole workspace runs here,
+  // never `-p nub-cli` alone.
+  assert.match(s, /\ncargo test\n/, "CI runs the whole workspace, not -p nub-cli");
   assert.match(s, /crates\/nub-native && cargo build/);
   assert.match(s, /cp "\$CARGO_TARGET_DIR\/debug\/libnub_native\.so" runtime\/addons\/nub-native\.node/);
   // Anchored to the COMMAND, not the raw text: PREPARE is shared by both jobs and its
@@ -104,11 +121,33 @@ test("jobScript(test) matches CI: whole workspace, real addon staged over the pl
   assert.doesNotMatch(s, /cargo clippy/);
 });
 
+// The adhoc job is the one whose payload RUNS the binary, so it inherits the test job's
+// addon obligation (the placeholder would be dlopen'd for real) and adds two of its own:
+// the payload must land on disk rather than arrive via stdin (the truncation trap
+// remoteJobCommand documents), and NUB_ALLOW_INCOMPLETE_RUNTIME must be unset before it
+// runs, or every nub the payload spawns sees a NUB_* var a user's never would.
+test("jobScript(adhoc) builds the real binary and runs the payload from a file with NUB_BIN", () => {
+  const b64 = Buffer.from("echo probe").toString("base64");
+  const s = jobScript("adhoc", "fast", b64);
+  assert.match(s, /crates\/nub-native && cargo build/, "the placeholder addon would be dlopen'd for real");
+  assert.match(s, /cp "\$CARGO_TARGET_DIR\/debug\/libnub_native\.so" runtime\/addons\/nub-native\.node/);
+  assert.match(s, /\ncargo build -p nub-cli --profile fast\n/, "the payload needs a binary to run");
+  assert.ok(s.includes(b64), "the payload must ship inside the job script");
+  assert.match(s, /base64 -d > "\$HOME\/adhoc-job\.sh"/, "the payload must land on disk, never stdin");
+  assert.match(
+    s,
+    /unset NUB_ALLOW_INCOMPLETE_RUNTIME\nNUB_BIN="\$CARGO_TARGET_DIR\/fast\/nub" bash "\$HOME\/adhoc-job\.sh"/,
+    "the payload must see NUB_BIN and must not inherit the runtime opt-out",
+  );
+  assert.doesNotMatch(s, /cargo clippy/);
+  assert.doesNotMatch(s, /\ncargo test/, "an adhoc job runs the payload, not the gates");
+});
+
 // The bake compiles the dependency graph then `rm -rf ~/src`. A target dir inside ~/src
 // would be destroyed with it, so every builder would pay a full cold compile while the
 // image claimed to carry warm artifacts. Both sides must agree on the path.
 test("every job uses a target dir that survives the bake's cleanup of ~/src", () => {
-  for (const job of ["clippy", "test"]) {
+  for (const job of ["clippy", "test", "adhoc"]) {
     const s = jobScript(job, "fast");
     assert.match(s, /export CARGO_TARGET_DIR="\$HOME\/\.cargo-shared-target"/, `${job} must reuse the baked artifacts`);
     assert.ok(!/CARGO_TARGET_DIR="?\$HOME\/src/.test(s), `${job} must not target a dir the bake deletes`);
@@ -118,7 +157,7 @@ test("every job uses a target dir that survives the bake's cleanup of ~/src", ()
 // sshd runs `bash -s` non-interactively; Ubuntu's .bashrc returns before any appended
 // PATH line, so rustup's env is never applied and cargo dies with 127.
 test("every job sources cargo's env, since a non-interactive ssh shell never does", () => {
-  for (const job of ["clippy", "test"]) {
+  for (const job of ["clippy", "test", "adhoc"]) {
     assert.match(jobScript(job, "fast"), /\. "\$HOME\/\.cargo\/env"/, `${job} would die with cargo: command not found`);
   }
 });
@@ -231,7 +270,7 @@ test("the bake warms every cargo invocation the jobs actually run", () => {
   const profileOf = (cmd) =>
     /(^|\s)--release([\s)]|$)/.test(cmd) ? "release" : (cmd.match(/--profile\s+([^\s)]+)/)?.[1] ?? "dev");
 
-  for (const job of ["clippy", "test"]) {
+  for (const job of ["clippy", "test", "adhoc"]) {
     for (const cmd of cargoLines(jobScript(job, "fast"))) {
       const match = warmed.find((w) => w.startsWith(cmd));
       assert.ok(
@@ -247,4 +286,46 @@ test("the bake warms every cargo invocation the jobs actually run", () => {
       );
     }
   }
+});
+
+// The lockstep test above reads the SOURCE, so it validates warm lines whether or not they
+// ship. An UNESCAPED backtick inside the warm template literal closes it early; the rest of
+// the block rides an ||-short-circuited tagged template that never evaluates, so `warm`
+// silently ships only the prefix — cargo fetch ran, no warm-up compiled, and the bake would
+// have imaged a cold builder as warm. Found live 2026-09-01: a comment's || true in raw
+// backticks truncated the block at the exact line that says "must not be SILENT".
+test("the bake's warm block contains no raw backtick to truncate the shipped script", () => {
+  const src = readFileSync(new URL("./remote-build.ts", import.meta.url), "utf8");
+  const opener = "const warm = `set -euxo pipefail";
+  const from = src.indexOf(opener);
+  const to = src.indexOf('echo "warm target dir', from);
+  assert.ok(from > 0 && to > from, "could not locate the bake's warm block in the source");
+  const body = src.slice(from + opener.length, to);
+  const raw = body.match(/(?<!\\)`/g) || [];
+  assert.equal(raw.length, 0, "a raw backtick inside the warm template literal truncates the shipped script at that point");
+});
+
+// The command lockstep above says nothing about the ENVIRONMENT those commands run in, and
+// the bake carries its own prep rather than reusing PREPARE. `--all-features` turns on
+// `embed-runtime`, whose build.rs rejects a runtime staged without the vendored node_modules,
+// so a grant present in one prep and absent from the other fails the bake's warm-up legs —
+// which are deliberately best-effort, so the bake would publish a silently COLD image.
+test("the bake and the job prep both grant the vendored-runtime opt-out", () => {
+  const src = readFileSync(new URL("./remote-build.ts", import.meta.url), "utf8");
+  const from = src.indexOf("const warm = `set -euxo pipefail");
+  const to = src.indexOf('echo "warm target dir', from);
+  assert.ok(from > 0 && to > from, "could not locate the bake's warm block in the source");
+
+  const GRANT = "export NUB_ALLOW_INCOMPLETE_RUNTIME=1";
+  assert.match(
+    src.slice(from, to),
+    new RegExp(GRANT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    "the bake's warm block does not grant NUB_ALLOW_INCOMPLETE_RUNTIME — its --all-features " +
+      "warm-up legs will fail the vendored-runtime check and bake a cold image, silently",
+  );
+  assert.ok(
+    jobScript("clippy", "fast").includes(GRANT),
+    "jobScript(clippy) does not carry NUB_ALLOW_INCOMPLETE_RUNTIME — the remote gate will " +
+      "panic in build.rs instead of linting",
+  );
 });

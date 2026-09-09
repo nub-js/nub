@@ -231,6 +231,59 @@ fn a_workspace_member_points_the_loader_at_the_root_schema() {
 
 #[cfg(unix)]
 #[test]
+fn a_package_inside_a_package_finds_the_enclosing_schema() {
+    // `fns/` carries its own manifest, so it is the project root — and the schema
+    // one level up was neither that nor the workspace root. The lookup checked
+    // exactly those two directories, so this ran on nub's own `.env*` cascade
+    // with no diagnostic at all, which is the silent substitution the whole
+    // hand-over exists to refuse. The walk now covers everything up to the
+    // workspace root.
+    let dir = project(&[
+        (
+            "package.json",
+            r#"{"name":"ws","version":"1.0.0","workspaces":["apps/*"]}"#,
+        ),
+        ("apps/web/package.json", r#"{"name":"web"}"#),
+        ("apps/web/.env.schema", "# ---\nA=1\n"),
+        ("apps/web/.env", "FROM_DOTENV=cascade\n"),
+        ("apps/web/fns/package.json", r#"{"name":"fns"}"#),
+    ]);
+    let tally = dir.path().join("tally");
+    install_stub_loader(dir.path(), &tally);
+    std::fs::copy(
+        dir.path().join("probe.mjs"),
+        dir.path().join("apps/web/fns/probe.mjs"),
+    )
+    .expect("probe into the nested package");
+
+    let run = run(&dir.path().join("apps/web/fns"));
+    assert_eq!(
+        run.var("FROM_LOADER").as_deref(),
+        Some("yes"),
+        "the enclosing package's schema must reach a package nested inside it. \
+         stderr: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.var("FROM_DOTENV"),
+        None,
+        "and finding it must stand nub's own cascade down, not run beside it. \
+         stderr: {}",
+        run.stderr
+    );
+    let handed = run
+        .var("LOADER_PATH")
+        .expect("the loader must be given a --path");
+    assert_eq!(
+        std::fs::canonicalize(&handed).expect("canonicalize --path"),
+        std::fs::canonicalize(dir.path().join("apps/web")).expect("canonicalize member"),
+        "the loader must be pointed at the directory the schema is in. stderr: {}",
+        run.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn nub_watch_also_puts_the_loader_in_front_of_node() {
     // `nub watch` assembles its own `node --watch` command instead of going
     // through `spawn_node`, so it does not inherit the wrap — but detection has
@@ -268,6 +321,52 @@ fn nub_watch_also_puts_the_loader_in_front_of_node() {
     assert!(
         line.contains(r#""FROM_LOADER":"yes""#),
         "nub watch must run Node behind the loader; got: {line}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_watcher_inside_the_loader_still_honours_declared_sources() {
+    // `run_watch` builds its own env instead of going through `runtime_child_env`,
+    // so it is a second copy of the precedence rule and has to agree with the first.
+    // Reachable because the wrap marker is INHERITED: any `nub watch` started by a
+    // program already running behind the loader arrives here owned. Declared still
+    // beats inferred there — being inside a wrap is not a reason to drop what the
+    // project asked for.
+    let dir = project(&[
+        (".env.schema", "# ---\nA=1\n"),
+        ("custom.env", "FROM_DOTENV=declared\n"),
+        ("nub.jsonc", r#"{ "envFile": ["custom.env"] }"#),
+    ]);
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let mut child = Command::new(nub_binary())
+        .args(["watch", "probe.mjs"])
+        .current_dir(dir.path())
+        .env("PATH", which_node_dir())
+        .env("__NUB_ENV_OWNER_WRAPPED", &root)
+        .env_remove("NODE_OPTIONS")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nub watch");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let first_line = std::thread::spawn(move || {
+        use std::io::BufRead;
+        std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .find(|line| line.contains("FROM_DOTENV"))
+    });
+    let line = wait_for(first_line, std::time::Duration::from_secs(60));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let line = line.expect("nub watch printed no probe output within 60s");
+    assert!(
+        line.contains(r#""FROM_DOTENV":"declared""#),
+        "the watch path must apply the same precedence as the run path; got: {line}"
     );
 }
 
@@ -415,26 +514,40 @@ fn a_declared_but_missing_loader_is_fatal() {
 }
 
 #[test]
-fn a_schema_without_the_loader_keeps_loading_and_warns() {
-    // A schema with nothing to read it is not evidence that anything owns this
-    // project, so standing down would leave the child with no environment at all.
+fn a_schema_without_any_loader_is_fatal() {
+    // Falling back to `.env*` is a DIFFERENT answer, not a softer one: no defaults,
+    // no validation, no providers. A schema the project has not disclaimed says the
+    // environment is schema-resolved, so nub refuses rather than running the
+    // program on an environment it never asked for.
     let dir = project(&[
         (".env", "FROM_DOTENV=yes\n"),
         (".env.schema", "# ---\nA=1\n"),
     ]);
-    let run = run(dir.path());
-    assert_eq!(
-        run.var("FROM_DOTENV").as_deref(),
-        Some("yes"),
-        "with no loader installed nub must keep loading. stderr: {}",
-        run.stderr
+    let node_dir = which_node_dir();
+    let output = Command::new(nub_binary())
+        .arg("probe.mjs")
+        .current_dir(dir.path())
+        .env("PATH", &node_dir)
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .expect("spawn nub");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an unreadable schema must not run the program; exit was {:?}",
+        output.status.code()
     );
     assert!(
-        run.stderr.contains("nub add -D varlock"),
-        "the user must be told the schema was not applied, and how to fix it — \
-         as a DEV dependency, which is what the loader's own docs prescribe; \
-         stderr was: {}",
-        run.stderr
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "the program must not have run at all; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("nub add -D varlock"),
+        "the fix for a schema with no loader declared anywhere is an add — as a \
+         DEV dependency, which is what the loader's own docs prescribe; \
+         stderr: {stderr}"
     );
 }
 
@@ -442,8 +555,9 @@ fn a_schema_without_the_loader_keeps_loading_and_warns() {
 fn a_project_using_a_rival_schema_tool_is_not_warned_at() {
     // `dotenv-extended` claims this filename too. A project that declares it has
     // a tool applying its schema already, so telling it the schema "was not
-    // applied" is false, and recommending another package is noise. The file
-    // sniff cannot settle this one: the schema here IS @env-spec shaped.
+    // applied" is false, and recommending another package is noise. Its manifest
+    // is the only thing that can say so — nub never reads the schema itself, so
+    // the file here is deliberately @env-spec shaped.
     let dir = project(&[
         (
             "package.json",
@@ -469,13 +583,17 @@ fn a_project_using_a_rival_schema_tool_is_not_warned_at() {
 
 #[cfg(unix)]
 #[test]
-fn a_foreign_schema_does_not_hand_over_even_when_the_loader_is_installed() {
-    // The format sniff used to gate only the DIAGNOSTIC. That left the worse half
-    // live: a `dotenv-extended` schema in a project where any varlock happened to
-    // be reachable made nub suppress its own cascade and route the whole run
-    // through `varlock run` against a schema written for another format —
-    // silently, because the warning was the thing being suppressed.
+fn a_declared_rival_tool_blocks_the_hand_over_even_with_the_loader_installed() {
+    // The carve-out gates the HAND-OVER, not just the diagnostic. Gating only the
+    // warning leaves the worse half live: a `dotenv-extended` project where any
+    // varlock happens to be reachable would have nub suppress its own cascade and
+    // route the whole run through `varlock run` against a schema written for
+    // another format — silently, since the warning is what is being suppressed.
     let dir = project(&[
+        (
+            "package.json",
+            r#"{"name":"f","version":"1.0.0","devDependencies":{"dotenv-extended":"^2.9.0"}}"#,
+        ),
         (".env", "FROM_DOTENV=yes\n"),
         (".env.schema", "# Server\nPORT=\nAPI_URL=\n"),
     ]);
@@ -486,7 +604,7 @@ fn a_foreign_schema_does_not_hand_over_even_when_the_loader_is_installed() {
     assert_eq!(
         run.var("FROM_LOADER"),
         None,
-        "a foreign schema must not put the loader in front of Node. stderr: {}",
+        "a declared rival must not put the loader in front of Node. stderr: {}",
         run.stderr
     );
     assert!(!tally.exists(), "and must not invoke the loader at all");
@@ -533,51 +651,252 @@ fn a_different_project_inside_the_wrap_still_wraps_its_own() {
     );
 }
 
+/// Run without asserting success — for the cases whose point IS the exit code.
+#[cfg(unix)]
+fn try_run(dir: &Path, args: &[&str]) -> (bool, String, String) {
+    let node_dir = which_node_dir();
+    let output = Command::new(nub_binary())
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", &node_dir)
+        .env_remove("APP_ENV")
+        .env_remove("NODE_ENV")
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .expect("spawn nub");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
 #[test]
-fn a_foreign_env_schema_is_left_alone_silently() {
-    // `.env.schema` is not this format's name — dotenv-extended has defaulted to
-    // it since 2016 for an incompatible format. Warning on the filename told those
-    // projects their schema "was not applied" while another tool was applying it.
+fn an_explicit_env_file_displaces_the_loader() {
+    // A schema is INFERRED intent; an `envFile` value is DECLARED intent. Declared
+    // wins, and the loader stays out of the spawn chain entirely. This used to be
+    // refused as a contradiction, which left a project wanting a schema in CI and a
+    // plain `.env` locally with no way to say so.
     let dir = project(&[
-        (".env", "FROM_DOTENV=yes\n"),
-        (".env.schema", "# Server\nPORT=\nAPI_URL=\n"),
+        (".env.schema", "# ---\nA=1\n"),
+        ("custom.env", "FROM_DOTENV=explicit\n"),
+        ("nub.jsonc", r#"{ "envFile": ["custom.env"] }"#),
     ]);
-    let run = run(dir.path());
+    let tally = dir.path().join("tally");
+    install_stub_loader(dir.path(), &tally);
+
+    let run = run_args(dir.path(), &["probe.mjs"]);
     assert_eq!(
         run.var("FROM_DOTENV").as_deref(),
-        Some("yes"),
-        "a foreign schema must not disturb nub's own loading. stderr: {}",
+        Some("explicit"),
+        "the declared source must load. stderr: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.var("FROM_LOADER"),
+        None,
+        "and the loader must not have run. stderr: {}",
         run.stderr
     );
     assert!(
-        !run.stderr.contains("varlock"),
-        "nub must not name another tool at a project that never asked for it; \
-         stderr was: {}",
+        !tally.exists(),
+        "displacing means the loader is never spawned, not that its output is dropped"
+    );
+
+    // Same from the command line, which is the likelier way to reach it.
+    let run = run_args(dir.path(), &["--env-file=custom.env", "probe.mjs"]);
+    assert_eq!(
+        run.var("FROM_DOTENV").as_deref(),
+        Some("explicit"),
+        "an explicit --env-file must displace it too. stderr: {}",
         run.stderr
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn an_explicit_env_file_setting_overrides_the_stand_down() {
-    // Explicit beats inferred: a user who spells out `envFile` has asked for those
-    // files regardless of what a schema implies.
+fn env_file_varlock_selects_the_loader() {
+    // The one value that does NOT displace. An absent `envFile` reaches the same
+    // place, so what this pins is that naming the loader is not mistaken for the
+    // declaration that displaces it — the value has to survive the rule aimed at
+    // every other spelling.
     let dir = project(&[
         (".env.schema", "# ---\nA=1\n"),
-        ("custom.env", "FROM_DOTENV=explicit\n"),
-        ("nub.jsonc", r#"{ "envFile": "custom.env" }"#),
+        ("nub.jsonc", r#"{ "envFile": "varlock" }"#),
     ]);
     let tally = dir.path().join("tally");
     install_stub_loader(dir.path(), &tally);
-    let run = run(dir.path());
+
+    let run = run_args(dir.path(), &["probe.mjs"]);
     assert_eq!(
-        run.var("FROM_DOTENV").as_deref(),
-        Some("explicit"),
-        "an explicit envFile must still load. stderr: {}",
+        run.var("FROM_LOADER").as_deref(),
+        Some("yes"),
+        "`envFile: \"varlock\"` must hand the environment over. stderr: {}",
         run.stderr
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn env_file_varlock_without_a_schema_is_refused() {
+    // Nothing for the loader to read, so the run would quietly fall through to
+    // nub's own cascade under a name that asked for something else.
+    let dir = project(&[
+        (".env", "FROM_DOTENV=cascade\n"),
+        ("nub.jsonc", r#"{ "envFile": "varlock" }"#),
+    ]);
+    let tally = dir.path().join("tally");
+    install_stub_loader(dir.path(), &tally);
+
+    let (ok, stdout, stderr) = try_run(dir.path(), &["probe.mjs"]);
+    assert!(
+        !ok,
+        "a loader with no schema must not run; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains(".env.schema"),
+        "the error must name the missing file, which is the whole fix; stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bare_path_is_refused_with_the_array_form() {
+    // Paths live in an array, matching every other list-valued field. The error has
+    // to hand back the bracketed spelling — a bare "expected an array" leaves the
+    // user guessing whether their path was also wrong.
+    let dir = project(&[
+        ("custom.env", "FROM_DOTENV=explicit\n"),
+        ("nub.jsonc", r#"{ "envFile": "custom.env" }"#),
+    ]);
+    let (ok, _, stderr) = try_run(dir.path(), &["probe.mjs"]);
+    assert!(!ok, "a bare path must not be read as a one-element list");
+    assert!(
+        stderr.contains(r#"["custom.env"]"#),
+        "the error must show the path bracketed; stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_explicit_env_file_is_fine_without_a_loader() {
+    // The control for the test above: same flag, no schema. Without this, that test
+    // would pass just as well if `--env-file` were broken outright.
+    let dir = project(&[("custom.env", "FROM_DOTENV=explicit\n")]);
+    let run = run_args(dir.path(), &["--env-file=custom.env", "probe.mjs"]);
+    assert_eq!(
+        run.var("FROM_DOTENV").as_deref(),
+        Some("explicit"),
+        "with no loader in play an explicit env file must still load. stderr: {}",
+        run.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn loading_nothing_disables_the_loader_too() {
+    // Asking for NO environment used to be classified as a non-conflict — on the
+    // grounds that standing down for the loader already loads nothing — so both
+    // `--no-env-file` and `envFile: false` did nothing at all in a schema project
+    // and handed a fully resolved environment to someone who asked for none. That
+    // read the hand-over as the absence of loading rather than as its own answer.
+    let dir = project(&[(".env.schema", "# ---\nA=1\n"), (".env", "FROM_DOTENV=x\n")]);
+    let tally = dir.path().join("tally");
+    install_stub_loader(dir.path(), &tally);
+
+    let assert_empty = |run: &Run, spelling: &str| {
+        assert_eq!(
+            run.var("FROM_LOADER"),
+            None,
+            "{spelling} must stop the hand-over. stderr: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.var("FROM_DOTENV"),
+            None,
+            "{spelling} must not fall back to nub's own cascade either. stderr: {}",
+            run.stderr
+        );
+    };
+
+    assert_empty(
+        &run_args(dir.path(), &["--no-env-file", "probe.mjs"]),
+        "--no-env-file",
+    );
+    write(dir.path(), "nub.jsonc", r#"{ "envFile": false }"#);
+    assert_empty(&run_args(dir.path(), &["probe.mjs"]), "envFile: false");
+
+    assert!(
+        !tally.exists(),
+        "the loader must never have been spawned in either spelling"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_env_file_displaces_a_project_schema() {
+    // A schema is a DEFAULT — it decides the environment exactly when nobody said
+    // otherwise — so a declaration at ANY scope outranks it. The global layer was
+    // briefly carved out so that `nub config set --global envFile false` could not
+    // empty a schema project, which put a non-config signal at a novel position
+    // inside the precedence chain (beating global, losing to project) and silently
+    // ignored an explicit instruction — the very failure this field's rule exists
+    // to prevent. `envFile: "varlock"` is how a project opts back in, and the
+    // second half of this test is what makes that spelling load-bearing.
+    let dir = project(&[(".env.schema", "# ---\nA=1\n"), (".env", "FROM_DOTENV=x\n")]);
+    let tally = dir.path().join("tally");
+    install_stub_loader(dir.path(), &tally);
+
+    let home = tempfile::tempdir().expect("tempdir");
+    write(
+        home.path(),
+        ".config/nub/nub.jsonc",
+        r#"{ "envFile": false }"#,
+    );
+
+    let run_with_home = |dir: &Path| {
+        let output = Command::new(nub_binary())
+            .arg("probe.mjs")
+            .current_dir(dir)
+            .env("PATH", which_node_dir())
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("NODE_OPTIONS")
+            .output()
+            .expect("spawn nub");
+        Run {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    };
+
+    let run = run_with_home(dir.path());
+    assert_eq!(
+        run.var("FROM_LOADER"),
+        None,
+        "a global `envFile: false` must displace the schema. stderr: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.var("FROM_DOTENV"),
+        None,
+        "and `false` means no environment, not a fallback to nub's cascade. stderr: {}",
+        run.stderr
+    );
+
+    // The project overrides the machine-wide default by naming the loader.
+    write(dir.path(), "nub.jsonc", r#"{ "envFile": "varlock" }"#);
+    let run = run_with_home(dir.path());
+    assert_eq!(
+        run.var("FROM_LOADER").as_deref(),
+        Some("yes"),
+        "`envFile: \"varlock\"` in the project must beat a global `false`. stderr: {}",
+        run.stderr
+    );
+}
+
+// @lat: [[compat-mode-tests#Compat mode#Compat mode never puts the loader in front of Node]]
 #[cfg(unix)]
 #[test]
 fn compat_mode_does_no_owner_handling_at_all() {

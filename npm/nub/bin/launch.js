@@ -193,6 +193,143 @@ function leadsToUs(entry, st, ourReal) {
   return false;
 }
 
+// Does the npm-generated `<verb>.cmd` in `dir` demonstrably dispatch to OUR launcher?
+//
+// The Windows analogue of leadsToUs, and needed for the same reason: healWindowsBinDir
+// drops a `nub.exe` into a directory on the user's PATH, and there is a real unrelated
+// `nub@1.0.0` on npm. Matching on the NAME alone would shadow someone else's tool with
+// our binary — worse than the POSIX case, because PATHEXT makes our `.exe` win over
+// their `.cmd` silently.
+//
+// npm's batch shim references its target as `"%dp0%\..\<pkg>\bin\nub"`, so the scan is
+// the same shape as the sh one: pull quoted tokens, expand the basedir variable, realpath,
+// compare. `%dp0%` already ends in a separator (`%~dp0` expands with a trailing slash),
+// hence the `\\?` in the pattern.
+function cmdShimLeadsToUs(dir, verb, ourReal) {
+  try {
+    const body = fs.readFileSync(path.join(dir, `${verb}.cmd`), "utf8");
+    for (const q of body.match(/"([^"]*)"/g) || []) {
+      let p = q.slice(1, -1).replace(/%dp0%\\?/gi, `${dir}${path.sep}`);
+      if (!p.includes(path.sep) && !p.includes("/")) continue;
+      if (!path.isAbsolute(p)) p = path.resolve(dir, p);
+      try { if (fs.realpathSync(p) === ourReal) return true; } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+// Place `src` at `dest` as a hardlink, idempotently. Extracted from the .exe path so
+// the shell sidecar below gets identical staleness + fallback semantics.
+//
+// Idempotent, and correct across an upgrade: `npm i -g` extracts a NEW binary at a
+// new inode, so an existing file from a previous version is stale and must be
+// re-linked. Comparing ino+dev is exact for a hardlink; the size fallback covers
+// the copy path, where ino necessarily differs.
+function stageWindowsLink(srcPath, srcStat, dest) {
+  try {
+    const cur = fs.statSync(dest);
+    if ((cur.ino && cur.ino === srcStat.ino && cur.dev === srcStat.dev) || cur.size === srcStat.size) return;
+    fs.rmSync(dest, { force: true });
+  } catch {}
+  try {
+    fs.linkSync(srcPath, dest);
+  } catch {
+    // EXDEV (prefix on a different volume from the store) or a filesystem without
+    // hardlinks: fall back to a copy. Costs the file's size on disk once, which is
+    // why it is the fallback and not the default.
+    try { fs.copyFileSync(srcPath, dest); } catch {}
+  }
+}
+
+// The nub-owned subdirectory the bundled POSIX shell is carried into. Must match
+// NUB_SHELL_SUBDIR in crates/nub-cli/src/cli.rs (resolve_bundled_busybox).
+const SHELL_SUBDIR = "nub-sh";
+
+// Carry the bundled POSIX shell along with the .exe we just linked.
+//
+// `nub run` executes script bodies through the bundled busybox-w32 `sh`, and the
+// binary resolves it RELATIVE TO ITSELF (cli.rs resolve_bundled_busybox). The win32
+// package lays `busybox.exe` beside `bin/nub.exe`, so that holds — until the .exe is
+// hardlinked into npm's global bin dir, whose parent has no sidecar, and every
+// `nub run` then dies "bundled POSIX shell (busybox.exe) was not found" (#687).
+//
+// It goes in a SUBDIRECTORY, not beside the .exe, because `dir` is by construction a
+// directory on the user's PATH: a bare `busybox.exe` there would shadow a busybox the
+// user installed themselves, which is the same shadowing hazard cmdShimLeadsToUs
+// exists to prevent — and worse here, since the name is not even ours. A subdirectory
+// is not searched by PATH, so it is invisible to command resolution.
+//
+// A missing source is not an error: a NEWER launcher can run against an OLDER platform
+// package that predates the bundled shell (<0.6.0), and those installs never had one.
+function stageWindowsShell(pkgBinDir, dir) {
+  const from = path.join(pkgBinDir, "busybox.exe");
+  let st; try { st = fs.statSync(from); } catch { return; }
+  const into = path.join(dir, SHELL_SUBDIR);
+  try { fs.mkdirSync(into, { recursive: true }); } catch { return; }
+  stageWindowsLink(from, st, path.join(into, "busybox.exe"));
+}
+
+// WINDOWS: put a real `<verb>.exe` next to npm's shims, plus the shell it needs.
+//
+// The heal below is POSIX-only because there is no shebang or symlink fast path on
+// Windows — every call goes cmd.exe -> nub.cmd -> node -> spawn nub.exe, and the node
+// boot is ~58 ms of it. A hardlinked `nub.exe` in the same directory is resolved AHEAD
+// of `nub.cmd` by PATHEXT, so cmd.exe reaches the binary directly. Measured on
+// windows-latest, N=40: 95.6 -> 35.8 ms.
+//
+// ADD-ONLY WITH RESPECT TO FILES NPM OWNS. npm's `.ps1` and extensionless shims are
+// left exactly as generated: we are not the first package to start editing files npm
+// owns (checked — esbuild, bun and @pnpm/exe all modify only files inside their OWN
+// package and never touch the global bin dir). The cost is that PowerShell and every
+// sh-family shell keep preferring those shims and see no improvement — including nub's
+// OWN Windows script shell, the bundled busybox (cli.rs `resolve_bundled_busybox`),
+// measured 170.3 -> 169.0 ms, i.e. nothing. `nub run` therefore does not benefit on
+// SPEED. It does depend on this function for CORRECTNESS: relocating the .exe moves
+// the binary away from the sidecar it resolves relative to itself, which is what
+// stageWindowsShell repairs (#687). Reading that trade as "nub run is unaffected"
+// is how the regression shipped.
+//
+// THREE RESIDUES THIS SHAPE OWNS, all from writing files npm does not track:
+//
+//   UNINSTALL. `npm uninstall -g @nubjs/nub` removes only the shims npm generated;
+//   cmd-shim never created `<verb>.exe` and npm has run no uninstall lifecycle script
+//   since v7, so there is no hook to clean it up. The file STAYS ON PATH and keeps
+//   answering `nub` from cmd.exe after the user believes nub is gone — and on the
+//   hardlink path the surviving link also keeps the binary's bytes on disk. This is a
+//   real user-visible residue, not merely wasted space; do not describe it as "npm's
+//   uninstall is unaffected". The `nub-sh/` shell dir survives the same way, but it is
+//   NOT on PATH, so it wastes space without answering any command.
+//
+//   UPGRADE. Once the `.exe` wins PATHEXT, cmd.exe never dispatches through npm's `.cmd`
+//   again, so THIS FUNCTION NEVER RUNS AGAIN for the users it serves and its currency
+//   check below cannot fire for them. `postinstall.js` (dropStaleWindowsExe) removes both
+//   the file and `nub-sh/` on every install so the next call re-heals against the new
+//   binary — but that only runs when lifecycle scripts do, so an `--ignore-scripts`
+//   upgrade still leaves cmd.exe executing the previous version silently.
+//
+// Best-effort and silent, like every other heal step: any failure leaves a working
+// (slower) install rather than a broken one.
+function healWindowsBinDir(verb, nativePath) {
+  if (process.platform !== "win32") return;
+  try {
+    const ourBin = path.join(__dirname, verb);
+    let ourReal; try { ourReal = fs.realpathSync(ourBin); } catch { ourReal = ourBin; }
+    let nativeReal; try { nativeReal = fs.realpathSync(nativePath); } catch { nativeReal = nativePath; }
+    let src; try { src = fs.statSync(nativeReal); } catch { return; }
+
+    for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+      if (!dir) continue;
+      if (!cmdShimLeadsToUs(dir, verb, ourReal)) continue;
+      stageWindowsLink(nativeReal, src, path.join(dir, `${verb}.exe`));
+      // Unconditional, NOT gated on the .exe having been (re)linked above: the
+      // 0.7.0-0.7.2 installs this fixes already carry a current .exe, so a shell
+      // staged only alongside a fresh link would never reach them.
+      stageWindowsShell(path.dirname(nativeReal), dir);
+      break; // the first PATH entry that dispatches to us is the one that matters
+    }
+  } catch {}
+}
+
 // Best-effort, never throws. Rewrite the on-PATH `<verb>` entry that dispatched us
 // into a minimal sh trampoline -> the native binary. POSIX only.
 function healPathEntry(verb, nativePath) {
@@ -261,6 +398,10 @@ module.exports = function launch(argv0Name) {
   const binPath = ensureExecutable(resolved, verb);
   // Self-heal the PATH entry on first POSIX call so later calls skip Node entirely.
   healPathEntry(verb, binPath);
+  // The Windows counterpart. Separate function rather than a branch inside healPathEntry
+  // because the two do genuinely different things: POSIX REWRITES the entry that
+  // dispatched us, Windows only ADDS a sibling `.exe` and leaves npm's shims untouched.
+  healWindowsBinDir(verb, binPath);
   // This call still runs through Node; spawn the native binary. The platform package
   // ships ONE binary, so binPath's basename is `nub` for both verbs and cannot carry
   // the mode — `__NUB_ARGV0` does, below. We set `argv0` too, but the env var is the

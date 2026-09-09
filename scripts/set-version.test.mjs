@@ -20,11 +20,30 @@ const PACKAGE_FILES = [
   "npm/nub-linux-arm64-musl/package.json",
   "npm/nub-win32-x64/package.json",
   "npm/nub-win32-arm64/package.json",
+  "npm/loader/package.json",
+  "npm/loader-darwin-arm64/package.json",
+  "npm/loader-darwin-x64/package.json",
+  "npm/loader-linux-x64/package.json",
+  "npm/loader-linux-x64-musl/package.json",
+  "npm/loader-linux-arm64/package.json",
+  "npm/loader-linux-arm64-musl/package.json",
+  "npm/loader-win32-x64/package.json",
+  "npm/loader-win32-arm64/package.json",
 ];
 const VERSION_SURFACES = [
   ...PACKAGE_FILES,
   "Cargo.toml",
   "crates/nub-native/Cargo.toml",
+  "crates/nub-core/Cargo.toml",
+  // The three out-of-workspace locks. Asserted here rather than merely written
+  // in the fixture because they are consumed under `--locked`: a stamp that
+  // misses one leaves it unsatisfiable, which is a failed release build rather
+  // than a stale string. nub-phantom is the one that proves the point — nothing
+  // read it under `--locked` until 2026-09-02, so nothing stamped it either, and
+  // its lock sat at 0.6.0 while the tree shipped 0.8.x with every check green.
+  "crates/nub-launcher/Cargo.lock",
+  "crates/nub-native/Cargo.lock",
+  "crates/nub-phantom/Cargo.lock",
   "runtime/version.mjs",
 ];
 
@@ -33,11 +52,40 @@ function write(root, file, content) {
   writeFileSync(join(root, file), content);
 }
 
-function fixture({ latest = false, corruptLatest = false } = {}) {
+function fixture({ latest = false, corruptLatest = false, crlfLocks = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "nub-set-version-"));
+  const lock = (text) => (crlfLocks ? text.replace(/\n/g, "\r\n") : text);
   for (const file of PACKAGE_FILES) write(root, file, JSON.stringify({ version: "0.0.0" }) + "\n");
   write(root, "Cargo.toml", '[workspace.package]\nversion = "0.0.0"\n');
   write(root, "crates/nub-native/Cargo.toml", '[package]\nversion = "0.0.0"\n');
+  // nub-core carries an inlined manifest version too, stamped alongside
+  // nub-native. Omitting it makes set-version exit on ENOENT before it reaches
+  // the schema snapshot this file is testing.
+  write(root, "crates/nub-core/Cargo.toml", '[package]\nversion = "0.0.0"\n');
+  // Each out-of-workspace lock records the version of a crate stamped above —
+  // the launcher's records nub-core, the addon's records itself, and phantom's
+  // records BOTH root-workspace path deps it pulls in. A second [[package]]
+  // block is present so the test would catch a stamp that rewrote every version
+  // line in the file rather than the one entry it names.
+  write(
+    root,
+    "crates/nub-launcher/Cargo.lock",
+    lock('[[package]]\nname = "anyhow"\nversion = "1.0.0"\n\n[[package]]\nname = "nub-core"\nversion = "0.0.0"\n'),
+  );
+  write(
+    root,
+    "crates/nub-native/Cargo.lock",
+    lock('[[package]]\nname = "anyhow"\nversion = "1.0.0"\n\n[[package]]\nname = "nub-native"\nversion = "0.0.0"\n'),
+  );
+  write(
+    root,
+    "crates/nub-phantom/Cargo.lock",
+    lock(
+      '[[package]]\nname = "anyhow"\nversion = "1.0.0"\n\n' +
+        '[[package]]\nname = "nub-phantom-core"\nversion = "0.0.0"\n\n' +
+        '[[package]]\nname = "nub-phantom-scan"\nversion = "0.0.0"\n',
+    ),
+  );
   write(root, "runtime/version.mjs", 'export const NUB_VERSION = "0.0.0";\n');
   if (latest) {
     write(root, "site/public/schema/latest.json", JSON.stringify({ $id: "https://nubjs.com/schema/latest.json", title: "Nub config" }) + "\n");
@@ -62,6 +110,18 @@ test("stamps a pinned schema snapshot from latest", () => {
     delete latest.$id;
     delete snapshot.$id;
     assert.deepEqual(snapshot, latest);
+
+    // A lock is stamped ENTRY-WISE. Rewriting every version line in it would
+    // repin unrelated dependencies and leave the lock unsatisfiable under
+    // `--locked` — the same failed release build the stamp exists to prevent.
+    for (const lock of [
+      "crates/nub-launcher/Cargo.lock",
+      "crates/nub-native/Cargo.lock",
+      "crates/nub-phantom/Cargo.lock",
+    ]) {
+      const content = readFileSync(join(root, lock), "utf8");
+      assert.match(content, /name = "anyhow"\nversion = "1\.0\.0"/, `${lock}: anyhow was repinned`);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -80,6 +140,38 @@ test("absent latest schema still stamps every version surface, writing no snapsh
       assert.match(readFileSync(join(root, file), "utf8"), new RegExp(VERSION), file);
     }
     assert.equal(existsSync(join(root, "site/public/schema/v7.8.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The lock patterns are the only multi-line ones in the script, and the release
+// job that depends on them runs the stamp on two windows-latest shards, where
+// the runner's core.autocrlf=true checks both locks out as CRLF. A literal `\n`
+// matches only 0x0A, so this is the shape that failed there while every local
+// run stayed green.
+test("stamps CRLF lockfiles, as a Windows runner checks them out", () => {
+  const root = fixture({ crlfLocks: true });
+  try {
+    const result = run(root);
+    assert.equal(result.status, 0, result.stderr);
+    for (const [lock, crate] of [
+      ["crates/nub-launcher/Cargo.lock", "nub-core"],
+      ["crates/nub-native/Cargo.lock", "nub-native"],
+      // Two rows for one file, because that lock carries two stamped entries:
+      // stamping only one of them leaves it exactly as unsatisfiable as
+      // stamping neither, and a single row could not tell those apart.
+      ["crates/nub-phantom/Cargo.lock", "nub-phantom-core"],
+      ["crates/nub-phantom/Cargo.lock", "nub-phantom-scan"],
+    ]) {
+      const content = readFileSync(join(root, lock), "utf8");
+      assert.match(
+        content,
+        new RegExp(`name = "${crate}"\\r\\nversion = "${VERSION}"`),
+        `${lock}: the ${crate} entry was not stamped, or its CRLF was lost`,
+      );
+      assert.match(content, /name = "anyhow"\r\nversion = "1\.0\.0"/, `${lock}: anyhow was repinned`);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

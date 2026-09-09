@@ -1,13 +1,28 @@
 import './global.css';
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import {
+  Bricolage_Grotesque,
+  Inter,
   Newsreader,
   Geist_Mono,
   Caveat,
   Encode_Sans,
 } from 'next/font/google';
+import { Analytics } from '@vercel/analytics/next';
 import type { ReactNode } from 'react';
 import type { Metadata, Viewport } from 'next';
+
+const bricolage = Bricolage_Grotesque({
+  subsets: ['latin'],
+  variable: '--font-bricolage',
+  display: 'swap',
+});
+
+const inter = Inter({
+  subsets: ['latin'],
+  variable: '--font-inter',
+  display: 'swap',
+});
 
 // Newsreader — the PREVIOUS site serif, kept registered ONLY so reverting the
 // Encode-Sans switch is a CSS-only change (point the @theme font vars back at
@@ -155,7 +170,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
       lang="en"
-      className={`${newsreader.variable} ${geistMono.variable} ${caveat.variable} ${encodeSans.variable}`}
+      className={`${bricolage.variable} ${inter.variable} ${newsreader.variable} ${geistMono.variable} ${caveat.variable} ${encodeSans.variable}`}
       suppressHydrationWarning
     >
       <body className="flex min-h-screen flex-col antialiased">
@@ -167,6 +182,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <RootProvider theme={{ defaultTheme: 'system', enableSystem: true }}>
           {children}
         </RootProvider>
+        <Analytics />
       </body>
     </html>
   );

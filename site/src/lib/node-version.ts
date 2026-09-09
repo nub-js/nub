@@ -10,17 +10,25 @@ export type NodeVersion = { full: string; major: string };
 
 const FALLBACK: NodeVersion = { full: '26.3.0', major: '26' };
 
+let cached: NodeVersion | null = null;
+
 export async function getLatestNode(): Promise<NodeVersion> {
+  if (cached) return cached;
+  if (process.env.NODE_ENV === 'development') {
+    cached = FALLBACK;
+    return FALLBACK;
+  }
   try {
     const res = await fetch('https://nodejs.org/dist/index.json', {
       next: { revalidate: 86400 },
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(1500),
     });
     if (!res.ok) return FALLBACK;
     const all = (await res.json()) as { version: string }[];
     const full = all[0]?.version?.replace(/^v/, '');
     if (!full) return FALLBACK;
-    return { full, major: full.split('.')[0] };
+    cached = { full, major: full.split('.')[0] };
+    return cached;
   } catch {
     return FALLBACK;
   }

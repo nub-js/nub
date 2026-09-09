@@ -47,9 +47,50 @@ pub enum Error {
     )]
     TrustCheckMissingTime(Box<MissingTimeDetails>),
     #[error(
-        "peer-context fixed-point did not converge after {0} iterations. mutually recursive peers, lockfile would be incomplete"
+        "in {}: `\"{}\": \"{}\"` names workspace package `{}`, which is not in this workspace",
+        .0.importer, .0.dep_name, .0.spec, .0.target
+    )]
+    WorkspacePkgNotFound(Box<WorkspacePkgNotFoundDetails>),
+    #[error(
+        "in {}: `\"{}\": \"{}\"` wants `{}` at `{}`, but this workspace has {}@{}",
+        .0.importer, .0.dep_name, .0.spec, .0.target, .0.range, .0.target, .0.local_version
+    )]
+    WorkspaceVersionMismatch(Box<WorkspaceVersionMismatchDetails>),
+    #[error(
+        "peer-context fixed-point did not converge after {0} iterations; lockfile would be incomplete"
     )]
     PeerContextDivergence(usize),
+}
+
+/// Context attached to a `WorkspacePkgNotFound` error.
+///
+/// `dep_name` is the key as written in the manifest and `target` is the
+/// member the spec asks for. They differ only for the alias form
+/// (`"card": "workspace:components-card@*"`), and keeping both is what
+/// lets the message point at the name the user actually has to fix.
+#[derive(Debug)]
+pub struct WorkspacePkgNotFoundDetails {
+    pub dep_name: String,
+    pub spec: String,
+    pub target: String,
+    pub importer: String,
+    /// Every member name in the workspace, for a did-you-mean list.
+    /// The formatter caps the rendered list; empty means the workspace
+    /// has no members at all.
+    pub known: Vec<String>,
+}
+
+/// Context attached to a `WorkspaceVersionMismatch` error — an aliased
+/// `workspace:<target>@<range>` whose range the local copy of `target`
+/// does not satisfy.
+#[derive(Debug)]
+pub struct WorkspaceVersionMismatchDetails {
+    pub dep_name: String,
+    pub spec: String,
+    pub target: String,
+    pub range: String,
+    pub local_version: String,
+    pub importer: String,
 }
 
 /// Context attached to a `NoMatch` error so the miette `help()` output can
@@ -165,6 +206,8 @@ impl miette::Diagnostic for Error {
             Self::BlockedExoticSubdep(_) => ERR_AUBE_BLOCKED_EXOTIC_SUBDEP,
             Self::TrustDowngrade(_) => ERR_AUBE_TRUST_DOWNGRADE,
             Self::TrustCheckMissingTime(_) => ERR_AUBE_TRUST_MISSING_TIME,
+            Self::WorkspacePkgNotFound(_) => ERR_AUBE_WORKSPACE_PKG_NOT_FOUND,
+            Self::WorkspaceVersionMismatch(_) => ERR_AUBE_NO_MATCHING_VERSION,
             Self::PeerContextDivergence(_) => ERR_AUBE_PEER_CONTEXT_NOT_CONVERGED,
         }))
     }
@@ -180,9 +223,50 @@ impl miette::Diagnostic for Error {
             Self::BlockedExoticSubdep(d) => Some(Box::new(format_exotic_subdep_help(d))),
             Self::TrustDowngrade(d) => Some(Box::new(format_trust_downgrade_help(d))),
             Self::TrustCheckMissingTime(d) => Some(Box::new(format_trust_missing_time_help(d))),
+            Self::WorkspacePkgNotFound(d) => Some(Box::new(format_workspace_pkg_not_found_help(d))),
+            Self::WorkspaceVersionMismatch(d) => Some(Box::new(format!(
+                "the `workspace:` protocol only resolves against this workspace, so this does \
+                 not fall back to the registry. Either widen the range (`workspace:{target}@*` \
+                 tracks whatever the local copy is) or bump `{target}` to a version that \
+                 satisfies `{range}`",
+                target = d.target,
+                range = d.range,
+            ))),
             Self::PeerContextDivergence(_) => None,
         }
     }
+}
+
+fn format_workspace_pkg_not_found_help(d: &WorkspacePkgNotFoundDetails) -> String {
+    let mut help = if d.dep_name == d.target {
+        format!(
+            "the `workspace:` protocol only resolves against this workspace's own packages, \
+             so `{}` never falls back to the registry",
+            d.target
+        )
+    } else {
+        // The alias form. Naming both halves matters: the key is what
+        // lands in `node_modules/`, the target is what has to exist.
+        format!(
+            "`workspace:{target}@<range>` aliases the local package `{target}` under the name \
+             `{key}`. `{key}` is the directory name you get in `node_modules/`; `{target}` is \
+             the `name` field some package in this workspace must declare",
+            target = d.target,
+            key = d.dep_name,
+        )
+    };
+    if d.known.is_empty() {
+        help.push_str(". This workspace has no packages");
+        return help;
+    }
+    // A big monorepo would bury the message under its own member list.
+    const SHOWN: usize = 10;
+    help.push_str(". Packages in this workspace: ");
+    help.push_str(&d.known[..d.known.len().min(SHOWN)].join(", "));
+    if d.known.len() > SHOWN {
+        help.push_str(&format!(" (+{} more)", d.known.len() - SHOWN));
+    }
+    help
 }
 
 fn format_trust_downgrade_help(d: &TrustDowngradeDetails) -> String {
@@ -471,12 +555,31 @@ fn format_undated_help(d: &UndatedDetails) -> String {
 }
 
 pub(crate) fn format_registry_help(name: &str, msg: &str) -> String {
+    format_registry_help_for(name, msg, aube_util::agent_sandbox::detect())
+}
+
+/// `sandbox` is the coding agent's sandbox around this process, injected so
+/// tests can pin the help without touching the environment. It changes ONE
+/// arm: a request the registry client classified as a network deny names the
+/// sandbox as the cause, because "check auth" is advice an agent may act on
+/// by poking at credentials. Every other failure inside a sandbox — auth,
+/// integrity, a 5xx from an allowlisted registry — keeps its own help;
+/// sandbox presence alone says nothing about why a request failed.
+pub(crate) fn format_registry_help_for(
+    name: &str,
+    msg: &str,
+    sandbox: Option<aube_util::agent_sandbox::AgentSandbox>,
+) -> String {
     let kind = classify_registry_error(msg);
     let mut s = String::new();
     if !name.is_empty() && name != "(resolver)" {
         s.push_str(&format!("package: {name}\n"));
     }
-    s.push_str(match kind {
+    let help: &str = match kind {
+        RegistryErrorKind::NetworkDenied => {
+            s.push_str(&aube_util::agent_sandbox::network_denied_help_for(sandbox));
+            return s;
+        }
         RegistryErrorKind::Tarball => {
             "tarball download or integrity check failed — try `aube store prune` to clear the cache; if the lockfile references a tarball that moved, delete the lockfile entry for this package and re-resolve"
         }
@@ -493,12 +596,13 @@ pub(crate) fn format_registry_help(name: &str, msg: &str) -> String {
             "pnpmfile `readPackage` hook returned an error — check the hook's stack trace above for the underlying cause"
         }
         RegistryErrorKind::ResolverBug => {
-            "internal resolver invariant violated — please report at https://github.com/jdx/aube/discussions with the lockfile and command that reproduced this"
+            "internal resolver invariant violated — please report at https://github.com/aubepkg/aube/discussions with the lockfile and command that reproduced this"
         }
         RegistryErrorKind::Generic => {
             "registry operation failed — see the message above for the underlying cause"
         }
-    });
+    };
+    s.push_str(help);
     s
 }
 
@@ -607,6 +711,9 @@ fn suggest_similar<'a>(needle: &str, choices: &'a [String]) -> Option<&'a str> {
 }
 
 pub(crate) enum RegistryErrorKind {
+    /// The registry client's own verdict (`aube_registry::Error::NetworkDenied`):
+    /// the socket was refused by policy, so no retry and no credential fixes it.
+    NetworkDenied,
     Tarball,
     Fetch,
     Git,
@@ -637,6 +744,10 @@ pub(crate) fn classify_registry_error(msg: &str) -> RegistryErrorKind {
         RegistryErrorKind::Hook
     } else if lower.starts_with("unparseable local specifier") || lower.contains("workspace:") {
         RegistryErrorKind::LocalSpec
+    } else if lower.contains("network access denied") {
+        // Before the tarball/fetch arms: a denied tarball download embeds
+        // the word "tarball" and the URL, and both would steal it.
+        RegistryErrorKind::NetworkDenied
     } else if lower.contains("tarball") || lower.contains("integrity") {
         RegistryErrorKind::Tarball
     } else if lower.starts_with("fetch ") || lower.contains("packument") || lower.contains("http") {

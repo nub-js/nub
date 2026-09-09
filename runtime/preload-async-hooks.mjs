@@ -28,8 +28,9 @@
 // loader worker, not a user realm, so it installs no browser globals.)
 import "./floor-builtin.mjs";
 import {
-  TRANSPILE_EXTS, PLAIN_JS_EXTS, dataExtsFor,
-  extname, resolveSpec, loadTranspile, maybeTranspilePlainJs, loadData, loadTextImport, isDependency,
+  TRANSPILE_EXTS, PLAIN_JS_EXTS, CLOBBER_MAP, dataExtsFor,
+  extname, isFileUrl, resolveSpec, loadTranspile, maybeTranspilePlainJs, loadData, loadTextImport, isDependency,
+  noteRuntimeV8FlagSource, outerHookOwnsFormat,
 } from "./transform-core.mjs";
 import { createRequire, isBuiltin } from "node:module";
 import { existsSync } from "node:fs";
@@ -61,10 +62,19 @@ const __pnp = (() => {
 })();
 
 // Node calls this once per worker when the main thread invokes
-// `module.register(url, parentURL, { data })`. We accept and ignore the payload
-// so future main-thread → worker plumbing is non-breaking. Returning a Promise
-// lets the main thread `await register(...)`.
-export async function initialize(_data) {}
+// `module.register(url, parentURL, { data })`, and register() blocks until it
+// resolves — so anything done here lands before the first resolve/load fires.
+// The STANDALONE LOADER (loader-entry.mjs / loader-register.cjs) sends
+// `{ standaloneLoader: true }`: this worker imports its OWN transform-core
+// instance (a separate module registry from the main thread), so the entry's
+// main-thread CLOBBER_MAP.clear() cannot reach the map THIS realm's resolveSpec
+// reads — without the clear here, `import "@js-temporal/polyfill"` on the
+// compat tier resolved to a synthetic re-export of a global the loader never
+// installs, silently binding `undefined` (verified on Node 20.19). The nub CLI
+// registers this worker with no data, keeping its clobbers intact.
+export async function initialize(data) {
+  if (data && data.standaloneLoader) CLOBBER_MAP.clear();
+}
 
 // ── Resolve hook ────────────────────────────────────────────────────
 export async function resolve(specifier, context, nextResolve) {
@@ -83,7 +93,14 @@ export async function resolve(specifier, context, nextResolve) {
 }
 
 // ── Load hook ───────────────────────────────────────────────────────
+// Every result passes through the runtime-V8-flag scan before Node compiles it —
+// see transform-core `noteRuntimeV8FlagSource`. Awaited here because the
+// `nextLoad` branch of loadInner hands back a promise on this tier.
 export async function load(url, context, nextLoad) {
+  return noteRuntimeV8FlagSource(await loadInner(url, context, nextLoad));
+}
+
+async function loadInner(url, context, nextLoad) {
   // Import Text (attribute-keyed): honor `with { type: "text" }` on ANY extension,
   // checked BEFORE extension dispatch so `import s from "./c.yaml" with {type:"text"}`
   // returns the raw text, not parsed YAML. shortCircuits, so Node never runs its own
@@ -92,8 +109,16 @@ export async function load(url, context, nextLoad) {
   // fast-tier hook (preload-common.cjs) this ALWAYS polyfills, with no native
   // fall-through gate: native import-text is Node 26.5+, but the compat tier tops out
   // at Node 22.14, so a native-capable Node never reaches this loader worker.
-  if (context?.importAttributes?.type === "text") return loadTextImport(url);
+  // `isFileUrl` because this branch precedes extension dispatch and so is not covered
+  // by `extname`'s scheme gate; the polyfill reads the bytes off disk. Mirrors the
+  // fast-tier hook.
+  if (context?.importAttributes?.type === "text" && isFileUrl(url)) return loadTextImport(url);
   const ext = extname(url);
+  // A user loader above nub's assigned this TypeScript file a bare module format
+  // and will transform it itself from the raw source (tsx's pattern; see
+  // `outerHookOwnsFormat`). This tier has no registration counter like the fast
+  // tier's and needs none: nothing but such a hook produces the bare form here.
+  if (outerHookOwnsFormat(context?.format, ext) && !isDependency(url)) return nextLoad(url, context);
   // node_modules deps are NEVER transpiled (the byte-parity boundary). This guard is
   // make-or-break now that TRANSPILE_EXTS includes `.js`/`.mjs`/`.cjs`: without it,
   // the compat tier would route every dependency `.js` through oxc. (loadTranspile's

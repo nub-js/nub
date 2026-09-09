@@ -53,6 +53,9 @@ export function baseOptions(): BaseLayoutProps {
     },
     links: [
       { text: <NavLabel>Docs</NavLabel>, url: '/docs', active: 'nested-url' },
+      { text: <NavLabel>Toolbox</NavLabel>, url: '/#toolbox' },
+      { text: <NavLabel>Features</NavLabel>, url: '/#features' },
+      { text: <NavLabel>Benchmarks</NavLabel>, url: '/#latency' },
       { text: <NavLabel>Blog</NavLabel>, url: '/blog', active: 'nested-url' },
       githubPillLink(),
     ],
