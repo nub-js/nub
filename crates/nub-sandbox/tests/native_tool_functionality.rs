@@ -505,6 +505,11 @@ fn operations(
             assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "loaded");
         }
         "nuget" => {
+            let selected = run(tool, &["--version"], root, env, policy);
+            let version = String::from_utf8_lossy(&selected.stdout).trim().to_owned();
+            assert_ok(tool, "SDK selection", selected);
+            assert_eq!(version, "10.0.100", "fixture must use its pinned SDK");
+            eprintln!("NATIVE TOOL SELECTED SDK {version}");
             assert_ok(
                 tool,
                 "offline restore",

@@ -94,7 +94,13 @@ The [focused subprocess run](https://github.com/nubjs/nub/actions/runs/343698548
 
 On Server 2022, the same executables launch with inherited streams, piped stdin or regular-file streams. Opening `NUL` for stdin or stdout fails with OS error 5. Default Rust `Command::output()` fails, while changing only its stdin to an existing empty file succeeds. All seven configurations pass on Windows 11 arm64.
 
-This identifies a subprocess-setup failure without claiming the complete Cargo, uv or Composer workloads pass. The parent sandbox launcher can supply an existing handle; it cannot make an unmodified descendant's later `NUL` open succeed. The [diagnostic fixture](tests/windows_subprocess_diagnostics.rs) preserves the individual results rather than treating unsupported configurations as working.
+The parent sandbox launcher can supply an existing handle; it cannot make an unmodified descendant's later `NUL` open succeed. The [diagnostic fixture](tests/windows_subprocess_diagnostics.rs) preserves the individual results rather than treating unsupported configurations as working.
+
+### Windows 11 native tool sequences
+
+The [Windows 11 run](https://github.com/nubjs/nub/actions/runs/34405367987), at `04566d64c9`, exercises native toolchains separately from the Server results above. Cargo 1.91.1, Go 1.25.1 and Composer 2.8.12 pass their complete exact-grant and tool-directory sequences, as do their plain controls. Maven 3.9.11 and rustup 1.29.1 also pass. Gradle passes with the explicitly acknowledged network limitation; its two strict-policy cases refuse preparation.
+
+The runner is Windows 11 arm64. Cargo, Go and the JVM use x64 emulation with x64 MSVC libraries; .NET uses the ARM64 host. These results are not Server results or an all-ARM64 toolchain test. The .NET workload's `global.json` pins SDK 10.0.100, while the original provisioning metadata lists the runner's other installed SDKs too. Installing an SDK alone does not select it for a project.
 
 ## Nub build-jail coverage
 

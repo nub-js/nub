@@ -65,11 +65,11 @@ jobs:
         run: |
           set -o pipefail
           cargo clippy -p nub-sandbox --profile fast --test native_tool_functionality -- -D warnings 2>&1 | tee reports/clippy.log
-      - name: Exercising native tool families
+      - name: Verifying selected SDK and native operations
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: |
           set -o pipefail
-          cargo test -p nub-sandbox --profile fast --test native_tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-tools.log
+          cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_ -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-tools.log
       - name: Preserving Windows 11 tool evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

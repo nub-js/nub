@@ -123,11 +123,12 @@ async function installComposer() {
     .flatMap(file => [dirname(file), dirname(realpathSync(file))]);
   return { php, phar, root: composerRoot, configRoots: [...new Set(configRoots)] };
 }
-function entry(name, program, args, toolRoot, { prefix = [], runtimeRoots = [], toolEnv = {}, mavenSeed } = {}) {
-  const version = output(program, [...prefix, ...args], { env: { ...process.env, ...toolEnv } });
+function entry(name, program, args, toolRoot, { prefix = [], runtimeRoots = [], toolEnv = {}, mavenSeed, cwd } = {}) {
+  const version = output(program, [...prefix, ...args], { env: { ...process.env, ...toolEnv }, cwd });
   // The runner supplies rustup; record its exact version without updating the
   // engine's toolchain manager. Cargo itself uses the isolated pinned toolchain.
   if (pins[name] && !version.includes(pins[name])) throw new Error(`${name} version drift: expected ${pins[name]}, got ${version}`);
+  if (name === 'nuget' && version !== pins.nuget) throw new Error(`selected .NET SDK drift: ${version}`);
   return { name, program, prefix, version, toolRoot, runtimeRoots, toolEnv, mavenSeed, shell: windows && /\.(cmd|bat)$/i.test(program) };
 }
 
@@ -137,6 +138,9 @@ const go = await installGo();
 const jvm = await installJvmTools();
 const composer = await installComposer();
 const dotnet = find('dotnet');
+const dotnetVersionRoot = join(root, 'dotnet-version');
+mkdirSync(dotnetVersionRoot, { recursive: true });
+writeFileSync(join(dotnetVersionRoot, 'global.json'), `${JSON.stringify({ sdk: { version: pins.nuget, rollForward: 'disable' } })}\n`);
 const runtimeRoots = [process.env.JAVA_HOME, process.env.DOTNET_ROOT].filter(Boolean);
 if (runtimeRoots.length !== 2) throw new Error('JAVA_HOME and DOTNET_ROOT must be set by workflow setup actions');
 const runtimeEnv = { JAVA_HOME: process.env.JAVA_HOME, DOTNET_ROOT: process.env.DOTNET_ROOT };
@@ -146,7 +150,7 @@ const matrix = [
   entry('go', go.program, ['version'], go.root, { runtimeRoots: [go.root] }),
   entry('gradle', jvm.gradle.program, ['--version'], jvm.gradle.root, { runtimeRoots, toolEnv: runtimeEnv }),
   entry('maven', jvm.maven.program, ['--version'], jvm.maven.root, { runtimeRoots, toolEnv: runtimeEnv, mavenSeed: jvm.maven.seedRepository }),
-  entry('nuget', dotnet, ['--info'], process.env.DOTNET_ROOT, { runtimeRoots, toolEnv: runtimeEnv }),
+  entry('nuget', dotnet, ['--version'], process.env.DOTNET_ROOT, { runtimeRoots, toolEnv: runtimeEnv, cwd: dotnetVersionRoot }),
   entry('composer', composer.php, ['--version'], composer.root, { prefix: [composer.phar], runtimeRoots: [resolve(composer.php, '..'), ...composer.configRoots] }),
 ];
 const matrixFile = join(root, 'matrix.json');
