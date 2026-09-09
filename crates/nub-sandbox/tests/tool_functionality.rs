@@ -69,6 +69,11 @@ fn policy(root: &Path, fs: Value, extra_env: &[(&str, &str)]) -> nub_sandbox::Sa
     };
     fs.insert("./".into(), Value::String("rw".into()));
     fs.insert("$tmp".into(), Value::String("rw".into()));
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SANDBOX_DIAGNOSTIC_PROC_READ").is_some() {
+        eprintln!("DIAGNOSTIC ONLY: adding /proc read; not a normal tool-directory policy");
+        fs.insert("/proc".into(), Value::String("r".into()));
+    }
     let homes = Homes {
         home: root.join("home"),
         cache: root.join("cache"),
