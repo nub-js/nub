@@ -145,17 +145,30 @@ fn windows_cleanup_fixture() {
             }
         }
         "owner" => {
+            let start = Instant::now();
+            let stage = |label: &str| {
+                eprintln!(
+                    "CLEANUP_OWNER {} {label} {:?}",
+                    std::process::id(),
+                    start.elapsed()
+                );
+            };
+            stage("acquiring");
             let resource = plan(&root, "hold").acquire().unwrap();
+            stage("acquired");
             let child = resource
                 .spawn_with_stdio(WindowsStdio::Null, WindowsStdio::Null, WindowsStdio::Null)
                 .unwrap();
+            stage("spawned");
             let pid = child.id();
             wait_for(&root.join(format!("ready-{pid}")));
+            stage("child-ready");
             std::fs::write(
                 root.join(format!("owner-{}", std::process::id())),
                 format!("{}\n{pid}", resource.profile_name()),
             )
             .unwrap();
+            stage("owner-ready");
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).unwrap();
             drop(child);
