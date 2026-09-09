@@ -354,6 +354,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.rustup",
     "~/go",
     "~/Library/Caches/go-build",
+    "~/Library/Application Support/go",
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
@@ -363,6 +364,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/Library/Caches/composer",
     "~/Library/Application Support/Composer",
     "~/.config/git",
+    "~/.cache/git",
     "~/.git-credential-cache",
 ];
 
@@ -402,6 +404,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.rustup",
     "~/go",
     "~/AppData/Local/go-build",
+    "~/AppData/Roaming/go",
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
@@ -411,6 +414,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/AppData/Local/Composer",
     "~/AppData/Roaming/Composer",
     "~/.config/git",
+    "~/.cache/git",
     "~/.git-credential-cache",
 ];
 
@@ -446,6 +450,7 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.rustup",
     "~/go",
     "$cache/go-build",
+    "~/.config/go",
     "~/.gradle",
     "~/.m2",
     "~/.nuget",
@@ -455,12 +460,29 @@ const TOOLDIR_PATTERNS: &[&str] = &[
     "~/.composer",
     "~/.config/composer",
     "~/.config/git",
+    "~/.cache/git",
     "~/.git-credential-cache",
 ];
 
 /// File-shaped state is exact, rather than a subtree root: Git replaces the global config
 /// through its adjacent lock file, so both leaf names are needed without granting `~`.
-const TOOLDIR_FILE_PATTERNS: &[&str] = &["~/.gitconfig", "~/.gitconfig.lock", "~/.git-credentials"];
+const TOOLDIR_FILE_PATTERNS: &[&str] = &[
+    "~/.gitconfig",
+    "~/.gitconfig.lock",
+    "~/.git-credentials",
+    #[cfg(not(windows))]
+    "~/.mavenrc",
+    #[cfg(windows)]
+    "~/mavenrc.cmd",
+    #[cfg(windows)]
+    "~/mavenrc_pre.cmd",
+    #[cfg(windows)]
+    "~/mavenrc_post.cmd",
+    #[cfg(windows)]
+    "~/mavenrc_pre.bat",
+    #[cfg(windows)]
+    "~/mavenrc_post.bat",
+];
 
 /// The per-OS `$tooldirs` surface patterns (host OS == target OS).
 pub fn tooldir_patterns() -> &'static [&'static str] {
@@ -574,11 +596,16 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     ] {
         env_path(env, name, &mut paths);
     }
+    if env.get("GOENV").is_some_and(|value| value != "off") {
+        env_path(env, "GOENV", &mut paths);
+    }
     // Standard roots add their tool-specific children, never the whole root.
     env_subpaths(
         env,
         "XDG_CACHE_HOME",
-        &["nub", "pnpm", "yarn", "pip", "uv", "go-build", "composer"],
+        &[
+            "nub", "pnpm", "yarn", "pip", "uv", "go-build", "composer", "git",
+        ],
         &mut paths,
     );
     env_subpaths(
@@ -590,7 +617,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_subpaths(
         env,
         "XDG_CONFIG_HOME",
-        &["nub", "pnpm", "yarn", "pip", "uv", "composer", "git"],
+        &["nub", "pnpm", "yarn", "pip", "uv", "composer", "git", "go"],
         &mut paths,
     );
     env_subpaths(env, "XDG_STATE_HOME", &["pnpm"], &mut paths);
@@ -625,7 +652,7 @@ fn environment_tooldirs(env: &BTreeMap<String, String>) -> BTreeSet<String> {
         env,
         "APPDATA",
         &[
-            "nub", "npm", "Yarn", "pip", "Python", "uv", "NuGet", "Composer",
+            "nub", "npm", "Yarn", "pip", "Python", "uv", "NuGet", "Composer", "go",
         ],
         &mut paths,
     );
@@ -1029,6 +1056,19 @@ mod tests {
         assert!(
             matchers.iter().any(|m| m.contains("nub/pm")),
             "nub PM cache path missing from $tooldirs: {matchers:?}"
+        );
+    }
+
+    #[test]
+    fn go_environment_file_override_is_a_path_except_when_disabled() {
+        for value in ["", "off"] {
+            let env = BTreeMap::from([("GOENV".into(), value.into())]);
+            assert!(environment_tooldirs(&env).is_empty());
+        }
+        let env = BTreeMap::from([("GOENV".into(), "/fixture/go-env".into())]);
+        assert_eq!(
+            environment_tooldirs(&env),
+            BTreeSet::from(["/fixture/go-env".into()])
         );
     }
 

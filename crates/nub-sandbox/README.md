@@ -17,6 +17,12 @@ The engine compiles filesystem, network and environment permissions for native c
 
 Directory grants cover descendants. Overlapping positive grants combine: a read-only grant does not remove an existing write grant. Filesystem deny entries such as `!~/.ssh` are rejected; Nub does not translate them into sibling grants.
 
+The filesystem boolean `false` grants no authored paths; `true` requests unrestricted filesystem access. Backend runtime essentials still apply to a confined command. Prefer explicit paths for an allowlist:
+
+```json
+{"fs": {"./": "r", "./output": "rw", "$tmp": "rw"}, "net": false}
+```
+
 | Convenience | Meaning | Example |
 | --- | --- | --- |
 | `$home`, `~` | Home root supplied in `CompileCtx`. | `"$home/.config/tool": "r"` |
@@ -63,11 +69,11 @@ Examples of conventional roots:
 | pip | `~/.cache/pip`, `~/.config/pip`, `~/.pip`, `~/.local/lib` | `~/Library/Caches/pip`, `~/Library/Application Support/pip`, `~/.config/pip`, `~/.pip`, `~/Library/Python` | `~/AppData/Local/pip`, `~/AppData/Roaming/pip`, `~/pip`, `~/AppData/Roaming/Python` |
 | uv | `~/.cache/uv`, `~/.local/share/uv`, `~/.config/uv`, `~/.local/bin` | The Linux roots, plus legacy `~/Library/Caches/uv` and `~/Library/Application Support/uv` | `~/AppData/Local/uv`, `~/AppData/Roaming/uv`, `~/.local/bin` |
 | Cargo/rustup | `~/.cargo`, `~/.rustup` | `~/.cargo`, `~/.rustup` | `~/.cargo`, `~/.rustup` |
-| Go | `~/go`, `$cache/go-build` | `~/go`, `~/Library/Caches/go-build` | `~/go`, `~/AppData/Local/go-build` |
-| Gradle/Maven | `~/.gradle`, `~/.m2` | `~/.gradle`, `~/.m2` | `~/.gradle`, `~/.m2` |
+| Go | `~/go`, `$cache/go-build`, `~/.config/go` | `~/go`, `~/Library/Caches/go-build`, `~/Library/Application Support/go` | `~/go`, `~/AppData/Local/go-build`, `~/AppData/Roaming/go` |
+| Gradle/Maven | `~/.gradle`, `~/.m2`; file `~/.mavenrc` | Same | `~/.gradle`, `~/.m2`; files `~/mavenrc.cmd`, `~/mavenrc_pre.cmd`, `~/mavenrc_post.cmd` and legacy pre/post `.bat` files |
 | .NET/NuGet | `~/.dotnet`, `~/.nuget`, `~/.local/share/NuGet` | The Linux roots | `~/.dotnet`, `~/.nuget`, `~/AppData/Local/NuGet`, `~/AppData/Roaming/NuGet` |
 | Composer | `~/.cache/composer`, `~/.composer`, `~/.config/composer` | `~/.composer`, `~/Library/Caches/composer`, `~/Library/Application Support/Composer` | `~/AppData/Local/Composer`, `~/AppData/Roaming/Composer` |
-| Git | `~/.config/git`, `~/.git-credential-cache`; files `~/.gitconfig`, `~/.gitconfig.lock`, `~/.git-credentials` | Same | Same |
+| Git | `~/.config/git`, `~/.cache/git`, `~/.git-credential-cache`; files `~/.gitconfig`, `~/.gitconfig.lock`, `~/.git-credentials` | Same | Same |
 
 Documented environment locations are expanded from the compilation snapshot, including `NPM_CONFIG_CACHE`, `PNPM_HOME`, `YARN_CACHE_FOLDER`, `BUN_INSTALL`, `UV_CACHE_DIR`, `CARGO_HOME`, `GOPATH`, `GRADLE_USER_HOME`, `NUGET_PACKAGES` and `COMPOSER_HOME`. The set also includes tool-specific children of supplied XDG and Windows app-data roots. It does not execute tools, inspect PATH, parse their configuration files or scan the disk.
 
@@ -83,7 +89,7 @@ These values add grants alongside the conventional roots. They do not change the
 | pip/Python | `PIP_CACHE_DIR`, `PIP_CONFIG_FILE`, `PYTHONUSERBASE` |
 | uv | `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `UV_PYTHON_INSTALL_DIR`, `UV_PYTHON_BIN_DIR`, `UV_INSTALL_DIR`, `UV_PROJECT_ENVIRONMENT` |
 | Cargo/rustup | `CARGO_HOME`, `RUSTUP_HOME`, `CARGO_TARGET_DIR` |
-| Go | `GOPATH`, `GOMODCACHE`, `GOCACHE`, `GOBIN`, `GOTMPDIR` |
+| Go | `GOPATH`, `GOMODCACHE`, `GOCACHE`, `GOBIN`, `GOTMPDIR`, `GOENV` (except `off`) |
 | Gradle | `GRADLE_USER_HOME` |
 | .NET/NuGet | `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`, `NUGET_SCRATCH`, `NUGET_PLUGINS_CACHE_PATH`, `DOTNET_CLI_HOME`, `DOTNET_BUNDLE_EXTRACT_BASE_DIR` |
 | Composer | `COMPOSER_HOME`, `COMPOSER_CACHE_DIR`, `COMPOSER_VENDOR_DIR`, `COMPOSER_BIN_DIR` |

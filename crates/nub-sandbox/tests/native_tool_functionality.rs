@@ -120,6 +120,17 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
     if tool.name == "nuget" {
         std::fs::create_dir_all(nuget_config(root)).expect("NuGet user configuration root");
     }
+    if tool.name == "maven" {
+        let rc = if cfg!(windows) {
+            "@echo loaded> \"%USERPROFILE%\\..\\project\\mavenrc-loaded\"\r\n"
+        } else {
+            "printf loaded > \"$HOME/../project/mavenrc-loaded\"\n"
+        };
+        std::fs::write(maven_config(root), rc).expect("Maven user startup file");
+    }
+    if tool.name == "go" {
+        std::fs::create_dir_all(go_config(root)).expect("Go user configuration root");
+    }
     if let Some(seed) = &tool.maven_seed {
         copy_directory(seed, &home.join(".m2/repository"));
     }
@@ -131,6 +142,24 @@ fn nuget_config(root: &Path) -> PathBuf {
         "home/AppData/Roaming/NuGet"
     } else {
         "home/.nuget/NuGet"
+    })
+}
+
+fn maven_config(root: &Path) -> PathBuf {
+    root.join(if cfg!(windows) {
+        "home/mavenrc_pre.cmd"
+    } else {
+        "home/.mavenrc"
+    })
+}
+
+fn go_config(root: &Path) -> PathBuf {
+    root.join(if cfg!(windows) {
+        "home/AppData/Roaming/go"
+    } else if cfg!(target_os = "macos") {
+        "home/Library/Application Support/go"
+    } else {
+        "home/config/go"
     })
 }
 
@@ -187,6 +216,15 @@ fn policy(
         if tool.name == "nuget" {
             fs.insert(
                 nuget_config(root).to_string_lossy().into(),
+                Value::String("rw".into()),
+            );
+        }
+        if tool.name == "maven" {
+            insert_read(&mut fs, &maven_config(root));
+        }
+        if tool.name == "go" {
+            fs.insert(
+                go_config(root).to_string_lossy().into(),
                 Value::String("rw".into()),
             );
         }
@@ -391,6 +429,23 @@ fn operations(
             run(tool, &["show", "home"], root, env, policy),
         ),
         "go" => {
+            assert_ok(
+                tool,
+                "user configuration write",
+                run(
+                    tool,
+                    &["env", "-w", "GONOPROXY=example.invalid"],
+                    root,
+                    env,
+                    policy,
+                ),
+            );
+            let config = run(tool, &["env", "GONOPROXY"], root, env, policy);
+            assert!(config.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&config.stdout).trim(),
+                "example.invalid"
+            );
             assert_ok(tool, "cold build", run(tool, &["build"], root, env, policy));
             assert_ok(tool, "warm build", run(tool, &["build"], root, env, policy));
             assert_ok(
@@ -439,11 +494,15 @@ fn operations(
                 "cold validate",
                 run(tool, &["-o", "validate"], root, env, policy),
             );
+            let marker = root.join("project/mavenrc-loaded");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "loaded");
+            std::fs::remove_file(&marker).unwrap();
             assert_ok(
                 tool,
                 "warm clean",
                 run(tool, &["-o", "clean"], root, env, policy),
             );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "loaded");
         }
         "nuget" => {
             assert_ok(

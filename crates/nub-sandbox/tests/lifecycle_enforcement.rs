@@ -226,9 +226,12 @@ fn tool_roots(root: &std::path::Path) -> Vec<PathBuf> {
     let roots = [
         "omitted/.cache/nub",
         "omitted/.config/nub",
+        "omitted/.cache/git",
         "relocated-cache/nub",
+        "relocated-cache/git",
         "relocated-data/nub/store",
         "relocated-config/nub",
+        "relocated-config/go",
         "relocated-store",
     ];
     #[cfg(windows)]

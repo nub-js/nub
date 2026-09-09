@@ -245,7 +245,7 @@ fn managed_tmp_and_user_denies_fail_loudly() {
 }
 
 #[test]
-fn fs_false_remains_the_explicit_axis_off_form() {
+fn fs_false_grants_no_authored_paths() {
     let policy = compile(&json!({"fs": false}), &ctx(&[])).expect("fs false compiles");
     assert_eq!(
         policy.fs.rules.default_effect,

@@ -58,15 +58,10 @@ pub fn fold_fs(value: &Value, ctx: &CompileCtx, path: &str) -> Result<FsPolicy, 
         entries: Vec::new(),
         default_effect: Effect::Deny,
     };
-    // Throwaway-tmp mode. `$tmp` (and any `$tmp/subpath`) is a SENTINEL for the specially-
-    // provisioned per-run PRIVATE dir — a subpath maps INTO that dir, never the shared system
-    // tmp — so its value is a plain fs permission: a truthy grant (`"r"`/`"rw"`/`true`) →
-    // `Private` (fresh per-run dir, shared tmp hidden); `false` → `Deny` (no tmp). The backend
-    // owns the private-dir creation + whole-subtree grant + shared-tmp denial at spawn time (the
-    // session path is not knowable at compile time), so a `$tmp`-prefixed entry sets only the
-    // MODE and emits no ordinary fs rule. Shared system tmp is a SEPARATE literal path, reached
-    // only by granting `/tmp` — never via this sentinel; `Shared` (the default when `$tmp` is
-    // absent) means "no tmp confinement, host tmp per fs rules".
+    // `$tmp` selects session-owned private storage, not a path known at compilation.
+    // It accepts rw/true or false; read-only access and suffixes are rejected because
+    // the backend grants the whole private subtree. Shared (when the token is absent)
+    // leaves the host temp location subject to the ordinary filesystem rules.
     let mut tmp = TmpMode::Shared;
     match value {
         // `true` fully relaxes the axis; `false` fully denies it.
