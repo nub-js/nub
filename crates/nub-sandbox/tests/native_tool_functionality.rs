@@ -186,6 +186,10 @@ fn policy(
     tooldirs: bool,
 ) -> nub_sandbox::SandboxPolicy {
     let mut fs = Map::new();
+    if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
+        let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
+        fs.insert(adapter, Value::String("r".into()));
+    }
     if tooldirs {
         fs.insert("$tooldirs".into(), Value::String("rw".into()));
     } else {
@@ -606,6 +610,30 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     let env = env_for(root.path(), &tool);
     write_projects(root.path());
     let policy = tooldirs.map(|value| policy(root.path(), &tool, env.clone(), value));
+    #[cfg(windows)]
+    if let Some(policy) = &policy {
+        let secret = root.path().join("withheld");
+        std::fs::write(&secret, "WITHHELD").unwrap();
+        let sandbox = Sandbox::acquire(policy).unwrap();
+        let output = tool_output::output(
+            sandbox
+                .prepare(
+                    CommandSpec::new(std::env::var_os("COMSPEC").unwrap())
+                        .args(["/d", "/c", "type", secret.to_str().unwrap()])
+                        .cwd(root.path().join("project"))
+                        .redact_stdout(true)
+                        .redact_stderr(true),
+                )
+                .unwrap(),
+        );
+        assert!(!output.status.success(), "canary exposed: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Access is denied"),
+            "{output:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("WITHHELD"));
+        eprintln!("NATIVE_CANARY_DENIED {output:?}");
+    }
     operations(name, &tool, root.path(), &env, policy.as_ref());
 }
 

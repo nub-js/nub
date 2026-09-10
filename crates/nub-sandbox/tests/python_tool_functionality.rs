@@ -111,6 +111,10 @@ fn policy(root: &Path, fs: Value, env: BTreeMap<String, String>) -> nub_sandbox:
         Value::Object(entries) => entries,
         _ => panic!("fixture filesystem policy must be an object"),
     };
+    if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
+        let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
+        fs.insert(adapter, Value::String("r".into()));
+    }
     fs.insert("./".into(), Value::String("rw".into()));
     fs.insert("$tmp".into(), Value::String("rw".into()));
     let homes = Homes {

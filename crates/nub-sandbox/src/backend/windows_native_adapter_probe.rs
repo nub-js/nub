@@ -9,6 +9,20 @@ use std::process::Command;
 
 const CHILD: &str = "backend::windows_native_adapter_probe::native_adapter_child";
 
+pub(crate) fn inject_probe(pid: u32) -> std::io::Result<()> {
+    let adapter = std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_DIR")
+        .ok_or_else(|| std::io::Error::other("native adapter directory missing"))?;
+    let output = Command::new(Path::new(&adapter).join("injector.exe"))
+        .arg(pid.to_string())
+        .arg(Path::new(&adapter).join("probe.dll"))
+        .output()?;
+    eprintln!("ADAPTER_INJECT {output:?}");
+    if !output.status.success() {
+        return Err(std::io::Error::other("native adapter injection failed"));
+    }
+    Ok(())
+}
+
 #[test]
 fn native_adapter_child() {
     let Ok(file) = std::env::var("NUB_ADAPTER_PROBE_FILE") else {
@@ -129,16 +143,7 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
                     WindowsStdio::Piped,
                     |pid| {
                         if mode == "adapter" {
-                            let output = Command::new(Path::new(&adapter).join("injector.exe"))
-                                .arg(pid.to_string())
-                                .arg(Path::new(&adapter).join("probe.dll"))
-                                .output()?;
-                            eprintln!("ADAPTER_INJECT {output:?}");
-                            if !output.status.success() {
-                                return Err(std::io::Error::other(
-                                    "native adapter injection failed",
-                                ));
-                            }
+                            inject_probe(pid)?;
                         }
                         Ok(())
                     },
@@ -154,14 +159,15 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
             let stdout = std::thread::spawn(move || read(Box::new(stdout)));
             let stderr = std::thread::spawn(move || read(Box::new(stderr)));
             let start = std::time::Instant::now();
+            let mut timed_out = false;
             let status = loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     break status;
                 }
                 if start.elapsed() > std::time::Duration::from_secs(30) {
                     child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("native adapter child timed out");
+                    timed_out = true;
+                    break child.wait().unwrap();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
@@ -170,10 +176,17 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
             drop(prepared);
             sandbox.close();
             cleanup().unwrap();
+            let stdout = stdout.join().unwrap();
+            let stderr = stderr.join().unwrap();
+            assert!(
+                !timed_out,
+                "native adapter child timed out: {}",
+                String::from_utf8_lossy(&stderr)
+            );
             std::process::Output {
                 status,
-                stdout: stdout.join().unwrap(),
-                stderr: stderr.join().unwrap(),
+                stdout,
+                stderr,
             }
         };
         eprintln!("ADAPTER_CONTROL {mode} {output:?}");

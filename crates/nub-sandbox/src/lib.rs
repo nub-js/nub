@@ -34,7 +34,16 @@
 //! Windows also rejects an already-shared working root that would defeat its allowlist.
 //!
 pub mod arm;
+// Reuse the integration fixtures in the test-only native adapter experiment.
+#[cfg(all(test, windows))]
+extern crate self as nub_sandbox;
 pub mod backend;
+#[cfg(all(test, windows))]
+#[path = "../tests/native_tool_functionality.rs"]
+mod native_tool_functionality_probe;
+#[cfg(all(test, windows))]
+#[path = "../tests/python_tool_functionality.rs"]
+mod python_tool_functionality_probe;
 // The catalog PARSER is compiled into the crate only for the dev-only override; `build.rs`
 // pulls the same file in with `#[path]` and always runs it. A shipped build therefore
 // contains no catalog-parsing code at all — the strongest form of "the dev path is absent,

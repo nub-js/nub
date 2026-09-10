@@ -2449,6 +2449,15 @@ pub(super) mod launch {
         }
 
         pub(crate) fn spawn(&self) -> io::Result<WindowsChild> {
+            #[cfg(test)]
+            if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
+                return self.spawn_before_resume(
+                    WindowsStdio::Inherit,
+                    self.plan.stdout,
+                    self.plan.stderr,
+                    crate::backend::windows_native_adapter_probe::inject_probe,
+                );
+            }
             self.spawn_with_stdio(WindowsStdio::Inherit, self.plan.stdout, self.plan.stderr)
         }
 
