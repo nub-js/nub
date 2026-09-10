@@ -8,12 +8,6 @@ import { BlogTOC } from './blog-toc';
 
 type BlogPage = NonNullable<ReturnType<typeof blog.getPage>>;
 
-/**
- * Shared renderer for a blog post, used by both /blog/[slug] and the
- * /blog/hn/[slug] variant that middleware serves for `?hn` visits.
- * `titleOverride` swaps the headline server-side; everything else is
- * identical.
- */
 export function PostArticle({
   page,
   titleOverride,
@@ -22,7 +16,6 @@ export function PostArticle({
   titleOverride?: string;
 }) {
   const MDXContent = page.data.body;
-
   const hasToc = page.data.toc.length > 0;
 
   return (
@@ -90,7 +83,6 @@ export function postMetadata(page: BlogPage, titleOverride?: string): Metadata {
   return {
     title,
     description,
-    // The hn variant canonicalizes to the real post URL too.
     alternates: { canonical: page.url },
     openGraph: {
       type: 'article',

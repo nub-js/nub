@@ -1,1488 +1,242 @@
 import Link from 'next/link';
-import type { ReactNode } from 'react';
-import { InstallTabs } from '@/components/install-tabs';
-import { MigrationPrompt, ViewRepoLink } from '@/components/migration-prompt';
-import { Terminal, Source, BenchBars } from '@/components/code';
-import { ToolkitTabs } from '@/components/toolkit-tabs';
-import { StarNudge } from '@/components/star-nudge';
 import { getLatestNode } from '@/lib/node-version';
 import { START_PROMPT } from '@/lib/start-prompt';
+import { MigrationPrompt, ViewRepoLink } from '@/components/migration-prompt';
+import { StarNudge } from '@/components/star-nudge';
+import { SmoothScroll } from '@/components/smooth-scroll';
+import {
+  HeroInstallCommand,
+  HeroQuickCommands,
+  HeroInteractiveStudio,
+  RealWorldProductionParallax,
+  CrossRuntimeCompatBenchmark,
+  ModernApisGrid,
+  ComplexityCurveChart,
+  AsymmetricBentoGrid,
+  PMConfigMatrixTable,
+  CommunityTestimonials,
+  FaqAccordion,
+  PreFooterCTA,
+} from '@/components/landing-showcase';
 
-export default function HomePage() {
-  return (
-    <div className="relative w-full overflow-x-hidden">
-      <Hero />
-      <Toolkit />
-      {/* Temporarily hidden: <VideoFeature /> */}
-      <RunFileBand />
-      <RunScriptBand />
-      <NubxBand />
-      <HypermanagerBand />
-      <FinalCta />
-      <Footer />
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------ Video feature */
-
-function VideoFeature() {
-  return (
-    <section className="border-b border-fd-border" aria-labelledby="video-heading">
-      <Container className="py-20 md:py-28">
-        <div className="mx-auto max-w-5xl">
-          <div className="mx-auto mb-8 max-w-2xl text-center">
-            <h2
-              id="video-heading"
-              className="text-balance font-display text-3xl font-medium leading-tight md:text-4xl"
-            >
-              Watch Nub in action
-            </h2>
-            <p className="mt-4 text-lg text-fd-muted-foreground">
-              A video walkthrough by our friends at{' '}
-              <a
-                href="https://www.youtube.com/@betterstack"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-fd-foreground underline decoration-dotted decoration-fd-muted-foreground/50 underline-offset-4 hover:decoration-fd-muted-foreground"
-              >
-                Better Stack
-              </a>
-              .
-            </p>
-          </div>
-          <div className="overflow-hidden rounded-xl border border-fd-border bg-black shadow-2xl shadow-black/20">
-            <iframe
-              className="block aspect-video w-full"
-              src="https://www.youtube-nocookie.com/embed/6YRpXxbtc2c?start=2"
-              title="An Ex-Bun Dev Just Built The Anti-Bun (Nub)"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-              referrerPolicy="strict-origin-when-cross-origin"
-              loading="lazy"
-              allowFullScreen
-            />
-          </div>
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-/* --------------------------------------------------------------- primitives */
-
-function Container({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <div className={`mx-auto w-full max-w-7xl px-6 ${className}`}>{children}</div>;
-}
-
-function Mono({ children }: { children: ReactNode }) {
-  // 0.95em — Geist Mono set a tick under x-height parity with Encode Sans so the
-  // token reads in-scale with the sentence rather than a hair large (same value as
-  // inline `code` in global.css).
-  return <span className="font-mono text-[0.95em] tracking-[-0.005em] text-fd-foreground">{children}</span>;
-}
-
-/* An external link to upstream docs (Node, oxc). Neutral underline that brightens
-   on hover; opens in a new tab. Wrap a <Mono> inside for a linked code term. */
-function DocLink({ href, children }: { href: string; children: ReactNode }) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="underline decoration-dotted decoration-fd-muted-foreground/50 underline-offset-4 hover:decoration-fd-muted-foreground"
-    >
-      {children}
-    </a>
-  );
-}
-
-/* Inline code sized for a display heading: monospace, a touch smaller than the
-   serif around it, with a faint tinted pill so a command reads as a command. */
-function HeadingCode({ children }: { children: ReactNode }) {
-  return (
-    <code className="rounded-md border border-fd-border/70 bg-fd-muted/40 px-2 py-0.5 align-[-0.035em] font-mono text-[0.66em] font-normal tracking-tight text-fd-foreground">
-      {children}
-    </code>
-  );
-}
-
-type Accent = 'ember' | 'acid' | 'sky' | 'orchid' | 'pink';
-const ACCENT_TEXT: Record<Accent, string> = {
-  ember: 'text-ember',
-  acid: 'text-acid',
-  sky: 'text-sky',
-  orchid: 'text-orchid',
-  pink: 'text-pink',
-};
-const ACCENT_PILL: Record<Accent, string> = {
-  ember: 'border-ember/40 text-ember',
-  acid: 'border-acid/40 text-acid',
-  sky: 'border-sky/40 text-sky',
-  orchid: 'border-orchid/40 text-orchid',
-  pink: 'border-pink/40 text-pink',
-};
-
-/* The centered top-of-band header: a command pill + serif title + subhead. */
-function BandHeader({
-  command,
-  title,
-  subhead,
-  accent,
-  showDollar = true,
-}: {
-  command: string;
-  title: ReactNode;
-  subhead: ReactNode;
-  accent: Accent;
-  showDollar?: boolean;
-}) {
-  return (
-    <div className="mx-auto max-w-3xl text-center">
-      <div
-        className={`inline-flex items-center gap-2 rounded-full border bg-fd-card/50 px-4 py-1.5 font-mono text-sm ${ACCENT_PILL[accent]}`}
-      >
-        {showDollar ? <span aria-hidden>$</span> : null}
-        <span>{command}</span>
-      </div>
-      <h2 className="mt-6 text-balance font-display text-4xl font-medium leading-[1.05] tracking-tight md:text-5xl">
-        {title}
-      </h2>
-      <p className="mx-auto mt-5 max-w-2xl text-balance text-lg leading-relaxed text-fd-muted-foreground">
-        {subhead}
-      </p>
-    </div>
-  );
-}
-
-/* A subsection inside a band: small prose column + a visual, alternating side. */
-function Feature({
-  eyebrow,
-  title,
-  body,
-  visual,
-  accent,
-  reverse = false,
-}: {
-  eyebrow: string;
-  title: ReactNode;
-  body: ReactNode;
-  visual: ReactNode;
-  accent: Accent;
-  reverse?: boolean;
-}) {
-  return (
-    <div className="grid items-center gap-12 py-14 lg:grid-cols-2">
-      <div className={`min-w-0 ${reverse ? 'lg:order-2' : ''}`}>
-        <p className={`eyebrow ${ACCENT_TEXT[accent]}`}>{eyebrow}</p>
-        <h3 className="mt-3 text-balance font-display text-2xl font-medium leading-snug md:text-3xl">
-          {title}
-        </h3>
-        <p className="mt-4 text-pretty text-lg leading-relaxed text-fd-muted-foreground">
-          {body}
-        </p>
-      </div>
-      <div className={`min-w-0 ${reverse ? 'lg:order-1' : ''}`}>{visual}</div>
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------- Hero variants */
-
-const heroLines = (major: string) => [
-  { cmd: 'nub index.ts', comment: 'TypeScript-first Node.js runtime' },
-  { cmd: 'nub run dev', comment: '24× faster pnpm run' },
-  { cmd: 'nubx prisma generate', comment: '19× faster npx' },
-  { cmd: 'nub install', comment: '5× faster pnpm install' },
-  { cmd: 'nub watch src/server.ts', comment: 'native watch mode' },
-  { cmd: 'nub pm shim', comment: 'built-in Corepack-style shims' },
-  { cmd: `nub node install ${major}`, comment: 'Node version manager' },
-];
-
-function HeroPill() {
-  return (
-    <Link
-      href="/blog/nub-0-7-0"
-      className="group inline-flex max-w-full items-center gap-2 rounded-full border border-fd-border bg-fd-card/50 py-1 pl-1 pr-3 text-sm leading-none text-fd-muted-foreground hover:border-ember/50"
-    >
-      {/* flex items-center centers all three optically (verified to <0.25px against the
-          pill center); no manual vertical nudges. The title is the only shrinkable
-          child — `max-w-full` bounds the pill to the hero column and `min-w-0` lets
-          the title shrink below its intrinsic width, so a narrow viewport ellipsizes
-          it instead of wrapping the pill to two lines. Badge and arrow stay whole. */}
-      <span className="shrink-0 rounded-full bg-ember px-2.5 py-0.5 font-mono text-[0.7rem] font-medium uppercase tracking-wider text-[#fffdf8] dark:text-[#160c08]">
-        New
-      </span>
-      <span className="min-w-0 truncate text-fd-foreground">
-        Nub v0.7 — nub.jsonc, Varlock support, Promise.allKeyed, and more
-      </span>
-      <span
-        aria-hidden
-        className="shrink-0 text-fd-muted-foreground transition-transform group-hover:translate-x-0.5"
-      >
-        →
-      </span>
-    </Link>
-  );
-}
-
-function HeroH1({ className = '' }: { className?: string }) {
-  return (
-    <h1
-      className={`text-balance font-display font-medium leading-[1.2] tracking-tight text-fd-foreground ${className}`}
-    >
-      The <span className="italic text-ember">all-in-one</span> Node.js toolkit
-    </h1>
-  );
-}
-
-function HeroSub({ className = '' }: { className?: string }) {
-  return (
-    <p
-      className={`text-balance text-lg leading-[1.75] text-fd-muted-foreground md:text-xl ${className}`}
-    >
-      A TypeScript-first toolchain for Node.js. Run TypeScript files,{' '}
-      <Mono>package.json</Mono>{' '}scripts, and local CLIs on the{' '}
-      <span className="text-fd-foreground">node</span>{' '}and package manager you already
-      have. No new runtime, no lock-in.
-    </p>
-  );
-}
-
-async function Hero() {
+export default async function HomePage() {
   const node = await getLatestNode();
+
   return (
-    <section className="relative border-b border-fd-border">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0 opacity-50"
-        style={{
-          background:
-            'radial-gradient(55% 50% at 50% -5%, rgba(255,93,59,0.16), transparent 70%)',
-        }}
-      />
-      {/* Handwritten "Leave a star" annotation in the hero's top-right; its arrow
-          swoops up to the star pill in the bar above. Mounted here but PORTALS to
-          <body> so it renders over the nav (escaping the hero's stacking context);
-          only the home route mounts it. Optional — see StarNudge. */}
+    <div className="relative w-full overflow-x-clip bg-[#0c0a09] text-zinc-100 selection:bg-ember selection:text-white font-sans">
+      {/* Silky smooth momentum scrolling powered by Lenis */}
+      <SmoothScroll />
+
+      {/* Handwritten "Leave a star" annotation that swoops up to the nav's GitHub star pill */}
       <StarNudge />
-      {/* Wider than the rest of the page (smaller gutters) so the H1 has room
-          and never breaks past 3 lines. Stacks to one column below xl. */}
-      <div className="relative mx-auto flex min-h-[calc(100svh-3.5rem)] w-full max-w-[88rem] items-center px-6 py-16 sm:px-8">
-        <div className="grid w-full items-center gap-12 xl:grid-cols-[minmax(0,1fr)_minmax(640px,1fr)] xl:gap-12">
-          <div className="min-w-0">
-            <HeroPill />
-            {/* Fluid in the 2-col zone: the xl grid squeezes the heading column to
-                ~528px at the 1280 boundary, where a flat 48px wraps to 4 lines.
-                clamp() scales the type with the viewport so it stays ≤3 lines through
-                the squeeze, then caps at 48px once there's room. Single-column (<xl)
-                keeps the flat 4xl/5xl — the heading is full-width there. */}
-            <HeroH1 className="mt-6 text-4xl md:text-5xl xl:text-[clamp(2.3rem,3vw,3rem)]" />
-            <HeroSub className="mt-6" />
-            <div className="mt-9">
-              <InstallTabs />
-            </div>
-            <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2">
-              <MigrationPrompt prompt={START_PROMPT} />
-              <ViewRepoLink />
-            </div>
-          </div>
-          <Terminal size="lg" className="w-full min-w-0 max-w-2xl xl:max-w-none" lines={heroLines(node.major)} />
-        </div>
-      </div>
-    </section>
-  );
-}
 
-/* ------------------------------------------------------------------- Toolkit */
-
-/* Replaces the old "pile" section: a color-coded, auto-advancing overview of the
-   four commands, introducing the accent system each band below reuses. The
-   interactive tabs live in the ToolkitTabs client component. */
-async function Toolkit() {
-  const node = await getLatestNode();
-  return (
-    <section className="border-b border-fd-border">
-      <Container className="py-28 md:py-[180px]">
-        <div className="mx-auto max-w-2xl text-center">
-          <p className="eyebrow text-fd-muted-foreground">The toolchain</p>
-          <h2 className="mt-3 text-balance font-display text-3xl font-medium leading-tight md:text-4xl">
-            An all-in-one toolkit for Node.js
-          </h2>
-          <p className="mt-4 text-balance text-lg leading-relaxed text-fd-muted-foreground">
-            One Rust binary to run your files and scripts, install dependencies, and
-            manage Node itself.
-          </p>
-        </div>
-        <div className="mt-10">
-          <ToolkitTabs node={node} />
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-/* ----------------------------------------------------------- Band: nub <file> */
-
-async function RunFileBand() {
-  const node = await getLatestNode();
-  return (
-    <section className="border-b border-fd-border">
-      <Container className="py-32 md:py-[180px]">
-        <BandHeader
-          command={'nub <file>'}
-          title="A TypeScript-first Node.js"
-          subhead={
-            <>
-              Nub adds support for TypeScript, JSX, decorators, <Mono>.env</Mono>{' '}files,
-              YAML/TOML imports, and modern syntax and APIs on top of stock Node. Flag-for-flag
-              compatible with <Mono>node</Mono>. Powered by Rust and oxc.
-            </>
-          }
-          accent="ember"
-        />
-
-        <div className="mt-10 divide-y divide-fd-border/60">
-          <Feature
-            accent="ember"
-            eyebrow="Architecture"
-            title="Transpiles in Rust, runs on real Node"
-            body={
-              <>
-                Nub transpiles your code in memory with{' '}
-                <DocLink href="https://oxc.rs">oxc</DocLink>{' '}
-                (compiled into a{' '}
-                <DocLink href="https://nodejs.org/api/n-api.html">native Node addon</DocLink>) and
-                runs the output on the stock{' '}
-                <Mono>node</Mono>{' '}binary. There&rsquo;s no Nub runtime, just real Node.
-                Runs on Node.js 18 LTS and newer.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub app.ts' },
-                  { out: '# oxc transpiles in memory, then stock node runs it' },
-                  { out: `running on node v${node.full}` },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            reverse
-            eyebrow="TypeScript-first"
-            title="Full TypeScript support, not just type stripping"
-            body={
-              <>
-                Recent versions of Node support{' '}
-                <DocLink href="https://nodejs.org/api/typescript.html">type stripping</DocLink>,
-                which erases annotations but rejects non-erasable syntax. Nub&rsquo;s load hook
-                transpiles each file through its native addon instead, so enums, parameter
-                properties, and extensionless imports that Node doesn&rsquo;t allow all just work.
-              </>
-            }
-            visual={
-              <Source
-                lang="tsx"
-                code={`import { Model } from "./base"   // extensionless → ./base.ts
-
-enum Status { Draft, Sent, Paid }
-
-class Invoice extends Model {
-  constructor(public status = Status.Draft) {} // parameter property
-}`}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            eyebrow="tsconfig"
-            title="Respects your tsconfig.json"
-            body={
-              <>
-                Nub resolves your <Mono>tsconfig.json</Mono>{' '}(including{' '}
-                <Mono>{'"extends"'}</Mono>) and feeds its <Mono>paths</Mono>{' '}into Node&rsquo;s own
-                resolver through a{' '}
-                <DocLink href="https://nodejs.org/api/module.html#moduleregisterhooksoptions">
-                  <Mono>module.registerHooks()</Mono>
-                </DocLink>{' '}resolve hook. No more <Mono>tsconfig-paths</Mono>{' '}or disagreement
-                between Node.js and your editor.
-              </>
-            }
-            visual={
-              <Source
-                lang="json"
-                code={`// tsconfig.json
-{
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"],
-      "@db": ["src/db/index.ts"]
-    }
-  }
-}`}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            reverse
-            eyebrow="Environment"
-            title="Loads .env files automatically"
-            body={
-              <>
-                Nub reads <Mono>.env</Mono>, <Mono>.env.local</Mono>, and{' '}
-                <Mono>.env.[NODE_ENV]</Mono>{' '}and injects them before Node starts. No{' '}
-                <Mono>dotenv</Mono>{' '}required. Automatic var expansion via{' '}
-                <Mono>{'${VAR}'}</Mono>{' '}just like Vite and Next.js.
-              </>
-            }
-            visual={
-              <Source
-                lang="bash"
-                code={`# .env
-APP=acme
-DATABASE_URL=postgres://localhost/\${APP}_dev
-
-# No dotenv. No cross-env. No import "dotenv/config".
-$ nub server.ts`}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            eyebrow="Modern syntax"
-            title={<>Decorators, JSX, and <HeadingCode>using</HeadingCode></>}
-            body={
-              <>
-                Nub supports decorators and JSX, transpiling it according to your{' '}
-                <Mono>tsconfig.json</Mono>{' '}settings. Full support for{' '}
-                <DocLink href="https://www.typescriptlang.org/tsconfig/#emitDecoratorMetadata">
-                  <Mono>emitDecoratorMetadata</Mono>
-                </DocLink>{' '}and explicit resource management, no build step required.
-              </>
-            }
-            visual={
-              <Source
-                lang="tsx"
-                code={`await using db = await connect()    // disposed at scope end
-
-@sealed                             // legacy decorator
-class User {}
-
-const view = <Hello name="world" /> // JSX in .tsx`}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            reverse
-            eyebrow="Loaders"
-            title="Import JSON, YAML, and TOML"
-            body={
-              <>
-                Import <Mono>.yml</Mono>, <Mono>.yaml</Mono>, <Mono>.toml</Mono>,{' '}
-                <Mono>.json5</Mono>, and <Mono>.jsonc</Mono>{' '}files directly. A{' '}
-                <DocLink href="https://nodejs.org/api/module.html#moduleregisterhooksoptions">
-                  <Mono>module.registerHooks()</Mono>
-                </DocLink>{' '}load hook routes them through fast Rust parsers in Nub&rsquo;s native
-                addon, resolving each import to a plain JavaScript object. (Oh, <Mono>.txt</Mono>{' '}works too)
-              </>
-            }
-            visual={
-              <Source
-                lang="ts"
-                code={`import config from "./config.yaml"   // parsed object
-import flags  from "./feature.jsonc" // comments stripped
-import pkg    from "./Cargo.toml"    // parsed object
-import prompt from "./prompt.txt"    // string
-
-const { host, port } = config        // destructure fields`}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            eyebrow="Auto-restart"
-            title="A dependency-aware watch mode"
-            body={
-              <>
-                Powered by{' '}
-                <DocLink href="https://nodejs.org/api/cli.html#--watch">
-                  <Mono>node --watch</Mono>
-                </DocLink>, Nub&rsquo;s <Mono>watch</Mono>{' '}command
-                watches for changes to your entrypoint or any file transitively imported.
-                It also adds TypeScript/JSX sourcemap support and watches your <Mono>package.json</Mono>, tsconfigs, and{' '}
-                <Mono>.env</Mono>{' '}files.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub watch src/server.ts' },
-                  { out: 'Listening on http://localhost:3000' },
-                  { out: ' ' },
-                  { out: '↺ src/db.ts changed — restarting' },
-                  { out: 'Listening on http://localhost:3000' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            reverse
-            eyebrow="Node version management"
-            title="Auto-installs Node, on demand"
-            body={
-              <>
-                Nub reads your <Mono>.node-version</Mono>, <Mono>.nvmrc</Mono>, or{' '}
-                <Mono>engines</Mono>/<Mono>devEngines</Mono>{' '}pin and runs your code on exactly
-                that version. If it isn&rsquo;t on your machine, Nub downloads it from nodejs.org,
-                verifies the checksum, and installs it on the fly — replacing <Mono>nvm</Mono>{' '}
-                and <Mono>fnm</Mono>. You can also{' '}
-                <Link
-                  href="/docs/node"
-                  className="underline decoration-dotted decoration-fd-muted-foreground/50 underline-offset-4 hover:decoration-fd-muted-foreground"
-                >
-                  manage versions manually
-                </Link>.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: `echo ${node.major} > .node-version` },
-                  { cmd: 'nub hello.ts' },
-                  { out: `Using Node.js ${node.full} (resolved from .node-version)` },
-                  { out: 'Installed in 9.8s' },
-                  { out: 'Hello world!' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            eyebrow="Performance"
-            title="Negligible overhead over plain Node"
-            body={
-              <>
-                Nub transpiles each file in memory through its native Rust addon, then runs it on
-                the real <Mono>node</Mono>{' '}binary. Its own startup is a few milliseconds of Rust,
-                dwarfed by Node&rsquo;s, so a <Mono>.ts</Mono>{' '}file starts up on par with plain{' '}
-                <Mono>node</Mono>{' '}and about 2.9× faster than <Mono>tsx</Mono>, which loads esbuild
-                and its loader hooks on every run.
-              </>
-            }
-            visual={
-              <div className="nub-code-panel rounded-xl border p-6">
-                {/* Source: benchmarks/results.md "Direct TS execution". */}
-                <p className="nub-code-muted mb-5 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  run a TypeScript file · macOS
-                </p>
-                <BenchBars
-                  accent="ember"
-                  max={128}
-                  rows={[
-                    { cmd: 'node hello.ts', ms: 44 },
-                    { cmd: 'nub hello.ts', ms: 44, us: true },
-                    { cmd: 'tsx hello.ts', ms: 128, ratio: 2.9 },
-                  ]}
-                />
-                <a
-                  href="https://github.com/nubjs/nub/blob/main/benchmarks/results.md#direct-ts-execution-nub-hellots-vs-node-vs-tsx-vs-bun"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="nub-code-link nub-code-muted mt-3 inline-block py-1.5 font-mono text-[0.7rem] uppercase tracking-[0.14em] underline decoration-dotted underline-offset-4"
-                >
-                  View bench →
-                </a>
-              </div>
-            }
-          />
-
-          <Compatibility />
-
-          <Feature
-            accent="ember"
-            reverse
-            eyebrow="truly drop-in"
-            title={<>Flag-for-flag compatible with <HeadingCode>node</HeadingCode></>}
-            body={
-              <>
-                Nub is <span className="italic">actually</span> a drop-in replacement for{' '}
-                <Mono>node</Mono>. Every V8 and Node flag, <Mono>NODE_OPTIONS</Mono>, argv, exit
-                codes, and signals behave identically — Nub forwards them straight to the real{' '}
-                <Mono>node</Mono>{' '}it runs. Swap <Mono>node</Mono>{' '}for <Mono>nub</Mono>{' '}in
-                any script, Dockerfile, or CI step; nothing else changes.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  {
-                    cmd: `NODE_OPTIONS='--enable-source-maps' nub \\
-  --max-old-space-size=8192 \\
-  --import ./instrument.js \\
-  app.ts --port 3000`,
-                  },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="ember"
-            eyebrow="No Nub-specific APIs"
-            title="Zero lock-in"
-            body={
-              <>
-                Nub is <span className="text-fd-foreground">not a runtime</span>. Your code is
-                run using stock <Mono>node</Mono>. Nub simply transpiles your code, polyfills
-                missing global APIs, sets some flags, and makes additive modifications to
-                Node&rsquo;s module resolution to improve TypeScript support.
-              </>
-            }
-            visual={
-              <ul className="space-y-3">
-                {RULES.map((rule) => (
-                  <li
-                    key={rule}
-                    className="flex items-center gap-3 border-b border-fd-border/60 pb-3 font-mono text-sm text-fd-foreground"
-                  >
-                    <span className="text-ember" aria-hidden>✗</span>
-                    {rule}
-                  </li>
-                ))}
-              </ul>
-            }
-          />
-
-          <ModernApis />
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-/* Modern web-platform + TC39 APIs and syntax. */
-const APIS: { name: string; label: string }[] = [
-  { name: 'Web Workers', label: 'Auto-polyfilled' },
-  { name: 'Temporal', label: 'Polyfilled < 26' },
-  { name: 'URLPattern', label: 'Polyfilled < 24' },
-  { name: 'WebSocket', label: 'Unflagged < 22' },
-  { name: 'navigator.locks', label: 'Auto-polyfilled' },
-  { name: 'localStorage', label: 'Auto-unflagged' },
-  { name: 'using / await using', label: 'Transpiled' },
-  { name: 'node:sqlite', label: 'Unflagged < 23' },
-  { name: 'vm.Module', label: 'Auto-unflagged' },
-  { name: 'RegExp.escape', label: 'Polyfilled < 24' },
-  { name: 'Promise.try', label: 'Polyfilled < 24' },
-  { name: 'Float16Array', label: 'Polyfilled < 24' },
-];
-
-function ModernApis() {
-  return (
-    <div className="py-14">
-      <div className="mx-auto max-w-2xl text-center">
-        <p className="eyebrow text-ember">Forward compatibility</p>
-        <h3 className="mt-3 text-balance font-display text-2xl font-medium md:text-3xl">
-          Modern APIs and syntax, fully supported
-        </h3>
-        <p className="mt-4 text-balance text-lg leading-relaxed text-fd-muted-foreground">
-          Nub polyfills APIs like{' '}
-          <DocLink href="https://tc39.es/proposal-temporal/"><Mono>Temporal</Mono></DocLink>{' '}and{' '}
-          <DocLink href="https://developer.mozilla.org/en-US/docs/Web/API/Worker"><Mono>Worker</Mono></DocLink>, adds
-          support for new ECMAScript syntax like{' '}
-          <DocLink href="https://github.com/tc39/proposal-explicit-resource-management"><Mono>using</Mono></DocLink>, and unflags all
-          experimental Node.js features.
-        </p>
-      </div>
-      <div className="mt-10 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-        {APIS.map((api) => (
-          <div
-            key={api.name}
-            className="rounded-lg border border-fd-border bg-fd-card/40 px-4 py-3.5"
-          >
-            <div className="font-mono text-sm text-fd-foreground">{api.name}</div>
-            <div className="mt-1 font-mono text-[0.7rem] uppercase tracking-wider text-fd-muted-foreground">
-              {api.label}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------ Band: nub run */
-
-function RunScriptBand() {
-  return (
-    <section className="border-b border-fd-border">
-      <Container className="py-32 md:py-[180px]">
-        <BandHeader
-          command="nub run"
-          title={<>A 24× faster <HeadingCode>pnpm run</HeadingCode></>}
-          subhead={
-            <>
-              A drop-in for <Mono>npm run</Mono>{' '}and <Mono>pnpm run</Mono>{' '}with lifecycle
-              hooks, <Mono>npm_*</Mono>{' '}env vars, and arg forwarding, without the
-              JS startup these Node-based tools pay on every call.
-            </>
-          }
-          accent="acid"
-        />
-
-        <div className="mt-10 divide-y divide-fd-border/60">
-          <Feature
-            accent="acid"
-            eyebrow="Performance"
-            title="Run package.json scripts at the speed of Rust"
-            body={
-              <>
-                Whereas scripts run with <Mono>npm run</Mono>{' '}or <Mono>pnpm run</Mono>{' '}feel
-                perceptibly laggy — they&rsquo;re Node.js programs, so each call cold-loads the
-                package manager&rsquo;s own JavaScript (config, workspace probe, the works) before
-                your script runs — Nub&rsquo;s runner is a Rust binary with no startup of its own.
-              </>
-            }
-            visual={
-              <div className="nub-code-panel rounded-xl border p-6">
-                {/* Source: tests/bench/script-runner, warm script-dispatch bench, M1 Max, Node v26.2.0, hyperfine 50 runs. */}
-                <p className="nub-code-muted mb-5 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  script dispatch · warm · 50 runs · macOS
-                </p>
-                <BenchBars
-                  accent="acid"
-                  max={442.7}
-                  rows={[
-                    { cmd: 'nub run', ms: 14.7, us: true },
-                    { cmd: 'node --run', ms: 32.2, ratio: 2.2 },
-                    { cmd: 'npm run', ms: 329.9, ratio: 22 },
-                    { cmd: 'pnpm run', ms: 442.7, ratio: 30 },
-                  ]}
-                />
-                <a
-                  href="https://github.com/nubjs/nub/tree/main/tests/bench/script-runner"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="nub-code-link nub-code-muted mt-3 inline-block py-1.5 font-mono text-[0.7rem] uppercase tracking-[0.14em] underline decoration-dotted underline-offset-4"
-                >
-                  View bench →
-                </a>
-              </div>
-            }
-          />
-
-          <Feature
-            accent="acid"
-            reverse
-            eyebrow="Drop-in for pnpm run"
-            title={<>Flag-for-flag compatible with <HeadingCode>pnpm run</HeadingCode></>}
-            body={
-              <>
-                Nub accepts <Mono>pnpm run</Mono>&rsquo;s flags with the same spelling and
-                semantics, down to the obscure recursive ones. Swap <Mono>pnpm</Mono>{' '}for{' '}
-                <Mono>nub</Mono>{' '}and your CI scripts run unchanged, only faster.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub run build', comment: 'plain script run' },
-                  { cmd: 'nub run test -- --coverage', comment: 'pass args through' },
-                  { cmd: 'nub -r --if-present lint', comment: 'skip packages without it' },
-                  { cmd: 'nub -r --parallel --no-bail test', comment: 'all at once, collect all results' },
-                  { cmd: 'nub -r --resume-from @org/api --stream build', comment: 'CI restart, streamed' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="acid"
-            eyebrow="Workspaces"
-            title="Monorepo-friendly"
-            body={
-              <>
-                Nub implements pnpm&rsquo;s <Mono>--filter</Mono>{' '}grammar and{' '}
-                <Mono>-r</Mono>, reading workspaces from <Mono>package.json#workspaces</Mono>{' '}
-                or <Mono>pnpm-workspace.yaml</Mono>. Your existing filter commands work unchanged.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub -r run build', comment: 'every package, topo-ordered' },
-                  { cmd: 'nub --filter @org/api dev', comment: 'one package' },
-                  { cmd: 'nub --filter ...@org/web build', comment: '+ its deps' },
-                  { cmd: 'nub --filter "[main]" test', comment: 'changed since main' },
-                ]}
-              />
-            }
-          />
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-/* --------------------------------------------------------------- Band: nubx */
-
-function NubxBand() {
-  return (
-    <section className="border-b border-fd-border">
-      <Container className="py-32 md:py-[180px]">
-        <BandHeader
-          command="nubx"
-          title={<>A 19× faster <HeadingCode>npx</HeadingCode></>}
-          subhead={
-            <>
-              The <Mono>nubx</Mono>{' '}command resolves <Mono>node_modules/.bin</Mono>{' '}in Rust
-              and execs the binary directly — no Node process in the wrapper. A drop-in for{' '}
-              <Mono>npx</Mono>{' '}and <Mono>pnpm dlx</Mono>: it runs a local bin, or fetches an
-              uninstalled one from the registry.
-            </>
-          }
-          accent="sky"
-        />
-
-        <div className="mt-10 divide-y divide-fd-border/60">
-          <Feature
-            accent="sky"
-            eyebrow="Performance"
-            title="Makes commands feel instantaneous"
-            body={
-              <>
-                When invoking native CLIs like <Mono>esbuild</Mono>, <Mono>npx</Mono>{' '}
-                itself (written in JS) adds a noticeable 200ms of cold-start latency, even
-                when running a CLI command that&rsquo;s instantaneous. Nub walks{' '}
-                <Mono>node_modules/.bin</Mono>{' '}and execs the binary directly.
-              </>
-            }
-            visual={
-              <div className="nub-code-panel rounded-xl border p-6">
-                {/* Source: benchmarks/results.md "Bin runner". */}
-                <p className="nub-code-muted mb-5 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  esbuild --version · macOS
-                </p>
-                <BenchBars
-                  accent="sky"
-                  max={226}
-                  rows={[
-                    { cmd: 'nubx esbuild --version', ms: 11, us: true },
-                    { cmd: 'pnpm exec esbuild --version', ms: 191, ratio: 17 },
-                    { cmd: 'npx esbuild --version', ms: 226, ratio: 19 },
-                  ]}
-                />
-                <a
-                  href="https://github.com/nubjs/nub/blob/main/benchmarks/results.md#bin-runner-nubx--nub-exec-vs-pnpm-exec-vs-npx"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="nub-code-link nub-code-muted mt-3 inline-block py-1.5 font-mono text-[0.7rem] uppercase tracking-[0.14em] underline decoration-dotted underline-offset-4"
-                >
-                  View bench →
-                </a>
-              </div>
-            }
-          />
-
-          <Feature
-            accent="sky"
-            reverse
-            eyebrow="Drop-in for pnpm exec"
-            title={<>Flag-for-flag compatible with <HeadingCode>pnpm exec</HeadingCode></>}
-            body={
-              <>
-                The <Mono>nubx</Mono>{' '}and <Mono>nub exec</Mono>{' '}commands take{' '}
-                <Mono>pnpm exec</Mono>&rsquo;s flags, and <Mono>nub dlx</Mono>{' '}matches{' '}
-                <Mono>pnpm dlx</Mono>, shell mode included. Swap <Mono>pnpm</Mono>{' '}for{' '}
-                <Mono>nub</Mono>{' '}and the command you already know runs.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub exec -r tsc --build', comment: 'across the workspace' },
-                  { cmd: 'nub exec --parallel vitest', comment: 'every package at once' },
-                  { cmd: "nub dlx -p cowsay -c 'cowsay hi | tr a-z A-Z'", comment: 'dlx shell mode' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="sky"
-            eyebrow="Resolution"
-            title="Works with any package manager"
-            body={
-              <>
-                Nub resolves a locally-installed CLI from{' '}<Mono>node_modules/.bin</Mono>{' '}
-                regardless of which package manager put it there — so you get Nub's
-                performance without switching package managers.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nubx eslint .', comment: "member's .bin first" },
-                  { cmd: 'nubx prisma generate', comment: 'then workspace root' },
-                  { cmd: 'nubx tsc --noEmit', comment: 'then ancestors' },
-                  { cmd: 'nubx --node some-cli', comment: 'run under plain Node' },
-                ]}
-              />
-            }
-          />
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-/* ------------------------------------------------------------ Compatibility */
-
-/* Source: tests/cross-runtime/results.json `scores.denoExclusions`, using Node 26.7.0's own test tree (tests/node-suite at v26.7.0) with Deno's directory set and config skips applied. Rate = the share of the tests real Node passes that this runtime ALSO passes, so numerator and denominator come from the same set. Do NOT recompute it as runtime_pass / node_pass: that draws the numerator from a larger set than the denominator and reads high (98.8 vs 98.6 for nub on the same June data). */
-const COMPAT = [
-  { name: 'Node 26.7', rate: 100, tests: '4,690 / 4,690', us: false, dim: false },
-  { name: 'Nub', rate: 98.4, tests: '4,613 / 4,690', us: true, dim: false },
-  { name: 'Deno 2.9', rate: 72.4, tests: '3,397 / 4,690', us: false, dim: true },
-  { name: 'Bun 1.4', rate: 68.5, tests: '3,214 / 4,690', us: false, dim: true },
-];
-
-function Compatibility() {
-  return (
-    <div className="py-14">
-        <div className="mx-auto max-w-2xl text-center">
-          <h3 className="text-balance font-display text-2xl font-medium leading-snug md:text-3xl">
-            Node.js compatibility benchmark
-          </h3>
-          <p className="mt-5 text-balance text-lg leading-relaxed text-fd-muted-foreground">
-            Your code is transpiled and executed with the stock <Mono>node</Mono>{' '}binary, so it
-            runs on real Node, not a reimplementation. That&rsquo;s where the compatibility comes from.
-          </p>
-        </div>
-
-        <div className="mx-auto mt-12 max-w-3xl space-y-5">
-          {COMPAT.map((r) => {
-            // Short bars can't fit the label inside the fill (it gets clipped),
-            // so for anything under ~22% the label sits just outside the fill.
-            const labelInside = r.rate >= 22;
-            return (
-              <div key={r.name} className="grid grid-cols-[5.5rem_1fr_auto] items-center gap-3 sm:grid-cols-[7.5rem_1fr_auto] sm:gap-4">
-                <span className={`font-mono text-sm ${r.us ? 'font-semibold text-ember' : 'text-fd-foreground'}`}>
-                  {r.name}
-                </span>
-                <div className="flex h-8 items-center overflow-hidden rounded-md bg-fd-card/50">
-                  <div
-                    className={`flex h-full shrink-0 items-center justify-end pr-3 ${r.us ? 'bg-ember/85' : r.dim ? 'bg-fd-foreground/15' : 'bg-fd-foreground/25'}`}
-                    style={{ width: `${r.rate}%` }}
-                  >
-                    {labelInside ? (
-                      <span className={`font-mono text-xs font-medium ${r.us ? 'text-fd-primary-foreground' : 'text-fd-foreground'}`}>
-                        {r.rate}%
-                      </span>
-                    ) : null}
-                  </div>
-                  {labelInside ? null : (
-                    <span className="ml-2 font-mono text-xs font-medium text-fd-foreground">
-                      {r.rate}%
-                    </span>
-                  )}
-                </div>
-                <span className="font-mono text-xs tabular-nums text-fd-muted-foreground">{r.tests}</span>
-              </div>
-            );
-          })}
-        </div>
-        <p className="mx-auto mt-6 max-w-lg text-center text-sm leading-relaxed text-fd-muted-foreground">
-          Node 26.7&rsquo;s own test suite under Deno&rsquo;s compatibility lens, scored against stock Node. Most of Nub&rsquo;s 77 misses are tests that assert on machinery Nub installs itself &mdash; the permission model, module-loader hooks, the test runner, the compile cache &mdash; or on stack and output snapshots its preload changes.<br/>
-          <a
-            href="https://github.com/nubjs/nub/tree/main/tests/cross-runtime"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-fd-muted-foreground underline decoration-dotted decoration-fd-muted-foreground/60 underline-offset-4 hover:text-fd-foreground"
-          >
-            View benchmark repo
-          </a>
-        </p>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ Lock-in */
-
-const RULES = [
-  'No Nub global',
-  'No nub:* module namespace',
-  'No @nub/* npm scope',
-  'No "nub" field in package.json',
-  'No nub-named lockfile',
-];
-
-/* -------------------------------------------------------------- Final CTA */
-
-/* ----------------------------------------------------------- Built-in package manager */
-
-/* Per-config-field support across package managers. Cells derive directly from
-   crates/nub-cli/src/pm_engine/config_scope.rs and pm_engine/mod.rs — do NOT
-   edit a cell without changing the code it mirrors. Exception: the
-   `packageExtensions` row has no pm_engine dialect-scoping (no per-PM conflict);
-   the nub=yes cell is grounded in the embedded aube engine, which honors a
-   top-level `packageExtensions` natively (vendor/aube/crates/aube-manifest/src/lib.rs
-   `package_extensions()` → resolver package_ext.rs). Same for `allowScripts` — a real
-   npm field (top-level package.json, npm 12; RFC npm/rfcs#868) that the engine reads at
-   the manifest root (vendor/aube/crates/aube-manifest/src/lib.rs ROOT_ALLOW_SCRIPTS_KEY).
-   pnpm=no because pnpm's own map is `allowBuilds` in pnpm-workspace.yaml, which nub
-   still reads under a pnpm incumbent — a different field, so a different row's claim.
-   Both bun=no cells verified: zero refs in bun source + docs.
-   `trustedDependencies` is nub=no on purpose: `honors_trusted_dependencies` returns
-   true for Role::Bun ALONE (config_scope.rs, asserted for every other role), so under
-   its own identity nub reads the neutral `allowScripts` and ignores bun's branded field.
-   `catalog:` is yarn=yes for berry — `role_honors_catalog` honors Role::Yarn at major>=2
-   (pm_engine/mod.rs); only a `1.x` pin refuses. Version-gated cells show the modern
-   line's truth, same as npm=yes for `overrides` (which npm gained in 8.3). Legend:
-     yes  — honored
-     no   — ignored
-     —    — n/a
-   Notes encode the version gates the code enforces. */
-const PM_COLUMNS = ['npm', 'pnpm', 'yarn', 'bun', 'nub'] as const;
-type Cell = 'yes' | 'no' | 'na';
-const PM_MATRIX: { field: ReactNode; cells: Record<(typeof PM_COLUMNS)[number], Cell> }[] = [
-  {
-    field: <><Mono>workspaces</Mono></>,
-    cells: { npm: 'yes', pnpm: 'yes', yarn: 'yes', bun: 'yes', nub: 'yes' },
-  },
-  {
-    field: <><Mono>overrides</Mono></>,
-    cells: { npm: 'yes', pnpm: 'no', yarn: 'no', bun: 'yes', nub: 'yes' },
-  },
-  {
-    field: <><Mono>resolutions</Mono></>,
-    cells: { npm: 'no', pnpm: 'yes', yarn: 'yes', bun: 'yes', nub: 'yes' },
-  },
-  {
-    field: <><Mono>catalog:</Mono></>,
-    cells: { npm: 'no', pnpm: 'yes', yarn: 'yes', bun: 'yes', nub: 'yes' },
-  },
-  {
-    field: <><Mono>packageExtensions</Mono></>,
-    cells: { npm: 'no', pnpm: 'yes', yarn: 'yes', bun: 'no', nub: 'yes' },
-  },
-  {
-    field: <><Mono>allowScripts</Mono></>,
-    cells: { npm: 'yes', pnpm: 'no', yarn: 'no', bun: 'no', nub: 'yes' },
-  },
-  {
-    field: <><Mono>trustedDependencies</Mono></>,
-    cells: { npm: 'no', pnpm: 'no', yarn: 'no', bun: 'yes', nub: 'no' },
-  },
-  {
-    field: <><Mono>.npmrc</Mono></>,
-    cells: { npm: 'yes', pnpm: 'yes', yarn: 'yes', bun: 'yes', nub: 'yes' },
-  },
-];
-
-function PMMatrix() {
-  const glyph = (c: Cell) =>
-    c === 'yes' ? (
-      <span className="text-pink">●</span>
-    ) : c === 'no' ? (
-      <span className="nub-code-muted opacity-45">○</span>
-    ) : (
-      <span className="nub-code-muted opacity-35">—</span>
-    );
-  return (
-    <div className="nub-code-panel overflow-x-auto rounded-xl border">
-      <table className="w-full border-collapse text-left font-mono text-sm">
-        <thead>
-          <tr className="nub-code-separator border-b">
-            <th className="nub-code-muted px-4 py-3 font-normal">config field</th>
-            {PM_COLUMNS.map((pm) => (
-              <th
-                key={pm}
-                className={`px-4 py-3 text-center font-normal ${pm === 'nub' ? 'text-pink' : 'nub-code-muted'}`}
-              >
-                {pm}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {PM_MATRIX.map((row, i) => (
-            <tr key={i} className="nub-code-row-border border-b last:border-0">
-              <td className="nub-code-fg px-4 py-3">{row.field}</td>
-              {PM_COLUMNS.map((pm) => (
-                <td key={pm} className="px-4 py-3 text-center">
-                  {glyph(row.cells[pm])}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function HypermanagerBand() {
-  return (
-    <section className="border-b border-fd-border">
-      <Container className="py-32 md:py-[180px]">
-        <BandHeader
-          command="nub install"
-          title={
-            <>
-              A <span className="text-pink">5×</span> faster pnpm
-            </>
-          }
-          subhead={
-            <>
-              A pnpm-compatible package manager, built in. It reads the lockfile your project
-              already has — <Mono>pnpm</Mono>, <Mono>npm</Mono>, or <Mono>bun</Mono> — writes the
-              same format back, and is hardened against supply-chain attacks out of the box.
-              Powered by the{' '}
-              <a
-                href="https://github.com/jdx/aube"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-fd-muted-foreground underline decoration-dotted decoration-fd-muted-foreground/60 underline-offset-4 hover:text-fd-foreground hover:decoration-fd-foreground"
-              >
-                aube
-              </a>{' '}
-              engine.
-            </>
-          }
-          accent="pink"
-        />
-
-        <div className="mt-10 divide-y divide-fd-border/60">
-          <Feature
-            accent="pink"
-            eyebrow="Meta package manager"
-            title="Change package managers, keep your lockfile."
-            body={
-              <>
-                Nub autodetects your current manager and updates your existing lockfile in
-                place. No migration needed. Verified roundtrip compatibility for{' '}
-                <Mono>package-lock.json</Mono>, <Mono>pnpm-lock.yaml</Mono>, and <Mono>bun.lock</Mono>.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub install', comment: 'npm  package-lock.json → in place' },
-                  { cmd: 'nub install', comment: 'pnpm pnpm-lock.yaml    → in place' },
-                  { cmd: 'nub install', comment: 'bun  bun.lock          → in place' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="pink"
-            reverse
-            eyebrow="Drop-in for pnpm"
-            title={<>Drop-in <HeadingCode>pnpm</HeadingCode> compatibility</>}
-            body={
-              <>
-                Every package-manager command accepts pnpm&rsquo;s flags with the same spelling
-                and semantics, down to advanced features like the workspace catalog. Swap{' '}
-                <Mono>pnpm</Mono>{' '}for <Mono>nub</Mono>{' '}and your commands run unchanged.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { out: '# exact pin · devDeps · workspace catalog' },
-                  { cmd: 'nub add -E -D --save-catalog react' },
-                  { cmd: 'nub install --frozen-lockfile --prefer-offline --node-linker hoisted' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="pink"
-            eyebrow="Install speed"
-            title="Ultrafast installs"
-            body={
-              <>
-                Like pnpm, Nub keeps package files in a global content-addressed store and links
-                them into{' '}<Mono>node_modules</Mono>. The default layout relinks one symlink per
-                package instead of one hardlink per file, so a warm install scales with package
-                count, not file count. Nub embeds{' '}
-                <DocLink href="https://github.com/jdx/aube">aube</DocLink>, a highly optimized
-                Rust-based resolver and linker.
-              </>
-            }
-            visual={
-              <div className="nub-code-panel rounded-xl border p-6">
-                {/* Source: `large` fixture (1168 packages, 81398 files), warm + frozen + offline, node_modules wiped between runs; hyperfine, 25 runs / 6 warmup, near-idle ubuntu-latest CI. Linux is the honest shared primitive: bun and nub's hoisted mode both link with per-file hardlinks there (macOS forces both onto clonefile). The hoisted row is bun's exact layout + syscall — the same-regime bar; the default row adds the O(packages) GVS relink. bun 1.3.14, pnpm 10.34.4, npm on Node 24. */}
-                <p className="nub-code-muted mb-5 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  warm frozen install · 1168 packages · Linux
-                </p>
-                <BenchBars
-                  accent="pink"
-                  max={12945}
-                  unit="ms"
-                  rows={[
-                    { cmd: 'nub', ms: 346, us: true },
-                    { cmd: 'nub (hoisted)', ms: 1461, ratio: 4.2 },
-                    { cmd: 'bun', ms: 1896, ratio: 5.5 },
-                    { cmd: 'pnpm', ms: 3453, ratio: 10 },
-                    { cmd: 'npm', ms: 12945, ratio: 37.4 },
-                  ]}
-                />
-                <p className="nub-code-muted mt-4 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  ubuntu-latest · hyperfine, 25 runs ·{' '}
-                  <a
-                    href="https://github.com/nubjs/nub/blob/main/tests/bench/install/README.md"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="nub-code-link underline decoration-dotted underline-offset-4"
-                  >
-                    methodology →
-                  </a>
-                </p>
-              </div>
-            }
-          />
-
-          <Feature
-            accent="pink"
-            reverse
-            eyebrow="Config compatibility"
-            title="Mirrors your package manager's config rules"
-            body={
-              <>
-                Nub supports all the listed configuration mechanisms, but toggles them on and off
-                based on the conventions of your project&rsquo;s inferred package manager. There is
-                no Nub-specific configuration file.
-              </>
-            }
-            visual={<PMMatrix />}
-          />
-
-          <Feature
-            accent="pink"
-            eyebrow="Supply-chain safe by default"
-            title="Hardened against supply-chain attacks"
-            body={
-              <>
-                The defenses are on out of the box, no config required. Nub treats dependency
-                build scripts as <Mono>deny-by-default</Mono>, queries OSV for malicious-package
-                advisories on every fresh resolve, refuses a version whose publish trust evidence
-                weakened against an earlier release, and holds back releases younger than{' '}
-                <Mono>minimumReleaseAge</Mono> (24h, matching pnpm) so a freshly-compromised
-                version isn&rsquo;t pulled in.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub add @ledgerhq/connect-kit' },
-                  {
-                    out: 'Error: refusing to add malicious package(s):',
-                    tone: 'error',
-                  },
-                  {
-                    out: '  - @ledgerhq/connect-kit (MAL-2023-8697:',
-                    tone: 'error',
-                  },
-                  {
-                    out: '      https://osv.dev/vulnerability/MAL-2023-8697)',
-                    tone: 'error',
-                  },
-                  { out: '  ❌ code=ERR_NUB_MALICIOUS_PACKAGE', tone: 'error' },
-                  { out: '' },
-                  { cmd: 'nub install', comment: 'a version that lost its provenance' },
-                  {
-                    out: 'Error: trust downgrade for nanoid@3.3.14 (trustPolicy=',
-                    tone: 'error',
-                  },
-                  {
-                    out: '  no-downgrade): earlier published version 3.3.7 had',
-                    tone: 'error',
-                  },
-                  {
-                    out: '  provenance attestation but this version has no trust evidence',
-                    tone: 'error',
-                  },
-                  { out: '  ❌ code=ERR_NUB_TRUST_DOWNGRADE', tone: 'error' },
-                ]}
-              />
-            }
-          />
-
-          <Feature
-            accent="pink"
-            reverse
-            eyebrow="Deny-by-default build scripts"
-            title={<>Build scripts don&rsquo;t run until you allow them</>}
-            body={
-              <>
-                Install-time <Mono>postinstall</Mono> scripts are where most supply-chain payloads
-                land. Nub skips them by default, names what it skipped, and waits for{' '}
-                <Mono>nub approve-builds</Mono>. A curated default-trust floor can vouch for a
-                package only after it clears provenance, advisory, and cooling gates.
-              </>
-            }
-            visual={
-              <Terminal
-                lines={[
-                  { cmd: 'nub install' },
-                  {
-                    out: 'WARN ignored build scripts for 1 package(s): esbuild@0.21.5.',
-                    tone: 'error',
-                  },
-                  {
-                    out: '     Run `nub approve-builds` to review and enable them.',
-                  },
-                  { out: '     code=WARN_NUB_IGNORED_BUILD_SCRIPTS' },
-                  { out: '' },
-                  { cmd: 'nub approve-builds', comment: 'review + allow, once' },
-                ]}
-              />
-            }
-          />
-        </div>
-      </Container>
-    </section>
-  );
-}
-
-async function FinalCta() {
-  return (
-    <section className="relative border-b border-fd-border">
+      {/* Top Ambient Hero Radial Glow & Subtle Grid Pattern with Nub Ember & Acid Accents */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 opacity-60"
+        className="pointer-events-none absolute inset-x-0 top-0 h-[750px] opacity-60 z-0"
         style={{
-          background:
-            'radial-gradient(50% 60% at 50% 120%, rgba(255,93,59,0.14), transparent 70%)',
+          background: 'radial-gradient(ellipse 60% 50% at 50% 0%, rgba(255, 93, 59, 0.16), rgba(79, 225, 115, 0.05) 40%, transparent 70%)',
         }}
       />
-      <Container className="relative py-32 text-center md:py-[180px]">
-        <img
-          src="/icon.svg"
-          alt=""
-          width={40}
-          height={40}
-          className="mx-auto mb-8 h-10 w-10 rounded-[12px] ring-1 ring-white/10"
-        />
-        <h2 className="text-balance font-display text-4xl font-medium leading-[1.05] md:text-6xl">
-          The all-in-one toolkit for Node.js
-        </h2>
-        <div className="mt-10 flex flex-col items-center gap-4">
-          <InstallTabs className="mx-auto" />
-          <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 effect-grid-bg opacity-20 z-0"
+      />
+
+      {/* ----------------------------------------------------------- 1. MONUMENTAL HERO */}
+      <section className="relative z-10 pt-16 pb-20 md:pt-24 md:pb-28 border-b border-[#2e2a25]">
+        <div className="w-[85%] mx-auto text-center">
+          {/* Eyebrow / Release Pill */}
+          <Link
+            href="/blog/introducing-nub"
+            className="group inline-flex items-center gap-2 rounded-full border border-[#38332c] bg-[#141210] py-1 pl-3 pr-4 text-[11px] font-mono tracking-wider uppercase text-zinc-400 hover:border-ember/60 hover:text-white transition-all shadow-sm mb-8"
+          >
+            <span className="inline-block h-2 w-2 rounded-full bg-ember animate-pulse" />
+            <span className="text-zinc-200 font-semibold">Nub 0.7</span>
+            <span className="text-zinc-600">—</span>
+            <span className="truncate">Release Notes</span>
+            <span aria-hidden className="text-zinc-500 group-hover:translate-x-0.5 transition-transform">
+              →
+            </span>
+          </Link>
+
+          {/* Sharp & Curvy Headline: Bricolage Grotesque + Newsreader Italic */}
+          <h1 className="font-display text-4xl sm:text-6xl md:text-[68px] font-bold tracking-tight leading-[1.06] text-white text-balance max-w-5xl mx-auto">
+            The all-in-one toolkit that{' '}
+            <span className="font-serif italic font-normal text-ember">augments</span>{' '}
+            Node.js
+            <span className="text-ember">.</span>
+          </h1>
+
+          {/* Subtitle */}
+          <p className="mx-auto mt-6 max-w-3xl text-pretty text-sm sm:text-base md:text-lg text-zinc-400 leading-relaxed font-normal">
+            A TypeScript-first toolchain for Node.js. Run TypeScript files, package.json scripts, and local CLIs on stock Node with zero config, zero lock-in, and 24× faster performance.
+          </p>
+
+          {/* Install Command Bar */}
+          <div className="mt-10">
+            <HeroInstallCommand />
+          </div>
+
+          {/* Agent migration & GitHub Links */}
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-xs font-mono text-zinc-500">
             <MigrationPrompt prompt={START_PROMPT} />
+            <span className="text-zinc-800 hidden sm:inline">|</span>
             <ViewRepoLink />
           </div>
+
+          {/* Quick 7-Command Overview Deck */}
+          <HeroQuickCommands />
+
+          {/* Tabbed Interactive Studio */}
+          <HeroInteractiveStudio />
         </div>
-      </Container>
-    </section>
-  );
-}
+      </section>
 
-/* A footer link column: a small heading + a list of internal/external links. */
-function FooterCol({ title, links }: { title: string; links: [label: string, href: string][] }) {
-  return (
-    <div>
-      <p className="text-sm font-medium text-fd-foreground">{title}</p>
-      <ul className="mt-4 space-y-2.5">
-        {links.map(([label, href]) => (
-          <li key={href}>
-            {href.startsWith('http') ? (
-              <a href={href} className="text-sm text-fd-muted-foreground hover:text-fd-foreground">
-                {label}
-              </a>
-            ) : (
-              <Link href={href} className="text-sm text-fd-muted-foreground hover:text-fd-foreground">
-                {label}
-              </Link>
-            )}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
+      {/* ----------------------------------------------------------- 2. REAL PRODUCTION SYSTEMS (Scroll-locked Horizontal Parallax) */}
+      <section className="relative z-10 border-b border-[#2e2a25] bg-[#0e0c0a]/50">
+        <RealWorldProductionParallax />
+      </section>
 
-function Footer() {
-  const year = new Date().getFullYear();
-  return (
-    <footer className="border-t border-fd-border">
-      <Container className="py-14">
-        <div className="grid gap-10 sm:grid-cols-2 md:grid-cols-[2fr_1fr_1fr]">
-          <div className="max-w-xs">
-            <span className="font-display text-lg text-fd-foreground">
-              nub<span className="text-ember">.</span>
+      {/* ----------------------------------------------------------- 3. CROSS-RUNTIME NODE COMPATIBILITY & DIRECT TS */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25]">
+        <div className="w-[85%] mx-auto">
+          <CrossRuntimeCompatBenchmark />
+        </div>
+      </section>
+
+      {/* ----------------------------------------------------------- 4. FORWARD COMPATIBILITY & MODERN APIS */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25] bg-[#0e0c0a]/50">
+        <div className="w-[85%] mx-auto">
+          <ModernApisGrid />
+        </div>
+      </section>
+
+      {/* ----------------------------------------------------------- 5. COMPLEXITY VS SCALE & ASYMMETRIC BENTO GRID */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25]">
+        <div className="w-[85%] mx-auto">
+          {/* Complexity Graph & Hyperfine Data */}
+          <ComplexityCurveChart />
+
+          {/* Asymmetric Bento Grid (Different Colsize & Rowsize) */}
+          <div className="mt-16">
+            <div className="mb-8 text-left">
+              <span className="text-xs font-mono font-semibold uppercase tracking-wider text-ember flex items-center gap-1.5 mb-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-ember" />
+                Asymmetric Architecture
+              </span>
+              <h3 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-white">
+                Engineered for maximum developer velocity
+              </h3>
+            </div>
+            <AsymmetricBentoGrid />
+          </div>
+        </div>
+      </section>
+
+      {/* ----------------------------------------------------------- 6. PACKAGE MANAGER CONFIG COMPATIBILITY MATRIX */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25] bg-[#0e0c0a]/50">
+        <div className="w-[85%] mx-auto">
+          <PMConfigMatrixTable />
+        </div>
+      </section>
+
+      {/* ----------------------------------------------------------- 7. ARCHITECTURAL CAPABILITY PILLARS */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25]">
+        <div className="w-[85%] mx-auto">
+          <div className="mb-10 text-left">
+            <span className="text-xs font-mono font-semibold uppercase tracking-wider text-pink flex items-center gap-1.5 mb-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-pink" />
+              Architectural Design
             </span>
-            <p className="mt-3 text-sm leading-relaxed text-fd-muted-foreground">
-              An all-in-one toolkit for Node.js.
+            <h2 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-white">
+              Built on uncompromising principles
+            </h2>
+            <p className="mt-2 text-sm sm:text-base text-zinc-400">
+              Additive augmentation, deterministic compatibility, monorepo velocity, and default-deny supply chain defense.
             </p>
           </div>
-          <FooterCol
-            title="Resources"
-            links={[
-              ['Docs', '/docs'],
-              ['Blog', '/blog'],
-              ['FAQ', '/docs/faq'],
-              ['GitHub', 'https://github.com/nubjs/nub'],
-              ['License', 'https://github.com/nubjs/nub/blob/main/LICENSE'],
-            ]}
-          />
-          <FooterCol
-            title="Toolkit"
-            links={[
-              ['File runner', '/docs/runtime'],
-              ['Script runner', '/docs/run'],
-              ['Bin runner', '/docs/nubx'],
-              ['Package manager', '/docs/pm'],
-              ['Version manager', '/docs/node'],
-              ['Watch mode', '/docs/watch'],
-            ]}
-          />
+
+          <CommunityTestimonials />
         </div>
-        <p className="mt-12 flex items-center justify-center gap-1.5 border-t border-fd-border pt-6 text-xs text-fd-muted-foreground">
-          <span>© {year} Nub</span>
-          <span aria-hidden>·</span>
-          <a
-            href="https://github.com/nubjs/nub/blob/main/LICENSE"
-            className="inline-flex items-center gap-1 hover:text-fd-foreground"
-          >
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-              className="-translate-y-[1.5px]"
-            >
-              <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
-              <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
-              <path d="M7 21h10" />
-              <path d="M12 3v18" />
-              <path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
-            </svg>
-            MIT
-          </a>
-        </p>
-      </Container>
-    </footer>
+      </section>
+
+      {/* ----------------------------------------------------------- 8. FAQ ACCORDION */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25] bg-[#0e0c0a]/50">
+        <div className="w-[85%] mx-auto">
+          <FaqAccordion />
+        </div>
+      </section>
+
+      {/* ----------------------------------------------------------- 9. PRE-FOOTER CTA */}
+      <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25]">
+        <PreFooterCTA />
+      </section>
+
+      {/* ----------------------------------------------------------- 7. 5-COLUMN FOOTER */}
+      <footer className="relative z-10 py-16 bg-[#0c0a09]">
+        <div className="w-[85%] mx-auto">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-8 pb-12 border-b border-[#2e2a25]">
+            {/* Brand column */}
+            <div className="col-span-2 text-left">
+              <div className="flex items-center gap-1.5 font-bold text-2xl tracking-tight text-white">
+                <span>nub</span>
+                <span className="text-ember">.</span>
+                <span className="ml-2 rounded-full border border-[#38332c] bg-[#141210] px-2 py-0.5 text-[10px] font-mono text-zinc-400 font-normal">
+                  v0.7 · Node v{node.major}
+                </span>
+              </div>
+              <p className="mt-3 text-xs text-zinc-400 leading-relaxed max-w-sm">
+                A TypeScript-first developer supertool for Node.js. In-memory oxc transpilation, 24× script dispatch, and lockfile-neutral package management.
+              </p>
+              <div className="mt-4 text-xs font-mono text-zinc-500">
+                Released under the MIT License.
+              </div>
+            </div>
+
+            {/* Documentation */}
+            <div className="flex flex-col gap-2.5 text-xs font-mono text-left">
+              <span className="font-semibold text-zinc-200 mb-1">Documentation</span>
+              <Link href="/docs" className="text-zinc-400 hover:text-white transition-colors">Getting Started</Link>
+              <Link href="/docs/run" className="text-zinc-400 hover:text-white transition-colors">TypeScript Runner</Link>
+              <Link href="/docs/watch" className="text-zinc-400 hover:text-white transition-colors">Watch Mode</Link>
+              <Link href="/docs/install" className="text-zinc-400 hover:text-white transition-colors">Package Manager</Link>
+              <Link href="/docs/config" className="text-zinc-400 hover:text-white transition-colors">Configuration</Link>
+            </div>
+
+            {/* Ecosystem */}
+            <div className="flex flex-col gap-2.5 text-xs font-mono text-left">
+              <span className="font-semibold text-zinc-200 mb-1">Ecosystem</span>
+              <Link href="/docs/nubx" className="text-zinc-400 hover:text-white transition-colors">nubx (19× npx)</Link>
+              <Link href="/docs/node" className="text-zinc-400 hover:text-white transition-colors">Node Versioning</Link>
+              <a href="https://github.com/nubjs/nub/blob/main/benchmarks/results.md" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">Benchmarks</a>
+              <Link href="/blog" className="text-zinc-400 hover:text-white transition-colors">Blog &amp; Releases</Link>
+            </div>
+
+            {/* Community */}
+            <div className="flex flex-col gap-2.5 text-xs font-mono text-left">
+              <span className="font-semibold text-zinc-200 mb-1">Community</span>
+              <a href="https://github.com/nubjs/nub" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">GitHub</a>
+              <a href="https://github.com/nubjs/nub/discussions" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">Discussions</a>
+              <a href="https://github.com/nubjs/nub/issues" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">Issues</a>
+              <a href="https://github.com/nubjs/nub/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">MIT License</a>
+            </div>
+          </div>
+
+          <div className="mt-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs font-mono text-zinc-500">
+            <div>
+              © {new Date().getFullYear()} Nub. Built for the modern Node.js ecosystem.
+            </div>
+            <div className="flex items-center gap-4">
+              <span>TypeScript 5.x</span>
+              <span>•</span>
+              <span>Node.js v{node.major} LTS</span>
+              <span>•</span>
+              <span>Zero Runtime Lock-In</span>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </div>
   );
 }

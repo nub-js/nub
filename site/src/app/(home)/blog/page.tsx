@@ -24,8 +24,6 @@ export const metadata: Metadata = {
   },
 };
 
-// Newest first: by date, then by release version so same-day releases (two posts
-// sharing a `date`) still order by version rather than falling back to glob order.
 function versionRank(url: string): number {
   const m = url.match(/nub-(\d+)-(\d+)-(\d+)/);
   if (!m) return 0;
@@ -34,10 +32,6 @@ function versionRank(url: string): number {
 }
 
 export default function BlogIndex() {
-  // `date` accepts an ISO 8601 UTC timestamp (e.g. 2026-07-07T12:00:00Z) to
-  // order same-day posts; a date-only value parses as UTC midnight. Same-day
-  // release posts tie-break by version; the URL compare is a last-resort guard
-  // against nondeterministic file order.
   const posts = [...blog.getPages()].sort((a, b) => {
     const byDate =
       new Date(b.data.date ?? 0).getTime() -
@@ -48,11 +42,8 @@ export default function BlogIndex() {
   });
 
   return (
-    <div className="mx-auto max-w-3xl px-6 py-24">
-      <p className="eyebrow text-ember">Writing</p>
-      <h1 className="mt-4 font-display text-5xl font-medium tracking-tight">
-        The Nub blog
-      </h1>
+    <div className="mx-auto max-w-4xl px-6 py-20">
+      <h1 className="font-display text-4xl font-medium tracking-tight md:text-5xl">Blog</h1>
       <p className="mt-4 text-lg text-fd-muted-foreground">
         Notes on the toolkit, the thesis, and what ships next.
       </p>

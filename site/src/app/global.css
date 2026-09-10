@@ -1,6 +1,7 @@
 @import 'tailwindcss';
 @import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
+@import 'lenis/dist/lenis.css';
 
 @source '../../node_modules/fumadocs-ui/dist/**/*.js';
 
@@ -18,9 +19,9 @@
      Newsreader, set all three back to
      `var(--font-newsreader), ui-serif, Georgia, serif` (it stays registered in
      layout.tsx for exactly that). */
-  --font-display: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
-  --font-serif: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
-  --font-sans: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-bricolage), var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-newsreader), ui-serif, Georgia, serif;
+  --font-sans: var(--font-inter), var(--font-encode), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
 
   /* color pops — used sparingly against the ink ground. These are the DARK-mode
@@ -644,6 +645,23 @@ a[href] {
    `max-w-[900px]` without touching fumadocs' markup. */
 #nd-page {
   max-width: 720px;
+}
+
+/* Effect.website styling patterns */
+.effect-grid-bg {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+}
+
+.effect-glow-top {
+  background: radial-gradient(ellipse 60% 50% at 50% 0%, rgba(255, 93, 59, 0.15), rgba(255, 255, 255, 0.03) 40%, transparent 70%);
+}
+
+.effect-card-border {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
 }
 
 
