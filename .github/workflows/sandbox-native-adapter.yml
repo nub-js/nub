@@ -57,7 +57,7 @@ jobs:
           if errorlevel 1 exit /b 1
           cl /nologo /std:c++17 /W4 /WX /MT /EHsc /DPROBE_INJECTOR /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /Fe:injector.exe /link "$root\.probe-detours\lib.$lib\detours.lib"
           "@ | Set-Content .native-adapter/build.cmd
-          cmd /c .native-adapter/build.cmd *> reports/native-build.log
+          cmd /c .\.native-adapter\build.cmd *> reports/native-build.log
           if ($LASTEXITCODE -ne 0) { Get-Content reports/native-build.log; exit $LASTEXITCODE }
           "NUB_NATIVE_ADAPTER_PROBE_DIR=$root\.native-adapter" >> $env:GITHUB_ENV
           Get-FileHash .native-adapter/probe.dll, .native-adapter/injector.exe >> reports/environment.txt
