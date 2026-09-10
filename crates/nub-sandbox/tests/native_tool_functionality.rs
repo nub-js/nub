@@ -555,6 +555,43 @@ fn operations(
             );
         }
         "composer" => {
+            #[cfg(windows)]
+            if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_DIR").is_some() {
+                // Symfony suppresses proc_open warnings; retain the underlying PHP error.
+                let diagnostic = root.join("project/proc-open.php");
+                std::fs::write(&diagnostic, r#"<?php
+foreach (['pipes', 'nul', 'files'] as $mode) {
+    $descriptors = [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']];
+    if ($mode === 'nul') $descriptors = [['pipe', 'r'], ['file', 'NUL', 'w'], ['file', 'NUL', 'w']];
+    if ($mode === 'files') $descriptors = [['pipe', 'r'], ['file', 'proc-out', 'w'], ['file', 'proc-err', 'w']];
+    error_clear_last();
+    $process = proc_open([PHP_BINARY, '-r', 'echo 42;'], $descriptors, $pipes);
+    echo json_encode(['mode' => $mode, 'created' => is_resource($process), 'error' => error_get_last()]), PHP_EOL;
+    if (is_resource($process)) {
+        foreach ($pipes as $pipe) fclose($pipe);
+        echo 'EXIT ', proc_close($process), PHP_EOL;
+    }
+}
+"#).unwrap();
+                let php = Tool {
+                    name: "php-proc-open".into(),
+                    program: tool.program.clone(),
+                    prefix: vec![],
+                    version: tool.version.clone(),
+                    tool_root: tool.tool_root.clone(),
+                    runtime_roots: tool.runtime_roots.clone(),
+                    tool_env: tool.tool_env.clone(),
+                    shell: false,
+                    maven_seed: None,
+                };
+                let output = run(&php, &[diagnostic.to_str().unwrap()], root, env, policy);
+                eprintln!(
+                    "PHP_PROC_OPEN status={} stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             assert_ok(
                 tool,
                 "cold install",

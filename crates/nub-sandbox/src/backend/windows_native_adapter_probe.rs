@@ -14,7 +14,7 @@ pub(crate) fn inject_probe(pid: u32) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("native adapter directory missing"))?;
     let output = Command::new(Path::new(&adapter).join("injector.exe"))
         .arg(pid.to_string())
-        .arg(Path::new(&adapter).join("probe.dll"))
+        .arg(&adapter)
         .output()?;
     eprintln!("ADAPTER_INJECT {output:?}");
     if !output.status.success() {

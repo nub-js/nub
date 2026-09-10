@@ -65,11 +65,13 @@ jobs:
           git rev-parse HEAD > reports/environment.txt
           rustc -Vv >> reports/environment.txt
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
-          # Match the pinned native tools; Windows 11 runs these under x64 emulation.
-          $arch = 'amd64'
-          $lib = 'X64'
           $root = $env:GITHUB_WORKSPACE
-          @"
+          # Launchers and their children can have different architectures.
+          $targets = ,@('amd64', 'X64', 'x64')
+          if ('${{ matrix.os }}' -eq 'windows-11-arm') { $targets += ,@('amd64_arm64', 'ARM64', 'arm64') }
+          foreach ($target in $targets) {
+            $arch, $lib, $name = $target
+            @"
           @echo off
           call "$vs\VC\Auxiliary\Build\vcvarsall.bat" $arch
           if errorlevel 1 exit /b 1
@@ -77,14 +79,16 @@ jobs:
           nmake
           if errorlevel 1 exit /b 1
           cd /d "$root\.native-adapter"
-          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /LD /link "$root\.probe-detours\lib.$lib\detours.lib" /OUT:probe.dll /EXPORT:ProbeMarker,@1
+          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /LD /link "$root\.probe-detours\lib.$lib\detours.lib" /OUT:probe-$name.dll /EXPORT:ProbeMarker,@1
           if errorlevel 1 exit /b 1
+          if not "$name" == "x64" exit /b 0
           cl /nologo /std:c++17 /W4 /WX /MT /EHsc /DPROBE_INJECTOR /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /Fe:injector.exe /link "$root\.probe-detours\lib.$lib\detours.lib"
-          "@ | Set-Content .native-adapter/build.cmd
-          cmd /c .\.native-adapter\build.cmd *> reports/native-build.log
-          if ($LASTEXITCODE -ne 0) { Get-Content reports/native-build.log; exit $LASTEXITCODE }
+          "@ | Set-Content ".native-adapter/build-$name.cmd"
+            cmd /c ".\.native-adapter\build-$name.cmd" *> "reports/native-build-$name.log"
+            if ($LASTEXITCODE -ne 0) { Get-Content "reports/native-build-$name.log"; exit $LASTEXITCODE }
+          }
           "NUB_NATIVE_ADAPTER_PROBE_DIR=$root\.native-adapter" >> $env:GITHUB_ENV
-          Get-FileHash .native-adapter/probe.dll, .native-adapter/injector.exe >> reports/environment.txt
+          Get-FileHash .native-adapter/*.dll, .native-adapter/injector.exe | ConvertTo-Json >> reports/environment.txt
       - name: Checking sandbox targets
         shell: bash
         run: cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings
