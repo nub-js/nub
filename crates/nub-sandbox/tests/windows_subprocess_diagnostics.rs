@@ -105,7 +105,13 @@ fn windows_path_resolution_controls() {
     policy.env.constructed = env;
     let sandbox = Sandbox::new(&policy).unwrap();
     let prepared = sandbox
-        .prepare(CommandSpec::new(&exe).args(args).cwd(&project))
+        .prepare(
+            CommandSpec::new(&exe)
+                .args(args)
+                .cwd(&project)
+                .redact_stdout(true)
+                .redact_stderr(true),
+        )
         .unwrap();
     assert!(prepared.degradation.lost.is_empty());
     let output = tool_output::output(prepared);

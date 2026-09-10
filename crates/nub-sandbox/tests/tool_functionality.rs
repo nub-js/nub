@@ -638,7 +638,13 @@ fn run_unix_tool_control(
     if list_ancestors {
         use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
         // Diagnostic only: isolate directory enumeration from file-content access.
-        for path in root.path().join("project").ancestors().skip(1) {
+        for path in root
+            .path()
+            .join("project")
+            .ancestors()
+            .skip(1)
+            .take_while(|path| path.parent().is_some())
+        {
             policy.fs.rules.entries.push(FsRule {
                 matcher: CanonGlob(path.to_string_lossy().into_owned()),
                 effect: Effect::Allow,
@@ -737,7 +743,7 @@ fn run_unix_tool_control(
         ]);
     }
     let script = format!(
-        "const fs=require('fs');for(const p of {}){{try{{fs.readFileSync(p);process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}}}};console.log('CANARY_DENIED')",
+        "const fs=require('fs');for(const p of {}){{try{{fs.readFileSync(p);console.error('CANARY_EXPOSED',p);process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}}}};console.log('CANARY_DENIED')",
         serde_json::to_string(&denied_paths).unwrap()
     );
     if sandbox.is_some() {
