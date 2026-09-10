@@ -208,6 +208,11 @@ fn policy(
             "COMPOSER_BIN_DIR",
             "DOTNET_CLI_HOME",
         ] {
+            // NuGet clears and recreates these children; its stable parent grant
+            // below covers them without pinning an authored, now-absent child.
+            if tool.name == "nuget" && key.starts_with("NUGET_") {
+                continue;
+            }
             if let Some(path) = env.get(key) {
                 fs.insert(path.clone(), Value::String("rw".into()));
             }
