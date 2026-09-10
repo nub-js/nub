@@ -760,6 +760,133 @@ fn windows_bun140_retained_bundle() {
     run_retained_tool_control("bun140", true, false, None);
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires pinned Bun; distinguishes link privileges from path grants"]
+fn windows_bun140_link_primitives_and_global_sources() {
+    let tools = tools();
+    let tool = tools.iter().find(|tool| tool.name == "bun140").unwrap();
+    // This canary is outside even the broad fixture-only diagnostic grant.
+    let withheld = fixture();
+    let canary = withheld.path().join("secret");
+    std::fs::write(&canary, "DENIED_CANARY").unwrap();
+    let mut bundle_archive_passed = false;
+    for mode in ["plain", "bundle", "fixture-rw"] {
+        for source in ["folder", "archive"] {
+            let root = fixture();
+            let package = fixture_package(root.path());
+            let archive = root.path().join("project/package.tgz");
+            let packed = Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(root.path().join("project"))
+                .arg("package")
+                .output()
+                .unwrap();
+            assert!(packed.status.success(), "tar: {packed:?}");
+            let (cache, global, env) = tool_env(tool, root.path());
+            for path in [&cache, &global] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let mut fs = grant_fs(tool, root.path(), &cache, &global, true);
+            fs[cache.parent().unwrap().to_str().unwrap()] = json!("rw");
+            if mode == "fixture-rw" {
+                fs[root.path().to_str().unwrap()] = json!("rw");
+            }
+            let env: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let policy = policy(root.path(), fs, &env);
+            let mut plain_env = policy.env.constructed.clone();
+            let tmp = root.path().join("plain-tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                plain_env.insert(key.into(), tmp.to_string_lossy().into_owned());
+            }
+            let sandbox = (mode != "plain").then(|| Sandbox::acquire(&policy).unwrap());
+            let run = |argv: Vec<String>| {
+                if let Some(sandbox) = &sandbox {
+                    let prepared = sandbox
+                        .prepare(
+                            CommandSpec::new(&tool.program)
+                                .args(argv)
+                                .cwd(root.path().join("project"))
+                                .redact_stdout(true)
+                                .redact_stderr(true),
+                        )
+                        .unwrap();
+                    assert!(prepared.degradation.lost.is_empty());
+                    tool_output::output(prepared)
+                } else {
+                    Command::new(&tool.program)
+                        .args(argv)
+                        .env_clear()
+                        .envs(&plain_env)
+                        .current_dir(root.path().join("project"))
+                        .output()
+                        .unwrap()
+                }
+            };
+            let probe = format!(
+                r#"const fs=require('fs'),p=require('path');const target=p.resolve('package/cli.js'),dir=p.resolve('package');const results={{}};for(const [name,fn] of Object.entries({{copy:()=>fs.copyFileSync(target,'copy.js'),hardlink:()=>fs.linkSync(target,'hardlink.js'),fileSymlink:()=>fs.symlinkSync(target,'symlink.js','file'),dirSymlink:()=>fs.symlinkSync(dir,'dir-symlink','dir'),junction:()=>fs.symlinkSync(dir,'junction','junction')}})){{try{{fn();results[name]='ok'}}catch(e){{results[name]=e.code}}}}try{{fs.readFileSync({canary});results.canary='read'}}catch(e){{results.canary=e.code}}console.log(JSON.stringify(results))"#,
+                canary = serde_json::to_string(&canary).unwrap(),
+            );
+            let output = run(vec!["-e".into(), probe]);
+            assert_success(tool, "link primitive probe", &output);
+            let links: Value = serde_json::from_slice(&output.stdout).unwrap();
+            eprintln!("BUN_LINK_PRIMITIVES {mode} {source} {links}");
+            assert_eq!(links["copy"], "ok");
+            if mode == "plain" {
+                assert_eq!(links["canary"], "read");
+            } else {
+                assert!(matches!(links["canary"].as_str(), Some("EACCES" | "EPERM")));
+            }
+            let input = if source == "folder" {
+                &package
+            } else {
+                &archive
+            };
+            let output = run(vec![
+                "install".into(),
+                "--global".into(),
+                "--verbose".into(),
+                input.to_string_lossy().into_owned(),
+            ]);
+            eprintln!("BUN_GLOBAL_SOURCE {mode} {source} {output:?}");
+            if mode == "plain" {
+                assert_success(tool, "plain global source control", &output);
+            }
+            if mode == "bundle" && source == "archive" {
+                bundle_archive_passed = output.status.success();
+            }
+            if output.status.success() {
+                assert!(global.join("bin/fixture-bin.exe").is_file());
+                assert_success(
+                    tool,
+                    "cache prune after global install",
+                    &run(args(tool, &["pm", "cache", "rm"])),
+                );
+                assert_success(
+                    tool,
+                    "reinstall archived global package",
+                    &run(vec![
+                        "install".into(),
+                        "--global".into(),
+                        archive.to_string_lossy().into_owned(),
+                    ]),
+                );
+            }
+            if let Some(sandbox) = sandbox {
+                sandbox.close();
+                nub_sandbox::cleanup().unwrap();
+            }
+        }
+    }
+    assert!(
+        bundle_archive_passed,
+        "the bundle must support an ordinary archived global package"
+    );
+}
+
 #[cfg(unix)]
 fn bun_shared_cache_control(name: &str) {
     let tools = tools();
