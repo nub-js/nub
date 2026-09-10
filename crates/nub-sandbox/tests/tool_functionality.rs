@@ -595,17 +595,11 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
 
 #[cfg(target_os = "linux")]
 fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
-    run_unix_tool_control(name, tooldirs, unconfined, sample, false);
+    run_unix_tool_control(name, tooldirs, unconfined, sample);
 }
 
 #[cfg(unix)]
-fn run_unix_tool_control(
-    name: &str,
-    tooldirs: bool,
-    unconfined: bool,
-    sample: Option<usize>,
-    list_ancestors: bool,
-) {
+fn run_unix_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -634,30 +628,7 @@ fn run_unix_tool_control(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let mut policy = policy(root.path(), fs, &env_refs);
-    if list_ancestors {
-        use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
-        // Diagnostic only: isolate directory enumeration from file-content access.
-        let mut paths: Vec<_> = root
-            .path()
-            .join("project")
-            .ancestors()
-            .skip(1)
-            .take_while(|path| path.parent().is_some())
-            .map(Path::to_path_buf)
-            .collect();
-        // Bun 1.3 also enumerates the conventional temp directory while pruning,
-        // even with private TMPDIR. Listing grants no file contents or deletion.
-        paths.push(std::fs::canonicalize("/tmp").unwrap());
-        for path in paths {
-            policy.fs.rules.entries.push(FsRule {
-                matcher: CanonGlob(path.to_string_lossy().into_owned()),
-                effect: Effect::Allow,
-                access: FsAccess::Read,
-                origin: FsOrigin::Speculative,
-            });
-        }
-    }
+    let policy = policy(root.path(), fs, &env_refs);
     let mut plain_env = policy.env.constructed.clone();
     let plain_tmp = root.path().join("plain-tmp");
     std::fs::create_dir(&plain_tmp).unwrap();
@@ -766,21 +737,14 @@ fn run_unix_tool_control(
 #[test]
 #[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
 fn unix_bun132_retained_bundle() {
-    run_unix_tool_control("bun132", true, false, None, false);
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "requires pinned Bun versions; directory-node enumeration diagnostic"]
-fn unix_bun132_retained_ancestor_nodes() {
-    run_unix_tool_control("bun132", true, false, None, true);
+    run_unix_tool_control("bun132", true, false, None);
 }
 
 #[cfg(unix)]
 #[test]
 #[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
 fn unix_bun140_retained_bundle() {
-    run_unix_tool_control("bun140", true, false, None, false);
+    run_unix_tool_control("bun140", true, false, None);
 }
 
 #[cfg(target_os = "linux")]

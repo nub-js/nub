@@ -730,6 +730,28 @@ pub fn tooldirs_fs_rules_with_env(
         access
     };
     let mut out = Vec::new();
+    #[cfg(unix)]
+    if effect == Effect::Allow {
+        // Bun 1.3 enumerates project ancestors and the conventional temp root.
+        // A bare directory node grants listing, not file contents or writes.
+        let project = canonicalize_glob_prefix(&homes.project.to_string_lossy());
+        let nodes: BTreeSet<_> = std::path::Path::new(&project)
+            .ancestors()
+            .skip(1)
+            .take_while(|path| path.parent().is_some())
+            .map(|path| path.to_string_lossy().into_owned())
+            .chain([canonicalize_glob_prefix("/tmp")])
+            .filter(|path| !is_filesystem_root(path))
+            .collect();
+        for node in nodes {
+            out.push(FsRule {
+                matcher: CanonGlob(node),
+                effect,
+                access: FsAccess::Read,
+                origin: FsOrigin::Speculative,
+            });
+        }
+    }
     let environment_patterns = environment_tooldirs(env);
     #[cfg(unix)]
     for pattern in ["/tmp/.dotnet"] {

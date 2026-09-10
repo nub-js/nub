@@ -53,6 +53,12 @@ A whole-home grant is literal:
 
 It includes SSH keys, package-manager credentials and other readable home files. Neither home grants nor tool-directory grants promise secret-free contents.
 
+### Unix directory listing
+
+The tool-directory bundle permits listing the project's non-root ancestors and the conventional temporary directory. Bun 1.3 needs these listings for installed-bin execution and cache cleanup. These are directory-node grants, not sibling file grants: they add no file-content access, creation or deletion rights. Linux's listing right also permits listing descendant directories; macOS applies it to the named nodes.
+
+Older Bun versions hardcode `/tmp` or `/private/tmp` for `bunx` downloads, even with private `TMPDIR`. Listing does not permit creating or deleting those shared cache entries. The bundle does not silently grant writable host temp; those operations require explicit grants or a runtime version that honors a private cache location.
+
 ### Explicit Linux process metadata
 
 The tool-directory bundle includes read-only process metadata on Linux. A policy without `$tooldirs` can select individual capabilities:

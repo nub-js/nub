@@ -98,6 +98,96 @@ fn shared_tool_state_is_initialized_once_and_survives_session_close() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn tool_directory_listing_leaf() {
+    let Ok(root) = std::env::var("TOOL_LISTING_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let confined = std::env::var("TOOL_LISTING_CONFINED").unwrap() == "1";
+    let check = |result: std::io::Result<()>| {
+        if confined {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        } else {
+            result.unwrap();
+        }
+    };
+    assert!(
+        std::fs::read_dir(root)
+            .unwrap()
+            .any(|entry| entry.unwrap().file_name() == "secret")
+    );
+    assert!(std::fs::read_dir("/tmp").is_ok());
+    for path in [root.join("secret"), root.join("sibling/secret")] {
+        check(std::fs::read(&path).map(|_| ()));
+        check(std::fs::write(&path, "changed"));
+        check(std::fs::remove_file(&path));
+    }
+    check(std::fs::write(root.join("new-file"), "new"));
+    std::fs::write(root.join("project/allowed"), "allowed").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tool_directory_listing_does_not_grant_sibling_contents_or_writes() {
+    use nub_sandbox::{CommandSpec, Sandbox};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let project = root.join("project");
+    for dir in [&project, &root.join("sibling")] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut ctx = context(&project);
+    ctx.homes.home = root.join("home");
+    ctx.homes.cache = root.join("cache");
+    let mut fs = json!({"./": "rw", "$tooldirs": "rw", "$tmp": "rw"});
+    fs[exe.parent().unwrap().to_str().unwrap()] = json!("r");
+    let mut policy = compile(&json!({"fs": fs, "net": false}), &ctx).unwrap();
+    policy
+        .env
+        .constructed
+        .insert("TOOL_LISTING_ROOT".into(), root.display().to_string());
+    let args = ["--exact", "tool_directory_listing_leaf", "--nocapture"];
+    for confined in [false, true] {
+        for path in [root.join("secret"), root.join("sibling/secret")] {
+            std::fs::write(path, "withheld").unwrap();
+        }
+        policy.env.constructed.insert(
+            "TOOL_LISTING_CONFINED".into(),
+            if confined { "1" } else { "0" }.into(),
+        );
+        let output = if confined {
+            let sandbox = Sandbox::acquire(&policy).unwrap();
+            let prepared = sandbox
+                .prepare(CommandSpec::new(&exe).args(args).cwd(&project))
+                .unwrap();
+            assert!(
+                prepared.degradation.lost.is_empty(),
+                "{:?}",
+                prepared.degradation
+            );
+            let output = prepared.output().unwrap();
+            sandbox.close();
+            output
+        } else {
+            std::process::Command::new(&exe)
+                .args(args)
+                .envs(&policy.env.constructed)
+                .output()
+                .unwrap()
+        };
+        assert!(output.status.success(), "confined={confined}: {output:?}");
+        if !confined {
+            std::fs::remove_file(root.join("new-file")).unwrap();
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn unsupported_hosts_refuse_metadata_at_acquisition() {
