@@ -8,6 +8,7 @@
 #include <cwchar>
 #include <cstring>
 #include <cstdint>
+#include <initializer_list>
 #include "detours.h"
 
 static const GUID payload_id = {0x19c47458, 0xe2ad, 0x421d, {0x81, 0x37, 0x52, 0xa1, 0x85, 0xf7, 0xb8, 0x15}};
@@ -97,6 +98,89 @@ static auto true_create_process = CreateProcessW;
 using NtDirectory = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 static NtDirectory true_create_directory = nullptr;
 static NtDirectory true_open_directory = nullptr;
+using NtPipe = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+    ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
+using NtOpen = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
+using NtCreate = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+    PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using NtObject = NTSTATUS (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static NtPipe true_create_pipe = nullptr;
+static NtOpen true_open_file = nullptr;
+static NtCreate true_nt_create_file = nullptr;
+static NtObject query_object = nullptr;
+
+static bool pipe_name(POBJECT_ATTRIBUTES original, OBJECT_ATTRIBUTES& redirected,
+                      UNICODE_STRING& name, wchar_t (&path)[1024]) {
+    if (!original || !original->ObjectName) return false;
+    auto input = original->ObjectName;
+    if (!input->Buffer || input->Length % sizeof(wchar_t) || input->Length >= 512 * sizeof(wchar_t)) return false;
+    wchar_t source[512];
+    memcpy(source, input->Buffer, input->Length);
+    source[input->Length / sizeof(wchar_t)] = 0;
+    const wchar_t* leaf = nullptr;
+    if (original->RootDirectory) {
+        alignas(void*) BYTE info[4096];
+        ULONG size = 0;
+        if (query_object(original->RootDirectory, 1, info, sizeof(info), &size) < 0) return false;
+        auto root = reinterpret_cast<UNICODE_STRING*>(info);
+        const wchar_t npfs[] = L"\\Device\\NamedPipe";
+        if (root->Length != sizeof(npfs) - sizeof(wchar_t) ||
+            _wcsnicmp(root->Buffer, npfs, root->Length / sizeof(wchar_t))) return false;
+        leaf = source;
+    } else {
+        for (const wchar_t* prefix : {L"\\Device\\NamedPipe\\", L"\\??\\pipe\\"}) {
+            if (!_wcsnicmp(source, prefix, wcslen(prefix))) { leaf = source + wcslen(prefix); break; }
+        }
+    }
+    if (!leaf || (wcsncmp(leaf, L"msys-", 5) && wcsncmp(leaf, L"cygwin-", 7) &&
+                  wcsncmp(leaf, L"uv\\", 3) && !(original->RootDirectory && wcsstr(leaf, L"-pipe-nt-")))) return false;
+    if (swprintf_s(path, L"\\??\\pipe\\LOCAL\\%s", leaf) < 0) return false;
+    name.Buffer = path;
+    name.Length = USHORT(wcslen(path) * sizeof(wchar_t));
+    name.MaximumLength = USHORT(name.Length + sizeof(wchar_t));
+    redirected = *original;
+    redirected.RootDirectory = nullptr;
+    redirected.ObjectName = &name;
+    redirected.SecurityDescriptor = nullptr;
+    return true;
+}
+
+static NTSTATUS NTAPI create_pipe(PHANDLE handle, ACCESS_MASK access, POBJECT_ATTRIBUTES attrs,
+    PIO_STATUS_BLOCK io, ULONG share, ULONG disposition, ULONG options, ULONG type, ULONG read_mode,
+    ULONG completion, ULONG instances, ULONG inbound, ULONG outbound, PLARGE_INTEGER timeout) {
+    OBJECT_ATTRIBUTES redirected;
+    UNICODE_STRING name;
+    wchar_t path[1024];
+    bool mapped = pipe_name(attrs, redirected, name, path);
+    NTSTATUS status = true_create_pipe(handle, access, mapped ? &redirected : attrs, io, share,
+        disposition, options, type, read_mode, completion, instances, inbound, outbound, timeout);
+    if (mapped) fprintf(stderr, "ADAPTER_PIPE_CREATE path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
+    return status;
+}
+
+static NTSTATUS NTAPI open_file(PHANDLE handle, ACCESS_MASK access, POBJECT_ATTRIBUTES attrs,
+                                PIO_STATUS_BLOCK io, ULONG share, ULONG options) {
+    OBJECT_ATTRIBUTES redirected;
+    UNICODE_STRING name;
+    wchar_t path[1024];
+    bool mapped = pipe_name(attrs, redirected, name, path);
+    NTSTATUS status = true_open_file(handle, access, mapped ? &redirected : attrs, io, share, options);
+    if (mapped) fprintf(stderr, "ADAPTER_PIPE_OPEN path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
+    return status;
+}
+
+static NTSTATUS NTAPI nt_create_file(PHANDLE handle, ACCESS_MASK access, POBJECT_ATTRIBUTES attrs,
+    PIO_STATUS_BLOCK io, PLARGE_INTEGER allocation, ULONG attributes, ULONG share, ULONG disposition,
+    ULONG options, PVOID ea, ULONG ea_length) {
+    OBJECT_ATTRIBUTES redirected;
+    UNICODE_STRING name;
+    wchar_t path[1024];
+    bool mapped = pipe_name(attrs, redirected, name, path);
+    NTSTATUS status = true_nt_create_file(handle, access, mapped ? &redirected : attrs, io, allocation,
+        attributes, share, disposition, options, ea, ea_length);
+    if (mapped) fprintf(stderr, "ADAPTER_PIPE_CLIENT path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
+    return status;
+}
 
 static bool msys_directory(POBJECT_ATTRIBUTES original, OBJECT_ATTRIBUTES& redirected,
                            UNICODE_STRING& name, wchar_t (&path)[1024]) {
@@ -160,6 +244,7 @@ static NTSTATUS NTAPI open_directory(PHANDLE handle, ACCESS_MASK access, POBJECT
 
 static bool is_null(LPCWSTR path) {
     if (!path) return false;
+    if (!_wcsicmp(path, L"\\\\.\\NUL") || !_wcsicmp(path, L"\\\\?\\NUL")) return true;
     // PHP expands its NUL descriptor to an absolute DOS path before opening it.
     // Let Windows classify reserved DOS device names rather than matching file suffixes.
     using DosDeviceName = ULONG (NTAPI*)(PCWSTR);
@@ -252,6 +337,12 @@ static BOOL WINAPI create_process(LPCWSTR application, LPWSTR command,
 }
 
 extern "C" __declspec(dllexport) void ProbeMarker() {}
+template<typename T> static bool resolve_nt(T& function, const char* name) {
+    auto address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name);
+    static_assert(sizeof(function) == sizeof(address));
+    memcpy(&function, &address, sizeof(address));
+    return address != nullptr;
+}
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (DetourIsHelperProcess()) return TRUE;
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
@@ -260,12 +351,12 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     auto payload = static_cast<Payload*>(DetourFindPayloadEx(payload_id, &size));
     if (!payload || size != sizeof(Payload)) return FALSE;
     state = *payload;
-    auto create = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateDirectoryObject");
-    auto open = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenDirectoryObject");
-    if (!create || !open) return FALSE;
-    static_assert(sizeof(create) == sizeof(true_create_directory));
-    memcpy(&true_create_directory, &create, sizeof(create));
-    memcpy(&true_open_directory, &open, sizeof(open));
+    if (!resolve_nt(true_create_directory, "NtCreateDirectoryObject") ||
+        !resolve_nt(true_open_directory, "NtOpenDirectoryObject") ||
+        !resolve_nt(true_create_pipe, "NtCreateNamedPipeFile") ||
+        !resolve_nt(true_open_file, "NtOpenFile") ||
+        !resolve_nt(true_nt_create_file, "NtCreateFile") ||
+        !resolve_nt(query_object, "NtQueryObject")) return FALSE;
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_file), create_file);
@@ -274,6 +365,9 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_process), create_process);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_directory), create_directory);
     DetourAttach(reinterpret_cast<PVOID*>(&true_open_directory), open_directory);
+    DetourAttach(reinterpret_cast<PVOID*>(&true_create_pipe), create_pipe);
+    DetourAttach(reinterpret_cast<PVOID*>(&true_open_file), open_file);
+    DetourAttach(reinterpret_cast<PVOID*>(&true_nt_create_file), nt_create_file);
     return DetourTransactionCommit() == NO_ERROR;
 }
 #endif

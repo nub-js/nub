@@ -35,6 +35,11 @@ fn native_adapter_child() {
         .open("NUL")
         .and_then(|mut f| f.write(b"discarded"));
     let canonical = std::fs::canonicalize(&file);
+    let absolute_nul = Path::new(&file).parent().unwrap().join("NUL");
+    let absolute_nul = std::fs::OpenOptions::new()
+        .write(true)
+        .open(absolute_nul)
+        .and_then(|mut f| f.write(b"discarded"));
     let denied = std::fs::read(canary);
     let mut nested = None;
     if std::env::var_os("NUB_ADAPTER_PROBE_NESTED").is_none() {
@@ -53,6 +58,7 @@ fn native_adapter_child() {
         json!({
             "nul_read": nul_read.as_ref().is_ok_and(|n| *n == 0),
             "nul_write": nul_write.as_ref().is_ok_and(|n| *n == 9),
+            "absolute_nul": absolute_nul.as_ref().is_ok_and(|n| *n == 9),
             "canonical": canonical.is_ok(),
             "canary_denied": denied.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
             "nested": nested,
@@ -62,6 +68,7 @@ fn native_adapter_child() {
     if std::env::var_os("NUB_ADAPTER_PROBE_REQUIRE").is_some() {
         assert!(nul_read.is_ok_and(|n| n == 0));
         assert!(nul_write.is_ok_and(|n| n == 9));
+        assert!(absolute_nul.is_ok_and(|n| n == 9));
         assert!(canonical.is_ok());
         assert!(denied.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied));
         assert!(nested.is_none_or(|ok| ok));
@@ -82,7 +89,7 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
     std::fs::create_dir(&project).unwrap();
     let file = project.join("allowed");
     std::fs::write(&file, "allowed").unwrap();
-    let canary = root.path().join("withheld");
+    let canary = root.path().join("withheld-NUL");
     std::fs::write(&canary, "withheld").unwrap();
     let mut ambient: std::collections::BTreeMap<String, String> = std::env::vars().collect();
     ambient.insert(
@@ -205,7 +212,13 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
             assert_eq!(result["canonical"], false);
         }
         if mode == "plain" || mode == "adapter" {
-            for property in ["nul_read", "nul_write", "canonical", "nested"] {
+            for property in [
+                "nul_read",
+                "nul_write",
+                "absolute_nul",
+                "canonical",
+                "nested",
+            ] {
                 assert_eq!(result[property], true, "{mode} {property}: {result}");
             }
         }
