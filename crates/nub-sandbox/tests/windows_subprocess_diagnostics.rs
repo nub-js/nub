@@ -20,6 +20,106 @@ struct Target {
 }
 
 #[test]
+fn path_resolution_leaf() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, VOLUME_NAME_DOS, VOLUME_NAME_NT,
+    };
+
+    let Ok(project) = std::env::var("SANDBOX_DIAG_PROJECT") else {
+        return;
+    };
+    let file = File::open(Path::new(&project).join("input")).unwrap();
+    let resolve = |flags| {
+        let mut buffer = vec![0u16; 32768];
+        // SAFETY: the file owns a live handle and the buffer has the advertised capacity.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                flags,
+            )
+        };
+        if len == 0 {
+            json!({"error": std::io::Error::last_os_error().raw_os_error()})
+        } else {
+            assert!((len as usize) < buffer.len());
+            json!({"path": String::from_utf16(&buffer[..len as usize]).unwrap()})
+        }
+    };
+    println!(
+        "SANDBOX_SUBPROCESS_RESULT {}",
+        json!({"dos": resolve(VOLUME_NAME_DOS), "nt": resolve(VOLUME_NAME_NT),
+            "canary_readable": std::fs::read(std::env::var("SANDBOX_DIAG_CANARY").unwrap()).is_ok()})
+    );
+}
+
+#[test]
+#[ignore = "native AppContainer DOS versus NT path-resolution diagnostic"]
+fn windows_path_resolution_controls() {
+    let exe = std::env::current_exe().unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("sandbox-path-resolution-")
+        .tempdir_in(std::env::var_os("USERPROFILE").unwrap())
+        .unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("input"), "readable").unwrap();
+    std::fs::write(root.path().join("canary"), "withheld").unwrap();
+    let target = Target {
+        name: "path-resolution".into(),
+        program: exe.clone(),
+        args: Vec::new(),
+        root: exe.parent().unwrap().into(),
+    };
+    let env = environment(&target, "path-resolution", root.path());
+    let args = ["--exact", "path_resolution_leaf", "--nocapture"];
+    let control = Command::new(&exe)
+        .args(args)
+        .env_clear()
+        .envs(&env)
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(control.status.success(), "{control:?}");
+    let control = record(&control.stdout, &control.stderr);
+    assert!(control["dos"]["path"].is_string(), "{control}");
+    assert!(control["nt"]["path"].is_string(), "{control}");
+    assert_eq!(control["canary_readable"], true);
+    println!("PATH_RESOLUTION_PLAIN {control}");
+    let ctx = CompileCtx::new(
+        Homes {
+            home: root.path().join("home"),
+            cache: root.path().join("cache"),
+            tmp: root.path().join("tmp"),
+            project: project.clone(),
+        },
+        project.clone(),
+        ScopeCapabilities::approved(),
+        env.clone(),
+    );
+    let mut input = json!({"fs": {"./": "rw", "$tmp": "rw"}, "net": false});
+    input["fs"][exe.parent().unwrap().to_str().unwrap()] = json!("r");
+    let mut policy = compile(&input, &ctx).unwrap();
+    policy.env.constructed = env;
+    let sandbox = Sandbox::new(&policy).unwrap();
+    let prepared = sandbox
+        .prepare(CommandSpec::new(&exe).args(args).cwd(&project))
+        .unwrap();
+    assert!(prepared.degradation.lost.is_empty());
+    let output = tool_output::output(prepared);
+    assert!(output.status.success(), "{output:?}");
+    let result = record(&output.stdout, &output.stderr);
+    assert_eq!(result["canary_readable"], false, "{result}");
+    assert_eq!(result["nt"], control["nt"], "{result}");
+    // DOS translation is the measured compatibility result, not an enforcement assertion.
+    println!("PATH_RESOLUTION_CONFINED {result}");
+    sandbox.close();
+    nub_sandbox::cleanup().unwrap();
+}
+
+#[test]
 fn subprocess_leaf() {
     println!("SUBPROCESS_LEAF_OK");
 }
