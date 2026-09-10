@@ -4,41 +4,43 @@ The filesystem convenience set does not make every runtime compatible with every
 
 ## Test conditions
 
-The [native run at `0960f8a1b8`](https://github.com/nubjs/nub/actions/runs/34348165396) compares unconfined, explicit-path and tool-directory policies. The confined cases call the Rust engine directly with this filesystem policy:
+The fixtures compare unconfined, explicit-path and tool-directory policies. A tool-directory policy starts with:
 
 ```json
-{"fs":["./","$tooldirs","$tmp"]}
+{"fs":{"./":"rw","$tooldirs":"rw","$tmp":"rw"}}
 ```
 
 The fixtures also grant the tested interpreter's installation files and supply its environment and network requirements. Cache roots exist before acquisition. Neither the entire home directory nor the entire filesystem is granted. The exact fixtures are [JavaScript package managers](tests/tool_functionality.rs), [Python](tests/python_tool_functionality.rs), [native toolchains](tests/native_tool_functionality.rs) and [Git](tests/git_tool_functionality.rs).
 
 ## Versioned results
 
-“Pass” means both confined variants completed the sequence and the unconfined control passed. Windows native toolchains were tested on Server 2022 x86-64; the JavaScript, Python and Git suites also ran on Windows 11 arm64.
+“Pass” means the documented operation sequence and its unconfined control passed. “Adapter” requires the explicit runtime setup described below; raw execution remains unchanged. Writable cache parents are required where a tool removes and recreates its cache root.
 
-| Tool version | Linux x86-64 | macOS arm64 | Windows | Tested sequence or limit |
-| --- | --- | --- | --- | --- |
-| npm 11.6.2 | Pass | Pass | Pass | Install, reinstall, installed-bin execution, user-global operations and cache maintenance, with existing cache roots. |
-| pnpm 9.15.9 / 10.18.3 | Pass | Pass | Blocked | Windows confined commands reach the deadline; raw Node's global named-pipe behavior is an established backend incompatibility. |
-| pnpm 11.26.0 | Pass | Pass | Blocked | Windows local installation fails with `EPERM` from `realpath` on the project directory. This is distinct from the older versions' timeout. |
-| Yarn 1.22.22 | Blocked | Pass | Blocked | Linux process-memory inspection needs per-process procfs access; Windows IPC prevents completion. |
-| Yarn 2.4.2 / 3.8.7 / 4.17.0 | Pass | Pass | Pass | Install, reinstall and execution through the configured store. |
-| Bun 1.3.2 | Blocked | Blocked | Blocked | Installed-bin execution reports `CouldntReadCurrentDirectory`; a readable project does not grant arbitrary ancestors. |
-| Bun 1.4.0 | Blocked | Blocked | Blocked | Linux reports a JSON stack-depth error; macOS cache deletion needs a writable parent. Windows does not complete the confined sequence. |
-| pip 26.2.1 / uv 0.12.11 | Pass | Pass | Blocked | Windows pip cannot write inside its newly created private temp directory. Uv separately receives access denied while querying its interpreter; the exact denied operation is not established. Unix uv also passes with its default cache location. |
-| Cargo 1.91.1 | Pass with project target | Pass | Blocked | Build and clean pass with the default project-local target on Unix. Deleting a separately granted target root requires its parent's write permission. Windows compiler subprocess access is denied. |
-| rustup 1.29.0 | Pass | Pass | Pass | Installed toolchain and home queries; this does not certify installation of every toolchain. |
-| Go 1.25.1 | Pass | Pass | Blocked | User config write/read, build, install and cache cleanup. Server passes config write/read but compilation fails opening `NUL`. |
-| Gradle 8.14 | Pass | Pass | Blocked | Offline task, repeated task and daemon cleanup. On Windows, preparation reports that full networking cannot be supplied. The fixture rejects this before launching the workload; this is not a measured Gradle runtime failure. |
-| Maven 3.9.11 | Pass | Pass | Pass | Offline validation and clean; both commands execute the user startup file. |
-| .NET SDK 10.0.100 / NuGet | Blocked | Blocked | Pass | Restore, build and cache cleanup. Linux CoreCLR initialization fails; macOS requires shared `/tmp` coordination outside private temp. |
-| Composer 2.8.12 | Pass | Pass | Blocked | Cold/warm install without plugins or scripts, then cache cleanup. Windows confined subprocess access is denied. |
+The [initial version matrix](https://github.com/nubjs/nub/actions/runs/34348165396), [Linux/macOS tool-bundle run](https://github.com/nubjs/nub/actions/runs/34521317570), [Windows Node adapters](https://github.com/nubjs/nub/actions/runs/34400945240), [Windows Python adapter](https://github.com/nubjs/nub/actions/runs/34523672914) and [Windows 11 native tools](https://github.com/nubjs/nub/actions/runs/34405367987) provide the results below. An individual passing sequence does not make every job in its source run green.
 
-The JavaScript fixtures use Node 22.18.0. Bun 1.3.2 uses x64 emulation on Windows arm64. These are recorded versions, not minimum supported versions. Distinct pnpm and Yarn versions exercise their different storage layouts; adding a directory member does not imply that an older or newer runtime was tested.
+| Tool version | Linux x86-64 | macOS arm64 | Server 2022 x86-64 | Windows 11 arm64 | Tested sequence or limit |
+| --- | --- | --- | --- | --- | --- |
+| npm 11.6.2 | Pass | Pass | Pass | Pass | Install, reinstall, installed bin, user-global operations and cache maintenance. |
+| pnpm 9.15.9 / 10.18.3 / 11.26.0 | Pass | Pass | Adapter | Adapter | Full retained sequence with Node stdio/path helpers. Raw commands fail on subprocess pipes or path canonicalization. |
+| Yarn 1.22.22 | Pass | Pass | Adapter | Adapter | Install, bin, global install, cache cleanup and reinstall. Linux uses own-process metadata; Windows uses the Node helpers. |
+| Yarn 2.4.2 / 3.8.7 / 4.17.0 | Pass | Pass | Pass | Pass | Install, reinstall and execution through the configured store. |
+| Bun 1.3.2 | Partial | Partial | Blocked | Blocked | Retained install/bin/global/reinstall passes with bundle directory listings. Pruning populated host `bunx` caches requires additional write grants. |
+| Bun 1.4.0 | Pass | Pass | Blocked | Blocked | Linux/macOS retained install/bin/global/cache-cleanup/reinstall passes with a writable cache parent. This version honors private `TMPDIR`. Windows runtime limits remain unresolved. |
+| pip 26.2.1 | Pass | Pass | Adapter | Adapter | Local-wheel install, reinstall, import, user install and cache cleanup; Python 3.13.15 startup adapter preserves the package SID on private directories. |
+| uv 0.12.11 | Pass | Pass | Blocked | Blocked | Server interpreter subprocess access fails; Win11 installs packages but its installed tool trampoline fails canonicalization. |
+| Cargo 1.91.1 | Pass | Pass | Blocked | Pass | Build and clean with project-local target. Server subprocess access fails. |
+| rustup 1.29.0 / 1.29.1 | Pass | Pass | Pass | Pass | Installed-toolchain and home queries, not new toolchain installation. |
+| Go 1.25.1 | Pass | Pass | Blocked | Pass | User config, build, install and cache cleanup; Server compilation fails opening `NUL`. |
+| Gradle 8.14 | Pass | Pass | Qualified | Qualified | Offline task twice and daemon cleanup pass after acknowledging the specific full-networking limitation. |
+| Maven 3.9.11 | Pass | Pass | Pass | Pass | Offline validation and clean; both execute the user startup file. |
+| .NET SDK 10.0.100 / NuGet | Pass | Pass | Pass | Pass | Restore, build, cache cleanup and restore. Unix bundle includes process metadata/shared coordination; cache replacement uses a stable writable parent. |
+| Composer 2.8.12 | Pass | Pass | Blocked | Pass | Cold/warm install without plugins or scripts, then cache cleanup. Server subprocess access fails. |
+
+The JavaScript fixtures use Node 22.18.0. Windows 11 runs Cargo, Go and the JVM through x64 emulation; .NET uses ARM64. Bun 1.3.2 also uses x64 emulation there. These are recorded versions, not minimum supported versions. Distinct pnpm and Yarn versions exercise their storage layouts; adding a directory member does not establish compatibility with untested runtimes.
 
 ## Explicit Windows Node adapters
 
-The raw results above do not include runtime preloads. The [explicit-adapter run](https://github.com/nubjs/nub/actions/runs/34400945240), at `585cb0ee26`, tests `windows_node_compat_options` with Node 22.18.0 on Server 2022 x86-64 and Windows 11 arm64. Both hosts pass 14 cases, including four unconfined controls and two intentional root-only cache-cleanup denials.
+The [explicit-adapter run](https://github.com/nubjs/nub/actions/runs/34400945240), at `585cb0ee26`, tests `windows_node_compat_options` with Node 22.18.0 on Server 2022 x86-64 and Windows 11 arm64. Both hosts pass 14 cases, including four unconfined controls and two intentional root-only cache-cleanup denials.
 
 | Tool | Explicit-grant and tool-directory results |
 | --- | --- |
@@ -48,7 +50,6 @@ The raw results above do not include runtime preloads. The [explicit-adapter run
 The [fixture](tests/tool_functionality.rs) retains both cache-grant variants. This is opt-in Node adaptation, not a filesystem permission expansion or a change to raw execution. The helper includes no build-jail package-network policy. See the [setup and behavioral limits](README.md#explicit-windows-node-compatibility).
 
 ## Git
-
 
 The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. Windows sequences remain incomplete because of device and subprocess access restrictions.
 
@@ -65,7 +66,9 @@ Git creates an adjacent lock file and renames it when updating global configurat
 
 The writable directory admits the lock/rename protocol without granting all of home. The same principle applies to deleting a cache or build-output root. Configuration-file-only relocations still require explicit paths.
 
-For relocated NuGet caches, place them under one writable tool directory. This permits cache clearing and recreation without granting the parent of every arbitrary relocation:
+## Cache-root replacement
+
+Relocated NuGet caches can share one writable tool directory. This permits cache clearing and recreation without granting the parent of every arbitrary relocation:
 
 ```json
 {
@@ -101,6 +104,18 @@ This establishes that the tested Gradle workflow works with the narrower capabil
 - **Windows private ACLs:** applications can create protected directory ACLs that omit the AppContainer identity. Broader grants on an ancestor do not repair that behavior. Python's private-directory behavior exists in maintained older versions too; selecting an old minor release is not a general workaround.
 - **Windows devices and IPC:** filesystem paths do not grant access to every named pipe, the `NUL` device or additional networking capabilities. Server and Windows 11 results differ. The engine does not install administrator device permissions or loopback exemptions.
 - **Unix shared temp:** private `TMPDIR` does not relocate paths hardcoded by a runtime. The tool-directory bundle grants `/tmp/.dotnet` for .NET's shared coordination state. This directory is not private session data and survives session cleanup.
+
+### Unix Bun cache locations
+
+The [directory-listing run](https://github.com/nubjs/nub/actions/runs/34529167168) passes the retained Bun 1.3.2 and 1.4.0 sequences on Linux and macOS. The bundle supplies read-only directory listings for project ancestors and conventional temp; independent tests deny sibling file reads, writes, creation and deletion.
+
+Bun 1.3.2 hardcodes `/tmp` or `/private/tmp` for `bunx` downloads and pruning. Listing permits pruning an empty shared cache, but not creating or deleting its entries. Bun 1.4.0 instead checks `TMPDIR`, `TMP` and `TEMP`, allowing private session storage. The versioned fixtures preserve a populated host-cache canary rather than treating an empty-cache pass as general cleanup support.
+
+### Windows path resolution
+
+The [native path probe](https://github.com/nubjs/nub/actions/runs/34526954315) opens the granted file on both Windows hosts. Its NT path query succeeds, but its drive-letter query returns access denied; both plain queries succeed. The withheld-file canary remains denied.
+
+This is distinct from filesystem read permission. The [Microsoft report](https://github.com/microsoft/mxc/issues/694) identifies object-directory and mount-manager access needed by drive-letter translation. The engine does not modify those machine-wide permissions. The Node adapter handles its own realpath behavior, not arbitrary native programs' path queries.
 
 ### Linux failure isolation
 

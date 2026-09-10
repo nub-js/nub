@@ -770,6 +770,21 @@ fn bun_shared_cache_control(name: &str) {
     let env: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let policy = policy(root.path(), fs, &env);
     let sandbox = Sandbox::acquire(&policy).unwrap();
+    let setup = sandbox
+        .prepare(
+            CommandSpec::new(&tool.program)
+                .args(["-e", "const fs=require('fs'),p=require('path').join(require('os').tmpdir(),'bunx-'+process.getuid()+'-private-control');fs.mkdirSync(p);fs.writeFileSync(require('path').join(p,'entry'),'private');console.log(JSON.stringify(p))"])
+                .cwd(root.path().join("project"))
+                .redact_stdout(true)
+                .redact_stderr(true),
+        )
+        .unwrap();
+    assert!(setup.degradation.lost.is_empty(), "{:?}", setup.degradation);
+    let output = tool_output::output(setup);
+    assert_success(tool, "private bunx cache setup", &output);
+    let private: PathBuf = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(private.join("entry").is_file());
+    assert!(!private.starts_with(shared.path()));
     let prepared = sandbox
         .prepare(
             CommandSpec::new(&tool.program)
@@ -786,15 +801,24 @@ fn bun_shared_cache_control(name: &str) {
     );
     let output = tool_output::output(prepared);
     eprintln!("BUN_SHARED_CACHE {name} {output:?}");
-    assert!(
-        !output.status.success(),
-        "shared cache deletion requires a separate grant"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains(shared.path().file_name().unwrap().to_str().unwrap())
-    );
     assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside-session");
+    if name == "bun132" {
+        assert!(
+            !output.status.success(),
+            "shared cache deletion requires a separate grant"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(shared.path().file_name().unwrap().to_str().unwrap())
+        );
+        assert!(
+            private.join("entry").is_file(),
+            "Bun 1.3 ignores private TMPDIR here"
+        );
+    } else {
+        assert_success(tool, "private bunx cache cleanup", &output);
+        assert!(!private.exists(), "Bun 1.4 must clear the private cache");
+    }
     sandbox.close();
 }
 
