@@ -747,6 +747,71 @@ fn unix_bun140_retained_bundle() {
     run_unix_tool_control("bun140", true, false, None);
 }
 
+#[cfg(unix)]
+fn bun_shared_cache_control(name: &str) {
+    let tools = tools();
+    let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+    let root = fixture();
+    let (cache, global, env) = tool_env(tool, root.path());
+    for path in [&cache, &global] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    project_manifest(root.path());
+    // SAFETY: getuid has no preconditions or mutable process state.
+    let uid = unsafe { libc::getuid() };
+    let shared = tempfile::Builder::new()
+        .prefix(&format!("bunx-{uid}-sandbox-cache-control-"))
+        .tempdir_in("/tmp")
+        .unwrap();
+    let canary = shared.path().join("withheld");
+    std::fs::write(&canary, "outside-session").unwrap();
+    let mut fs = grant_fs(tool, root.path(), &cache, &global, true);
+    fs[cache.parent().unwrap().to_str().unwrap()] = json!("rw");
+    let env: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let policy = policy(root.path(), fs, &env);
+    let sandbox = Sandbox::acquire(&policy).unwrap();
+    let prepared = sandbox
+        .prepare(
+            CommandSpec::new(&tool.program)
+                .args(args(tool, &["pm", "cache", "rm"]))
+                .cwd(root.path().join("project"))
+                .redact_stdout(true)
+                .redact_stderr(true),
+        )
+        .unwrap();
+    assert!(
+        prepared.degradation.lost.is_empty(),
+        "{:?}",
+        prepared.degradation
+    );
+    let output = tool_output::output(prepared);
+    eprintln!("BUN_SHARED_CACHE {name} {output:?}");
+    assert!(
+        !output.status.success(),
+        "shared cache deletion requires a separate grant"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(shared.path().file_name().unwrap().to_str().unwrap())
+    );
+    assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside-session");
+    sandbox.close();
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun; populated shared-cache enforcement control"]
+fn unix_bun132_shared_cache_is_not_writable() {
+    bun_shared_cache_control("bun132");
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun; populated shared-cache enforcement control"]
+fn unix_bun140_shared_cache_is_not_writable() {
+    bun_shared_cache_control("bun140");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "serialized release timing with pinned native tools"]
