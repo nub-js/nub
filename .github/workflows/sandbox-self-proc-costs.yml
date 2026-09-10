@@ -44,6 +44,15 @@ jobs:
           set -o pipefail
           cd "$RUNNER_TEMP/sandbox-baseline"
           cargo test -p nub-sandbox --release --test self_proc_costs metadata_costs -- --ignored --nocapture --test-threads=1 2>&1 | tee "$GITHUB_WORKSPACE/reports/baseline.log"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.18.0'
+      - name: Measuring retained tool operations against plain controls
+        run: |
+          set -o pipefail
+          node scripts/sandbox-tool-fixtures.mjs > reports/provision.log 2>&1
+          cp .sandbox-tool-fixtures/matrix.json reports/tool-matrix.json
+          cargo test -p nub-sandbox --release --test tool_functionality linux_tool_bundle_release_costs -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/tool-costs.log
       - name: Preserving performance artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -590,6 +590,11 @@ fn run_tool_control(name: &str, control: ToolControl) {
 
 #[cfg(target_os = "linux")]
 fn run_self_proc_tool(name: &str, tooldirs: bool) {
+    run_self_proc_tool_control(name, tooldirs, false, None);
+}
+
+#[cfg(target_os = "linux")]
+fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -619,28 +624,48 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     let policy = policy(root.path(), fs, &env_refs);
-    let sandbox = Sandbox::acquire(&policy).unwrap();
+    let sandbox = (!unconfined).then(|| Sandbox::acquire(&policy).unwrap());
     let run = |argv: Vec<String>| {
         eprintln!(
             "SELF_PROC {} {} {argv:?}",
             tool.name,
             if tooldirs { "$tooldirs" } else { "exact" }
         );
-        let prepared = sandbox
-            .prepare(
-                CommandSpec::new(&tool.program)
-                    .args(argv)
-                    .cwd(root.path().join("project"))
-                    .redact_stdout(true)
-                    .redact_stderr(true),
-            )
-            .unwrap();
-        assert!(
-            prepared.degradation.lost.is_empty(),
-            "{:?}",
-            prepared.degradation
-        );
-        tool_output::output(prepared)
+        let started = std::time::Instant::now();
+        let output = if let Some(sandbox) = &sandbox {
+            let prepared = sandbox
+                .prepare(
+                    CommandSpec::new(&tool.program)
+                        .args(argv.clone())
+                        .cwd(root.path().join("project"))
+                        .redact_stdout(true)
+                        .redact_stderr(true),
+                )
+                .unwrap();
+            assert!(
+                prepared.degradation.lost.is_empty(),
+                "{:?}",
+                prepared.degradation
+            );
+            tool_output::output(prepared)
+        } else {
+            Command::new(&tool.program)
+                .args(&argv)
+                .env_clear()
+                .envs(&env)
+                .current_dir(root.path().join("project"))
+                .output()
+                .unwrap()
+        };
+        if let Some(sample) = sample {
+            println!(
+                "SELF_PROC_TOOL_COST {}",
+                json!({"tool": name, "tooldirs": tooldirs,
+                "unconfined": unconfined, "sample": sample, "argv": argv,
+                "ms": started.elapsed().as_secs_f64() * 1000.0})
+            );
+        }
+        output
     };
     for _ in 0..2 {
         assert_success(
@@ -680,11 +705,45 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
         serde_json::to_string(&canary).unwrap(),
         std::process::id()
     );
-    let output = run(vec!["-e".into(), script]);
-    assert_success(tool, "canaries after repeated commands", &output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("CANARY_DENIED"));
-    sandbox.close();
-    nub_sandbox::cleanup().unwrap();
+    if sandbox.is_some() {
+        let output = run(vec!["-e".into(), script]);
+        assert_success(tool, "canaries after repeated commands", &output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CANARY_DENIED"));
+    }
+    if let Some(sandbox) = sandbox {
+        sandbox.close();
+        nub_sandbox::cleanup().unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "serialized release timing with pinned native tools"]
+fn linux_tool_bundle_release_costs() {
+    use sha2::{Digest, Sha256};
+    if cfg!(debug_assertions) {
+        panic!("measure a release binary");
+    }
+    let exe = std::env::current_exe().unwrap();
+    let hash: String = Sha256::digest(std::fs::read(&exe).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!(
+        "SELF_PROC_TOOL_BINARY {}",
+        json!({"path": exe, "sha256": hash})
+    );
+    for tool in ["yarn1", "bun140"] {
+        for sample in 0..12 {
+            for unconfined in if sample % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                run_self_proc_tool_control(tool, true, unconfined, Some(sample));
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

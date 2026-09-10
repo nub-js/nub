@@ -83,6 +83,12 @@ The directory `/work/nuget` must exist at acquisition. Cache subdirectories may 
 
 ## Backend restrictions
 
+### Windows Python compatibility
+
+The [explicit startup adapter](README.md#python-private-directories-on-windows) passes pip 26.2.1's local-wheel install, reinstall, import, user install and cache cleanup with Python 3.13.15 on Server 2022 and Windows 11 arm64. The [native run](https://github.com/nubjs/nub/actions/runs/34523672914) also checks the resulting protected private-directory ACL, nested writes and denied-file canaries.
+
+This does not repair uv's native launcher. The same run still fails uv 0.12.11's interpreter query on Server and its installed entrypoint's path canonicalization on Windows 11. Adding read access to ancestor directory nodes does not repair either failure. These are not missing cache-directory grants, and the startup adapter is not a general native-process compatibility layer.
+
 ### Windows Gradle network qualification
 
 The strict matrix refuses Windows' `net-full` degradation before launching Gradle. A [separate execution probe](https://github.com/nubjs/nub/actions/runs/34403539949) explicitly acknowledges that limitation and passes on Server 2022 and Windows 11 arm64: Gradle 8.14 with Temurin 21.0.8 runs an offline task twice and performs daemon cleanup through one retained session. Its plain controls also pass. The [diagnostic test](tests/native_tool_functionality.rs) asserts the exact degradation rather than ignoring all unsupported permissions.
