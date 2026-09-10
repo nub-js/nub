@@ -2032,6 +2032,24 @@ impl SupervisedChild {
         self.reap(libc::WNOHANG)
     }
 
+    pub(super) fn wait_for_exit_event(&self) -> io::Result<()> {
+        let mut event = libc::pollfd {
+            fd: self.pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The retained pidfd becomes readable at exit. The timeout bounds
+        // cancellation latency without adding a fixed delay to short commands.
+        let result = unsafe { libc::poll(&mut event, 1, 20) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn reap(&mut self, flags: i32) -> io::Result<Option<std::process::ExitStatus>> {
         use std::os::unix::process::ExitStatusExt;
         if let Some(status) = self.status {

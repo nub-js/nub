@@ -782,7 +782,7 @@ impl PreparedChild {
                         "sandbox launch cancelled",
                     ));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                child.wait_for_exit_event()?;
                 continue;
             }
             #[cfg(target_os = "windows")]
