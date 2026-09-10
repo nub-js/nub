@@ -83,6 +83,7 @@ jobs:
           dotnet-version: '10.0.100'
       - name: Provisioning pinned tool controls
         id: tools
+        if: ${{ !cancelled() }}
         run: |
           node scripts/sandbox-tool-fixtures.mjs > reports/provision.log 2>&1
           cp .sandbox-tool-fixtures/matrix.json reports/js-matrix.json
