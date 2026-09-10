@@ -593,8 +593,19 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
     run_self_proc_tool_control(name, tooldirs, false, None);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
+    run_unix_tool_control(name, tooldirs, unconfined, sample, false);
+}
+
+#[cfg(unix)]
+fn run_unix_tool_control(
+    name: &str,
+    tooldirs: bool,
+    unconfined: bool,
+    sample: Option<usize>,
+    list_ancestors: bool,
+) {
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -615,7 +626,7 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
     fs.as_object_mut()
         .unwrap()
         .remove(cache.to_string_lossy().as_ref());
-    if !tooldirs {
+    if cfg!(target_os = "linux") && !tooldirs {
         fs["/proc/self/maps"] = json!("r");
         fs["/proc/self/stat"] = json!("r");
     }
@@ -623,7 +634,25 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let policy = policy(root.path(), fs, &env_refs);
+    let mut policy = policy(root.path(), fs, &env_refs);
+    if list_ancestors {
+        use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
+        // Diagnostic only: isolate directory enumeration from file-content access.
+        for path in root.path().join("project").ancestors().skip(1) {
+            policy.fs.rules.entries.push(FsRule {
+                matcher: CanonGlob(path.to_string_lossy().into_owned()),
+                effect: Effect::Allow,
+                access: FsAccess::Read,
+                origin: FsOrigin::Speculative,
+            });
+        }
+    }
+    let mut plain_env = policy.env.constructed.clone();
+    let plain_tmp = root.path().join("plain-tmp");
+    std::fs::create_dir(&plain_tmp).unwrap();
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        plain_env.insert(key.into(), plain_tmp.to_string_lossy().into_owned());
+    }
     let sandbox = (!unconfined).then(|| Sandbox::acquire(&policy).unwrap());
     let run = |argv: Vec<String>| {
         eprintln!(
@@ -652,7 +681,7 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
             Command::new(&tool.program)
                 .args(&argv)
                 .env_clear()
-                .envs(env.iter().map(|(key, value)| (key, value)))
+                .envs(&plain_env)
                 .current_dir(root.path().join("project"))
                 .output()
                 .unwrap()
@@ -700,10 +729,16 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
         "retained reinstall after prune",
         &run(args(tool, &["install", "--ignore-scripts"])),
     );
+    let mut denied_paths = vec![canary.to_string_lossy().into_owned()];
+    if cfg!(target_os = "linux") {
+        denied_paths.extend([
+            "/proc/self/environ".into(),
+            format!("/proc/{}/environ", std::process::id()),
+        ]);
+    }
     let script = format!(
-        "const fs=require('fs');for(const p of [{},'/proc/self/environ','/proc/{}/environ']){{try{{fs.readFileSync(p);process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}}}};console.log('CANARY_DENIED')",
-        serde_json::to_string(&canary).unwrap(),
-        std::process::id()
+        "const fs=require('fs');for(const p of {}){{try{{fs.readFileSync(p);process.exit(91)}}catch(e){{if(!['EACCES','EPERM'].includes(e.code))throw e}}}};console.log('CANARY_DENIED')",
+        serde_json::to_string(&denied_paths).unwrap()
     );
     if sandbox.is_some() {
         let output = run(vec!["-e".into(), script]);
@@ -714,6 +749,27 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
         sandbox.close();
         nub_sandbox::cleanup().unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
+fn unix_bun132_retained_bundle() {
+    run_unix_tool_control("bun132", true, false, None, false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun versions; directory-node enumeration diagnostic"]
+fn unix_bun132_retained_ancestor_nodes() {
+    run_unix_tool_control("bun132", true, false, None, true);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
+fn unix_bun140_retained_bundle() {
+    run_unix_tool_control("bun140", true, false, None, false);
 }
 
 #[cfg(target_os = "linux")]

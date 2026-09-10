@@ -107,6 +107,13 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/js-tools.log
+      - name: Exercising retained Bun versions and ancestor controls
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.tools.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --test tool_functionality bun132_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/bun132-plain.log
+          cargo test -p nub-sandbox --profile fast --test tool_functionality bun140_unconfined_normal_operations -- --ignored --nocapture 2>&1 | tee reports/bun140-plain.log
+          cargo test -p nub-sandbox --profile fast --test tool_functionality unix_bun -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/bun-retained.log
       - name: Exercising the .NET SDK tool bundle
         if: ${{ !cancelled() && runner.os != 'Windows' && steps.tools.outcome == 'success' }}
         run: |
