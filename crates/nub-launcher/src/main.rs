@@ -313,7 +313,7 @@ fn launch(view: &PayloadView<'_>, launcher_path: &Path) -> Result<ExitStatus> {
         }
     };
     // `cache::resolve` canonicalizes `app_dir`'s root, so these are absolute paths
-    // to files already covered by the exact payload-cache verification. They are
+    // to files already covered by the warm-cache readiness checks. They are
     // the only two cache paths that leave Rust and become Node arguments, so the
     // verbatim spelling stops here (see `node_argument`).
     let extracted = app_dir.as_ref().map(|dir| {
@@ -787,7 +787,7 @@ struct VerifiedWarmCache {
 ///
 /// The two conditions mirror the early returns in `acquire_embedded_node` and
 /// `ensure_app` — via the same path helpers, so a warm verdict and extraction
-/// cannot disagree. A published app needs no tree walk; the marker and entry
+/// cannot disagree. A published app needs no tree walk; the marker and launch-file
 /// checks below are independent of the number of extracted files.
 ///
 /// An already provisioned official Node needs no compile-cache marker because
@@ -900,14 +900,18 @@ fn app_cache_is_ready(manifest: &Manifest, cache_dir: &Path) -> bool {
         return false;
     }
 
-    // Keep a missing or replaced entry from qualifying as a warm cache. This is
-    // one metadata check, regardless of how many other files the payload holds.
+    // Check both paths handed to Node, regardless of how many other files the
+    // payload holds. The bootstrap is also needed by standalone preambles.
     if !is_safe_relative_name(&manifest.entry) || manifest.entry == CACHE_COMPLETE_MARKER {
         return false;
     }
-    let entry = cache_dir.join(&manifest.entry);
-    fs::symlink_metadata(&entry)
-        .is_ok_and(|metadata| metadata_is_trusted_regular_file(&entry, &metadata))
+    [manifest.entry.as_str(), compile::COMPILE_BOOTSTRAP_NAME]
+        .iter()
+        .all(|name| {
+            let path = cache_dir.join(name);
+            fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata_is_trusted_regular_file(&path, &metadata))
+        })
 }
 
 /// Validate the staged app against the payload before publication: exact names,
@@ -3707,6 +3711,7 @@ mod tests {
             manifest: test_manifest(),
             app_files: vec![
                 AppFile::plain("main.js", &b"app"[..]),
+                AppFile::plain(compile::COMPILE_BOOTSTRAP_NAME, &b"bootstrap"[..]),
                 AppFile::plain("nested/data.json", &br#"{"ok":true}"#[..]),
             ],
             node_blob: &[],
@@ -4373,12 +4378,11 @@ mod tests {
     }
 
     #[test]
-    fn warm_app_readiness_requires_a_marker_and_a_safe_regular_entry() {
+    fn warm_app_readiness_requires_a_marker_and_safe_regular_launch_files() {
         let base = fresh_cache_dir("app-warm-readiness");
         let mut view = test_view();
         let app_dir = materialize_test_app(&view, &base);
         let marker = app_dir.join(CACHE_COMPLETE_MARKER);
-        let entry = app_dir.join(&view.manifest.entry);
         assert!(app_cache_is_ready(&view.manifest, &app_dir));
 
         fs::write(&marker, b"incomplete").unwrap();
@@ -4390,15 +4394,21 @@ mod tests {
         fs::remove_dir(&marker).unwrap();
         write_file(&marker, b"").unwrap();
 
-        fs::remove_file(&entry).unwrap();
-        assert!(!app_cache_is_ready(&view.manifest, &app_dir));
-        assert_eq!(ensure_app(&view, &base).unwrap(), app_dir);
-        assert!(app_cache_matches_payload(&view, &app_dir));
-        fs::remove_file(&entry).unwrap();
-        fs::create_dir(&entry).unwrap();
-        assert!(!app_cache_is_ready(&view.manifest, &app_dir));
-        fs::remove_dir(&entry).unwrap();
-        write_file(&entry, b"app").unwrap();
+        for name in [
+            view.manifest.entry.as_str(),
+            compile::COMPILE_BOOTSTRAP_NAME,
+        ] {
+            let path = app_dir.join(name);
+            fs::remove_file(&path).unwrap();
+            assert!(!app_cache_is_ready(&view.manifest, &app_dir), "{name}");
+            assert_eq!(ensure_app(&view, &base).unwrap(), app_dir);
+            assert!(app_cache_matches_payload(&view, &app_dir));
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(!app_cache_is_ready(&view.manifest, &app_dir), "{name}");
+            assert_eq!(ensure_app(&view, &base).unwrap(), app_dir);
+            assert!(app_cache_matches_payload(&view, &app_dir));
+        }
 
         for name in ["../outside.js", "/outside.js", CACHE_COMPLETE_MARKER] {
             view.manifest.entry = name.to_string();
@@ -4409,7 +4419,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn warm_app_readiness_rejects_writable_roots_and_marker_or_entry_symlinks() {
+    fn warm_app_readiness_rejects_writable_roots_and_launch_file_symlinks() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let base = fresh_cache_dir("app-warm-trust");
@@ -4420,6 +4430,7 @@ mod tests {
             app_dir.parent().unwrap().to_path_buf(),
             app_dir.join(CACHE_COMPLETE_MARKER),
             app_dir.join(&view.manifest.entry),
+            app_dir.join(compile::COMPILE_BOOTSTRAP_NAME),
         ] {
             let permissions = fs::metadata(&path).unwrap().permissions();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
@@ -4427,7 +4438,11 @@ mod tests {
             fs::set_permissions(&path, permissions).unwrap();
             assert!(app_cache_is_ready(&view.manifest, &app_dir));
         }
-        for name in [CACHE_COMPLETE_MARKER, &view.manifest.entry] {
+        for name in [
+            CACHE_COMPLETE_MARKER,
+            &view.manifest.entry,
+            compile::COMPILE_BOOTSTRAP_NAME,
+        ] {
             let path = app_dir.join(name);
             let moved = base.join("moved");
             fs::rename(&path, &moved).unwrap();
@@ -4447,6 +4462,7 @@ mod tests {
         let dest = app_cache_dir(&base, &view.manifest);
         create_staging_dir(&staged).unwrap();
         write_file(&staged.join(&view.manifest.entry), b"app").unwrap();
+        write_file(&staged.join(compile::COMPILE_BOOTSTRAP_NAME), b"bootstrap").unwrap();
 
         let error = publish_cache_dir(&staged, &dest, |dir| {
             // The entry and marker exist, but nested/data.json is absent.

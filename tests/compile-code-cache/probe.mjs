@@ -133,6 +133,22 @@ assert.equal(fs.readFileSync(unused, "utf8"), "unused embedded asset");
 assert.equal(fs.statSync(marker).size, 0);
 console.log("PASS concurrent extraction publication");
 
+const bootstrap = path.join(appDir, "__nub_compile_bootstrap.cjs");
+fs.rmSync(bootstrap);
+run("missing-bootstrap-repair");
+fs.rmSync(bootstrap);
+fs.mkdirSync(bootstrap);
+run("invalid-bootstrap-repair");
+assert.ok(fs.lstatSync(bootstrap).isFile());
+if (process.platform !== "win32") {
+  const replacement = path.join(root, "replacement-bootstrap.cjs");
+  fs.writeFileSync(replacement, "throw new Error('replaced bootstrap executed')");
+  fs.rmSync(bootstrap);
+  fs.symlinkSync(replacement, bootstrap);
+  run("symlinked-bootstrap-repair");
+  assert.ok(fs.lstatSync(bootstrap).isFile());
+}
+
 if (process.platform !== "win32") {
   const dirs = [appDir, path.dirname(appDir)];
   const modes = dirs.map((dir) => fs.statSync(dir).mode & 0o777);
