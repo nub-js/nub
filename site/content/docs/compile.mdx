@@ -901,6 +901,8 @@ The default shape extracts Node under `compile-node/<version>-<hash>`, keyed by 
 
 Each candidate is tried for real. A read-only cold cache is skipped rather than fatal, and a `noexec` cache is skipped only when that cache must supply Node. A `--smol` binary with a proven external Node can use it for app data. A binary on AWS Lambda or in a `readOnlyRootFilesystem` pod falls through to the temp directory when needed. When no candidate works, the error reports the directories it tried and why each was unsuitable.
 
+The app's extracted files are validated before publication, not scanned on every launch. Later runs check the private cache directory, completion marker, and entry file. If other extracted files are modified or deleted afterward, remove that app's extraction directory to restore them on the next run.
+
 For a locked-down Linux deploy, warm the cache at image-build time in an executable XDG cache directory. The extraction lands in an ordinary layer, and the runtime hit writes nothing at all.
 
 ```dockerfile

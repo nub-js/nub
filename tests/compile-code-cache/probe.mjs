@@ -11,6 +11,7 @@ const nub = path.resolve(args.get("--nub"));
 const root = path.resolve(args.get("--out"));
 const target = args.get("--target") ?? "26.6.0";
 const expectCache = args.get("--expect-cache") !== "false";
+const expectWarmReuse = args.get("--expect-warm-reuse") !== "false";
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("NODE_") && !key.startsWith("__NUB_") && !key.startsWith("NUB_")));
 for (const key of ["NVM_DIR", "FNM_DIR", "VOLTA_HOME", "ASDF_DATA_DIR", "MISE_DATA_DIR"]) delete env[key];
 env.PATH = path.dirname(process.execPath) + path.delimiter + env.PATH;
@@ -29,6 +30,7 @@ write("node_modules/cache-fixture/package.json", JSON.stringify({ name: "cache-f
 write("node_modules/cache-fixture/index.js", "import fs from 'node:fs'; if(process.env.CACHE_PROBE_EFFECT) fs.writeFileSync(process.env.CACHE_PROBE_EFFECT,'executed');\n" +
   Array.from({ length: 8000 }, (_, i) => `export function f${i}(x) { return x + ${i}; }`).join("\n"));
 write("asset.txt", "embedded asset");
+write("unused.txt", "unused embedded asset");
 write("a.mjs", "import {b} from './b.mjs'; export function a(){return 'a'}; export const pair = a()+b();");
 write("b.mjs", "import {a} from './a.mjs'; export function b(){return a()+'b'};");
 write("late.mjs", "await Promise.resolve(); export const answer=42;");
@@ -58,7 +60,7 @@ function compile(name, entry, flags) {
   assert.equal(fs.existsSync(effect), false, "the build evaluated application code");
   return out;
 }
-const flags = ["--unbundled", "cache-fixture", "--include", path.join(source, "asset.txt")];
+const flags = ["--unbundled", "cache-fixture", "--include", path.join(source, "asset.txt"), "--include", path.join(source, "unused.txt")];
 const binary = compile("large", "main.mjs", flags);
 const smol = compile("smol", "main.mjs", ["--smol", ...flags]);
 const small = compile("small", "small.mjs", []);
@@ -84,6 +86,63 @@ const seeded = fs.readdirSync(cold.data.cache).some((name) => name.startsWith(".
 assert.equal(seeded, expectCache, "pack installation did not match the compiler under test");
 if (expectCache) assert.match(cold.result.stderr, /V8 code cache for ESM .*cache-fixture\/index\.js was accepted/);
 run("warm");
+
+let appDir = path.dirname(fileURLToPath(cold.data.url));
+while (!fs.existsSync(path.join(appDir, ".nub-complete"))) {
+  const parent = path.dirname(appDir);
+  assert.notEqual(parent, appDir, "the compiled entry must belong to a published extraction");
+  appDir = parent;
+}
+const marker = path.join(appDir, ".nub-complete");
+function filesUnder(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(dir, entry.name);
+    return entry.isDirectory() ? filesUnder(file) : [file];
+  });
+}
+const unused = filesUnder(appDir).find((file) => path.basename(file) === "unused.txt");
+assert.ok(unused, "the unused included asset must be extracted");
+const extraFile = path.join(appDir, "runtime-generated.txt");
+fs.writeFileSync(extraFile, "not in the payload");
+fs.rmSync(unused);
+run("published-cache-reuse");
+assert.equal(fs.existsSync(extraFile), expectWarmReuse, "warm reuse rescanned or replaced the published tree");
+assert.equal(fs.existsSync(unused), !expectWarmReuse, "warm reuse repaired an unrelated missing file");
+
+fs.rmSync(marker);
+run("missing-marker-repair");
+assert.equal(fs.readFileSync(unused, "utf8"), "unused embedded asset");
+assert.equal(fs.existsSync(extraFile), false);
+fs.writeFileSync(marker, "incomplete");
+run("invalid-marker-repair");
+assert.equal(fs.statSync(marker).size, 0);
+
+// Publication must remain recoverable even when several processes extract at once.
+fs.rmSync(appDir, { recursive: true });
+await Promise.all(Array.from({ length: 4 }, (_, i) => new Promise((resolve, reject) => {
+  const child = spawn(binary, [], { env: runEnv, cwd: foreign });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (data) => { stdout += data; });
+  child.stderr.on("data", (data) => { stderr += data; });
+  child.on("error", reject);
+  child.on("close", (status) => {
+    try { check({ status, stdout, stderr }, `concurrent-extraction-${i}`); resolve(); } catch (error) { reject(error); }
+  });
+})));
+assert.equal(fs.readFileSync(unused, "utf8"), "unused embedded asset");
+assert.equal(fs.statSync(marker).size, 0);
+console.log("PASS concurrent extraction publication");
+
+if (process.platform !== "win32") {
+  const dirs = [appDir, path.dirname(appDir)];
+  const modes = dirs.map((dir) => fs.statSync(dir).mode & 0o777);
+  try {
+    for (const dir of dirs) fs.chmodSync(dir, 0o500);
+    run("read-only-published-app");
+  } finally {
+    dirs.forEach((dir, i) => fs.chmodSync(dir, modes[i]));
+  }
+}
 run("disabled", { NODE_DISABLE_COMPILE_CACHE: "1" });
 run("portable", { NODE_COMPILE_CACHE: path.join(root, "portable"), NODE_COMPILE_CACHE_PORTABLE: "1" });
 const readOnly = path.join(root, "read-only");

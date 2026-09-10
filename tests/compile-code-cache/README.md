@@ -14,9 +14,10 @@ The fixture covers:
 - Package-scoped ESM `.js`, an embedded asset, cyclic imports, top-level await, dynamic imports, and a worker.
 - No application evaluation during compilation.
 - Cold and warm execution, disabled and portable caches, different V8 flags, an unavailable cache directory, and a user preload.
-- Concurrent cache publication, an unchanged `--smol` artifact, and the small-program path.
+- Published-app reuse without repairing unrelated files, missing/invalid-marker repair, concurrent extraction, and read-only published directories.
+- Concurrent code-cache publication, an unchanged `--smol` artifact, and the small-program path.
 
-For a merge-base control, pass `--expect-cache false`. The same program must still produce identical results, without a packaged-cache completion marker.
+For a control predating packaged bytecode, pass `--expect-cache false`. For a launcher that still scans the full extracted tree on warm runs, also pass `--expect-warm-reuse false`. The application output must match in every case.
 
 The lower-level tests exercise cache relocation, source validation, damaged packs, reproducible generation, and read-only caches with writable directories on Node 26.8 or later:
 
