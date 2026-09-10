@@ -775,6 +775,7 @@ fn windows_bun140_link_primitives_and_global_sources() {
         for source in ["folder", "archive"] {
             let root = fixture();
             let package = fixture_package(root.path());
+            project_manifest(root.path());
             let archive = root.path().join("project/package.tgz");
             let packed = Command::new("tar")
                 .args(["-czf"])
