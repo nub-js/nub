@@ -3665,6 +3665,7 @@ mod tests {
     /// and fails on another for a reason that has nothing to do with what it tests.
     /// Production never has the problem: it writes through `create_private_file`,
     /// which pins 0o600 at open time and again afterwards.
+    #[cfg(unix)]
     fn write_staged_fixture(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).unwrap();
         #[cfg(unix)]
