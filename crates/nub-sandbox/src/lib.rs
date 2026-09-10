@@ -79,6 +79,17 @@ pub mod matcher;
 pub mod policy;
 pub mod proxy;
 
+/// Python startup source repairing private-directory creation inside AppContainer.
+///
+/// Execute it from an embedder-owned `sitecustomize.py` available on `PYTHONPATH`.
+/// It preserves the protected owner/admin/system ACL and adds only the current
+/// package SID. Other mkdir modes and non-AppContainer processes are unchanged.
+/// Python isolated/no-site modes do not load this hook. This opt-in adapter adds
+/// no filesystem grants and cannot repair native descendants' device/IPC access.
+pub fn windows_python_compat_source() -> &'static str {
+    include_str!("backend/windows_python_compat.py")
+}
+
 /// What the kernel refused a confined launch, keyed by [`CommandSpec::audit_label`]. macOS
 /// answers from the unified log; every other host answers with an empty list. Failure path only.
 pub use backend::macos_denials;

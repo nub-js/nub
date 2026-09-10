@@ -208,6 +208,24 @@ sandbox.close();
 nub_sandbox::cleanup()?;
 ```
 
+### Python private directories on Windows
+
+Python versions affected by [CPython #134587](https://github.com/python/cpython/issues/134587) create private directories with an ACL that excludes their own AppContainer. Broader ancestor grants cannot fix the non-inheriting child ACL.
+
+The engine supplies an explicit startup adapter:
+
+```rust,ignore
+// Add to an embedder-owned sitecustomize.py on the child's PYTHONPATH.
+std::fs::write(startup.join("sitecustomize.py"), nub_sandbox::windows_python_compat_source())?;
+```
+
+The adapter retains Python's protected owner/admin/system permissions and adds only the current package SID. It changes `os.mkdir(..., 0o700)` inside AppContainer; other modes and ordinary Python processes are unchanged.
+
+- The embedder owns the startup directory, grants it read access and composes its contents with any existing startup hooks.
+- Python's isolated mode, `-S`, or a replaced `PYTHONPATH` can prevent this hook from loading.
+- The adapter grants no additional filesystem paths. It cannot repair native subprocesses' `NUL` device or named-pipe access.
+- The sandbox's OS enforcement remains in force whether or not the adapter loads.
+
 ### Explicit Windows Node compatibility
 
 Raw execution does not detect runtimes or inject compatibility code. Windows embedders can opt into the Node stdio and realpath adapters before acquiring a session:

@@ -626,6 +626,103 @@ fn run_tool_control(name: &str, label: &str, tooldirs: Option<bool>) {
     }
 }
 
+#[cfg(windows)]
+fn run_python_adapter(name: &str, tooldirs: bool) {
+    let tool = tool(name);
+    let root = fixture();
+    let paths = configured_paths(root.path());
+    initialize_configured_roots(&paths);
+    let mut env = env_for(root.path(), &tool, &paths);
+    let startup = root.path().join("project/python-startup");
+    std::fs::create_dir(&startup).unwrap();
+    std::fs::write(
+        startup.join("sitecustomize.py"),
+        nub_sandbox::windows_python_compat_source(),
+    )
+    .unwrap();
+    let existing = env.get("PYTHONPATH").unwrap();
+    env.insert(
+        "PYTHONPATH".into(),
+        format!("{};{existing}", startup.display()),
+    );
+    let policy = grant_policy(&tool, root.path(), &paths, env.clone(), tooldirs);
+    let retained = Sandbox::acquire(&policy).unwrap();
+    // Separate one-shot acquisitions share this live resource throughout the sequence.
+    let probe = r#"import os, pathlib, tempfile
+assert getattr(os.mkdir, '_appcontainer_compatible', False)
+p = pathlib.Path(tempfile.mkdtemp())
+(p / 'allowed').write_text('OK')
+assert (p / 'allowed').read_text() == 'OK'
+try:
+    os.mkdir(p, 0o700)
+except FileExistsError:
+    pass
+else:
+    raise AssertionError('existing private directory must fail')
+try:
+    os.mkdir('bad\0path', 0o700)
+except ValueError:
+    pass
+else:
+    raise AssertionError('embedded NUL must fail')
+os.mkdir(p / 'nested', 0o700)
+(p / 'nested' / 'allowed').write_text('NESTED')
+os.mkdir(p / 'ordinary', 0o777)
+print('PRIVATE_DIRECTORY_OK')
+"#;
+    assert_success(
+        &tool,
+        "private directory adapter",
+        &invoke_python(&tool, &["-c", probe], root.path(), &env, Some(&policy)),
+    );
+    match name {
+        "pip" => run_pip_operations(&tool, root.path(), &env, Some(&policy)),
+        "uv" => run_uv_operations(&tool, root.path(), &env, Some(&policy), &paths.uv_cache),
+        _ => unreachable!(),
+    }
+    let secret = root.path().join("denied-secret");
+    std::fs::write(&secret, "WITHHELD").unwrap();
+    let canary = format!(
+        "from pathlib import Path\ntry:\n Path({}).read_text()\nexcept PermissionError:\n print('CANARY_DENIED')\nelse:\n raise AssertionError('canary exposed')",
+        serde_json::to_string(secret.to_str().unwrap()).unwrap()
+    );
+    assert_success(
+        &tool,
+        "adapter permission canary",
+        &invoke_python(&tool, &["-c", &canary], root.path(), &env, Some(&policy)),
+    );
+    retained.close();
+    nub_sandbox::cleanup().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native Python tool matrix"]
+fn windows_adapter_pip_exact() {
+    run_python_adapter("pip", false);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native Python tool matrix"]
+fn windows_adapter_pip_tooldirs() {
+    run_python_adapter("pip", true);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native Python tool matrix"]
+fn windows_adapter_uv_exact() {
+    run_python_adapter("uv", false);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native Python tool matrix"]
+fn windows_adapter_uv_tooldirs() {
+    run_python_adapter("uv", true);
+}
+
 macro_rules! python_tool_test {
     ($name:ident, $tool:literal, $label:literal, $tooldirs:expr) => {
         #[test]
