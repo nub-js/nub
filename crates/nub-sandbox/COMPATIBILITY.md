@@ -65,6 +65,22 @@ Git creates an adjacent lock file and renames it when updating global configurat
 
 The writable directory admits the lock/rename protocol without granting all of home. The same principle applies to deleting a cache or build-output root. Configuration-file-only relocations still require explicit paths.
 
+For relocated NuGet caches, place them under one writable tool directory. This permits cache clearing and recreation without granting the parent of every arbitrary relocation:
+
+```json
+{
+  "fs": {"./": "rw", "$tooldirs": "rw", "/work/nuget": "rw", "$tmp": "rw"},
+  "vars": {
+    "NUGET_PACKAGES": "/work/nuget/packages",
+    "NUGET_HTTP_CACHE_PATH": "/work/nuget/http-cache",
+    "NUGET_SCRATCH": "/work/nuget/scratch",
+    "NUGET_PLUGINS_CACHE_PATH": "/work/nuget/plugins-cache"
+  }
+}
+```
+
+The directory `/work/nuget` must exist at acquisition. Cache subdirectories may then be created, cleared and recreated during the session. Using the conventional `~/.nuget` parent instead is already covered by `$tooldirs`.
+
 ## Backend restrictions
 
 ### Windows Gradle network qualification

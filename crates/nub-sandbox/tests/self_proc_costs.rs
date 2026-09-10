@@ -45,10 +45,12 @@ fn metadata_costs() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     println!("SELF_PROC_BINARY {}", json!({"path": exe, "sha256": hash}));
-    for metadata in [false, true] {
-        if metadata && std::env::var_os("SELF_PROC_BASELINE").is_some() {
+    let baseline = std::env::var_os("SELF_PROC_BASELINE").is_some();
+    for mode in ["exact", "metadata", "tooldirs"] {
+        if mode == "metadata" && baseline {
             continue;
         }
+        let metadata = mode != "exact" && !baseline;
         for loops in [0, 2000] {
             let root = tempfile::tempdir().unwrap();
             std::fs::write(root.path().join("allowed"), "ALLOWED").unwrap();
@@ -65,7 +67,9 @@ fn metadata_costs() {
             );
             let mut value = json!({"fs":{"./":"rw", "$tmp":"rw"}, "net": false});
             value["fs"][exe.parent().unwrap().to_string_lossy().as_ref()] = json!("r");
-            if metadata {
+            if mode == "tooldirs" {
+                value["fs"]["$tooldirs"] = json!("rw");
+            } else if metadata {
                 value["fs"]["/proc/self/maps"] = json!("r");
                 value["fs"]["/proc/self/stat"] = json!("r");
             }
@@ -78,7 +82,7 @@ fn metadata_costs() {
             let sandbox = Sandbox::acquire(&policy).unwrap();
             println!(
                 "SELF_PROC_ACQUIRE {}",
-                json!({"metadata":metadata,"ms":acquire.elapsed().as_secs_f64()*1000.0})
+                json!({"policy_mode":mode,"metadata":metadata,"ms":acquire.elapsed().as_secs_f64()*1000.0})
             );
             for sample in 0..24 {
                 // Alternate order rather than putting every plain control before its subject.
@@ -118,7 +122,7 @@ fn metadata_costs() {
                         .unwrap();
                     println!(
                         "SELF_PROC_COST {}",
-                        json!({"metadata":metadata,"confined":confined,"sample":sample,"total_ms":total_ms,"opens":loops,"open_ms":open_ms})
+                        json!({"policy_mode":mode,"metadata":metadata,"confined":confined,"sample":sample,"total_ms":total_ms,"opens":loops,"open_ms":open_ms})
                     );
                 }
             }
@@ -127,7 +131,7 @@ fn metadata_costs() {
             nub_sandbox::cleanup().unwrap();
             println!(
                 "SELF_PROC_CLOSE {}",
-                json!({"metadata":metadata,"ms":close.elapsed().as_secs_f64()*1000.0})
+                json!({"policy_mode":mode,"metadata":metadata,"ms":close.elapsed().as_secs_f64()*1000.0})
             );
         }
     }

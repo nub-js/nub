@@ -93,10 +93,13 @@ fn env_for(root: &Path, tool: &Tool) -> BTreeMap<String, String> {
         ("GOBIN", home.join("go-bin")),
         ("GOTMPDIR", root.join("go-tmp")),
         ("GRADLE_USER_HOME", home.join("gradle")),
-        ("NUGET_PACKAGES", home.join("nuget-packages")),
-        ("NUGET_HTTP_CACHE_PATH", home.join("nuget-http")),
-        ("NUGET_SCRATCH", home.join("nuget-scratch")),
-        ("NUGET_PLUGINS_CACHE_PATH", home.join("nuget-plugins")),
+        ("NUGET_PACKAGES", home.join(".nuget/packages")),
+        ("NUGET_HTTP_CACHE_PATH", home.join(".nuget/http-cache")),
+        ("NUGET_SCRATCH", home.join(".nuget/scratch")),
+        (
+            "NUGET_PLUGINS_CACHE_PATH",
+            home.join(".nuget/plugins-cache"),
+        ),
         ("COMPOSER_HOME", home.join("composer-home")),
         ("COMPOSER_CACHE_DIR", home.join("composer-cache")),
         ("COMPOSER_VENDOR_DIR", root.join("project/vendor")),
@@ -214,6 +217,10 @@ fn policy(
             Value::String("rw".into()),
         );
         if tool.name == "nuget" {
+            fs.insert(
+                root.join("home/.nuget").to_string_lossy().into(),
+                Value::String("rw".into()),
+            );
             fs.insert(
                 nuget_config(root).to_string_lossy().into(),
                 Value::String("rw".into()),

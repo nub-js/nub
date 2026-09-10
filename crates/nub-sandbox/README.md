@@ -28,7 +28,7 @@ The filesystem boolean `false` grants no authored paths; `true` requests unrestr
 | `$home`, `~` | Home root supplied in `CompileCtx`. | `"$home/.config/tool": "r"` |
 | `$cache` | One standard OS cache root, supplied in `CompileCtx`. | `"$cache/tool": "rw"` |
 | `$tmp` | Managed private storage retained for the resource's lifetime. | `"$tmp": "rw"` |
-| `$tooldirs` | A union of conventional tool directories and approved environment relocations. | `"$tooldirs": "rw"` |
+| `$tooldirs` | Conventional tool directories, environment relocations and bounded process/coordination capabilities. | `"$tooldirs": "rw"` |
 
 The standard cache roots are `XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, and `LOCALAPPDATA` on Windows. The cache convenience does not include every tool's storage location. A dot-directory outside that root needs its own grant unless it is a member of the tool-directory set:
 
