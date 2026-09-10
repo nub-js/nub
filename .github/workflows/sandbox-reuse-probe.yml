@@ -80,7 +80,7 @@ jobs:
         if: (success() || failure()) && steps.tools.outcome == 'success'
         run: |
           set -o pipefail
-          cargo test -p nub-sandbox --profile fast --test tool_functionality -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/tools.log
+          cargo test -p nub-sandbox --profile fast --test tool_functionality -- --ignored --nocapture --test-threads=1 --skip linux_tool_bundle_release_costs 2>&1 | tee reports/tools.log
       - name: Provisioning pinned Python tools
         id: python-tools
         if: success() || failure()

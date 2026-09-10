@@ -593,7 +593,7 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
     run_self_proc_tool_control(name, tooldirs, false, None);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
     run_unix_tool_control(name, tooldirs, unconfined, sample, false);
 }

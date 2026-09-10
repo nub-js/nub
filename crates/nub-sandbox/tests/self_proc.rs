@@ -421,6 +421,21 @@ mod linux {
 
     #[test]
     fn cancellation_reclaims_metadata_workers_and_descriptors() {
+        if std::env::var_os("SELF_PROC_COUNTER_OWNER").is_none() {
+            // Whole-process counts need an isolated test host, not sibling tests'
+            // concurrently opening descriptors and creating supervisor threads.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::cancellation_reclaims_metadata_workers_and_descriptors",
+                    "--nocapture",
+                ])
+                .env("SELF_PROC_COUNTER_OWNER", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         let (root, sandbox) = fixture(&["maps", "stat"]);
         let counts = || {
             (
