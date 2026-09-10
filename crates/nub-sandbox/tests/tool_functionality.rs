@@ -652,7 +652,7 @@ fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, samp
             Command::new(&tool.program)
                 .args(&argv)
                 .env_clear()
-                .envs(&env)
+                .envs(env.iter().map(|(key, value)| (key, value)))
                 .current_dir(root.path().join("project"))
                 .output()
                 .unwrap()
