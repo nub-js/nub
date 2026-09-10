@@ -117,6 +117,7 @@ pub(crate) struct AppContainerLaunch {
     egress_funnel: Option<NetPolicy>,
     /// A stable profile-owned slot, resolved only after policy identity acquisition.
     private_tmp: bool,
+    pub(super) native_compat: bool,
     stdout: WindowsStdio,
     stderr: WindowsStdio,
 }
@@ -1000,6 +1001,7 @@ pub(crate) fn apply(
         // `run()` launches the co-package helper over this policy and injects its proxy env.
         egress_funnel: funnel.then(|| policy.net.clone()),
         private_tmp,
+        native_compat: false,
         stdout: if spec.redact_stdout {
             WindowsStdio::Piped
         } else {
@@ -2104,6 +2106,7 @@ pub(super) mod launch {
         sid: SidGuard,
         private_tmp: Option<PathBuf>,
         window_objects: Vec<super::windows_registry::WindowObject>,
+        native_compat: Option<PathBuf>,
     }
 
     impl Drop for ResourceState {
@@ -2240,7 +2243,28 @@ pub(super) mod launch {
             #[cfg(test)]
             test_crash_transition("profile-created", &name, &profile_folder);
             let private_tmp = self.private_tmp.then(|| profile_folder.join("Temp"));
+            let native_compat = self
+                .native_compat
+                .then(|| crate::backend::windows_native_compat::asset_path(&name))
+                .transpose()?;
             if resource.fresh {
+                if let Some(path) = &native_compat {
+                    acquisition_step(
+                        "native-assets",
+                        crate::backend::windows_native_compat::install(&mut resource, path),
+                    )?;
+                    grant_recorded_ace(
+                        &mut resource,
+                        path,
+                        ac_sid,
+                        (
+                            super::windows_registry::AclKind::Subtree,
+                            GENERIC_READ | GENERIC_EXECUTE,
+                        ),
+                        false,
+                        false,
+                    )?;
+                }
                 acquisition_step(
                     "profile-journal",
                     resource.record_private_path(&profile_folder),
@@ -2389,6 +2413,7 @@ pub(super) mod launch {
                 sid,
                 private_tmp,
                 window_objects,
+                native_compat,
             })))
         }
 
@@ -2751,6 +2776,13 @@ pub(super) mod launch {
                 last_exit: None,
             };
             before_resume(child.pid)?;
+            if let Some(path) = self
+                .state
+                .as_ref()
+                .and_then(|state| state.native_compat.as_deref())
+            {
+                crate::backend::windows_native_compat::inject(child.process.0, path)?;
+            }
             if unsafe { ResumeThread(thread.0) } == u32::MAX {
                 let error = io::Error::last_os_error();
                 let _ = child.kill();
@@ -3423,7 +3455,15 @@ pub(super) mod launch {
             launch.egress_funnel.is_some(),
         )?
         .with_network(launch.egress_funnel.as_ref())
-        .map(|identity| identity.with_private_tmp(launch.private_tmp))
+        .map(|identity| {
+            identity
+                .with_private_tmp(launch.private_tmp)
+                .with_native_compat(
+                    launch
+                        .native_compat
+                        .then(crate::backend::windows_native_compat::version),
+                )
+        })
     }
 
     /// Derive the stable SID for an already-created policy-named profile.  This is

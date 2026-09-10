@@ -114,6 +114,7 @@ features = [
 # `preserve_order` is deliberately NOT requested: the generator emits list order as
 # written, and none of the catalog's objects carry last-match-wins semantics.
 [build-dependencies]
+cc = "1"
 serde_json = { workspace = true }
 # The shared validator (`src/catalog.rs`, pulled into build.rs with `#[path]`) parses each
 # entry's `versions` range, so the build-script copy needs the same crate the library one does.

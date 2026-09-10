@@ -98,6 +98,15 @@ impl PolicyIdentity {
         self
     }
 
+    pub(crate) fn with_native_compat(mut self, version: Option<&str>) -> Self {
+        if let Some(version) = version {
+            self.canonical.push_str("\nnative-compat=");
+            self.canonical.push_str(version);
+            self.hash = hex(&Sha256::digest(self.canonical.as_bytes()));
+        }
+        self
+    }
+
     /// Retained leases stay keyed by policy; only a new acquisition resolves a new
     /// resource incarnation. File contents and timestamps do not affect identity.
     pub(crate) fn with_objects(
@@ -815,6 +824,22 @@ fn prune_with(file: &mut RegistryFile, live: impl Fn(&str) -> bool) {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn native_assets_path(profile: &str) -> io::Result<PathBuf> {
+    // Only generated profile names reach here, never caller-authored paths.
+    if !profile.starts_with("nub_sbx_r_")
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid sandbox profile name",
+        ));
+    }
+    Ok(registry_root()?.join(format!("native-{profile}")))
+}
+
 fn registry_root() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
@@ -1270,6 +1295,21 @@ pub(crate) fn test_entry(profile: &str) -> io::Result<Option<Entry>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_adapter_version_participates_in_policy_identity() {
+        let identity = super::PolicyIdentity::new([], [], [], None, false, false).unwrap();
+        assert_eq!(identity, identity.clone().with_native_compat(None));
+        let first = identity.clone().with_native_compat(Some("adapter-one"));
+        assert_eq!(
+            first,
+            identity.clone().with_native_compat(Some("adapter-one"))
+        );
+        assert_ne!(
+            first,
+            identity.clone().with_native_compat(Some("adapter-two"))
+        );
+        assert_ne!(first, identity);
+    }
     use super::*;
 
     #[test]

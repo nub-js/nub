@@ -48,6 +48,7 @@ fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
         allow_internet: false,
         egress_funnel: None,
         private_tmp: true,
+        native_compat: false,
         stdout: WindowsStdio::Null,
         stderr: WindowsStdio::Null,
     }

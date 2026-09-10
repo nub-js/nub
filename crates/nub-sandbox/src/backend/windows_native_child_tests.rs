@@ -43,6 +43,7 @@ pub(super) fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
         allow_internet: false,
         egress_funnel: None,
         private_tmp: false,
+        native_compat: false,
         stdout: WindowsStdio::Piped,
         stderr: WindowsStdio::Piped,
     }

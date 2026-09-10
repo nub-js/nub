@@ -1,4 +1,4 @@
-// Native compatibility feasibility probe. AppContainer remains the security boundary.
+// Optional native compatibility. AppContainer remains the security boundary.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
@@ -47,15 +47,12 @@ static USHORT image_machine(HANDLE process) {
 
 static BOOL inject(HANDLE process, const Payload& source) {
     Payload target = source;
-    USHORT reported = 0, native_machine = 0;
-    IsWow64Process2(process, &reported, &native_machine);
     USHORT machine = image_machine(process);
-    fprintf(stderr, "ADAPTER_MACHINE image=%04x wow=%04x native=%04x\n", machine, reported, native_machine);
     const char* arch = machine == IMAGE_FILE_MACHINE_AMD64 ? "x64" :
                        machine == IMAGE_FILE_MACHINE_ARM64 ? "arm64" : nullptr;
     if (!arch) { SetLastError(ERROR_EXE_MACHINE_TYPE_MISMATCH); return FALSE; }
     char path[MAX_PATH];
-    if (sprintf_s(path, "%s\\probe-%s.dll", source.directory, arch) < 0) return FALSE;
+    if (sprintf_s(path, "%s\\compat-%s.dll", source.directory, arch) < 0) return FALSE;
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
     if (!DuplicateHandle(GetCurrentProcess(), source.null_device, process,
                          &target.null_device, 0, FALSE, DUPLICATE_SAME_ACCESS)) return FALSE;
@@ -64,21 +61,20 @@ static BOOL inject(HANDLE process, const Payload& source) {
            DetourUpdateProcessWithDll(process, &dll, 1);
 }
 
-#ifdef PROBE_INJECTOR
-int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return 2;
-    DWORD pid = wcstoul(argv[1], nullptr, 10);
-    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-                                 PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_DUP_HANDLE,
-                                 FALSE, pid);
-    if (!process) { fprintf(stderr, "OpenProcess: %lu\n", GetLastError()); return 3; }
+#ifdef SANDBOX_COMPAT_HOST
+extern "C" DWORD sandbox_native_inject(HANDLE process, const wchar_t* directory) {
+    Payload state = {};
     state.null_device = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (state.null_device == INVALID_HANDLE_VALUE) return 4;
+    if (state.null_device == INVALID_HANDLE_VALUE) return GetLastError();
     BOOL substituted = FALSE;
-    if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, argv[2], -1,
-                             state.directory, MAX_PATH, nullptr, &substituted) || substituted) return 5;
+    if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, directory, -1,
+                             state.directory, MAX_PATH, nullptr, &substituted) || substituted) {
+        DWORD error = substituted ? ERROR_NO_UNICODE_TRANSLATION : GetLastError();
+        CloseHandle(state.null_device);
+        return error;
+    }
     for (int i = 0; i < 26; ++i) {
         wchar_t drive[] = {wchar_t(L'A' + i), L':', 0};
         QueryDosDeviceW(drive, state.devices[i], MAX_PATH);
@@ -86,9 +82,7 @@ int wmain(int argc, wchar_t** argv) {
     BOOL ok = inject(process, state);
     DWORD error = GetLastError();
     CloseHandle(state.null_device);
-    CloseHandle(process);
-    fprintf(stderr, "INJECTION %s error=%lu\n", ok ? "ok" : "failed", error);
-    return ok ? 0 : 6;
+    return ok ? ERROR_SUCCESS : error;
 }
 #else
 static auto true_create_file = CreateFileW;
@@ -177,7 +171,6 @@ static NTSTATUS NTAPI create_pipe(PHANDLE handle, ACCESS_MASK access, POBJECT_AT
     bool mapped = pipe_name(attrs, redirected, name, path);
     NTSTATUS status = true_create_pipe(handle, access, mapped ? &redirected : attrs, io, share,
         disposition, options, type, read_mode, completion, instances, inbound, outbound, timeout);
-    if (mapped) fprintf(stderr, "ADAPTER_PIPE_CREATE path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
     return status;
 }
 
@@ -188,7 +181,6 @@ static NTSTATUS NTAPI open_file(PHANDLE handle, ACCESS_MASK access, POBJECT_ATTR
     wchar_t path[1024];
     bool mapped = pipe_name(attrs, redirected, name, path);
     NTSTATUS status = true_open_file(handle, access, mapped ? &redirected : attrs, io, share, options);
-    if (mapped) fprintf(stderr, "ADAPTER_PIPE_OPEN path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
     return status;
 }
 
@@ -201,7 +193,6 @@ static NTSTATUS NTAPI nt_create_file(PHANDLE handle, ACCESS_MASK access, POBJECT
     bool mapped = pipe_name(attrs, redirected, name, path);
     NTSTATUS status = true_nt_create_file(handle, access, mapped ? &redirected : attrs, io, allocation,
         attributes, share, disposition, options, ea, ea_length);
-    if (mapped) fprintf(stderr, "ADAPTER_PIPE_CLIENT path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
     return status;
 }
 
@@ -253,7 +244,6 @@ static NTSTATUS NTAPI create_directory(PHANDLE handle, ACCESS_MASK access, POBJE
     wchar_t path[1024];
     if (!msys_directory(attrs, redirected, name, path)) return true_create_directory(handle, access, attrs);
     NTSTATUS status = true_create_directory(handle, access, &redirected);
-    fprintf(stderr, "ADAPTER_MSYS_DIRECTORY path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
     return status;
 }
 
@@ -283,11 +273,6 @@ static HANDLE WINAPI create_file(LPCWSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES security, DWORD disposition,
                                 DWORD flags, HANDLE template_file) {
     HANDLE result = true_create_file(path, access, share, security, disposition, flags, template_file);
-    if (result == INVALID_HANDLE_VALUE && path && (wcsstr(path, L"NUL") || wcsstr(path, L"nul"))) {
-        DWORD error = GetLastError();
-        fprintf(stderr, "ADAPTER_NUL path=%ls access=%08lx flags=%08lx error=%lu recognized=%d\n", path, access, flags, error, is_null(path));
-        SetLastError(error);
-    }
     if (result != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ACCESS_DENIED ||
         !is_null(path) || (flags & FILE_FLAG_OVERLAPPED)) return result;
     // Duplicate a parent-opened real null device, never a regular-file approximation.
@@ -359,7 +344,7 @@ static BOOL WINAPI create_process(LPCWSTR application, LPWSTR command,
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) void ProbeMarker() {}
+extern "C" __declspec(dllexport) void SandboxCompatMarker() {}
 template<typename T> static bool resolve_nt(T& function, const char* name) {
     auto address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name);
     static_assert(sizeof(function) == sizeof(address));

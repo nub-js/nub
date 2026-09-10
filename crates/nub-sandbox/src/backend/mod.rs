@@ -154,6 +154,8 @@ pub fn landlock_abi() -> Option<u32> {
 mod windows;
 #[cfg(all(test, target_os = "windows"))]
 mod windows_native_adapter_probe;
+#[cfg(windows)]
+mod windows_native_compat;
 
 #[cfg(target_os = "windows")]
 pub use windows::windows_publish_appcontainer_read;
@@ -565,6 +567,8 @@ pub(crate) struct SessionResources {
     private_tmp: Option<PrivateTemp>,
     #[cfg(windows)]
     windows_leases: std::sync::Mutex<std::collections::BTreeMap<String, windows::WindowsLease>>,
+    #[cfg(windows)]
+    native_compat: bool,
 }
 
 impl Sandbox {
@@ -573,6 +577,22 @@ impl Sandbox {
     /// This is the sole compatibility ambient lookup: credential values are captured here
     /// for the broker session and are never re-read for later command submissions.
     pub fn new(policy: &SandboxPolicy) -> Result<Self, Degradation> {
+        Self::new_impl(policy, false)
+    }
+
+    /// Acquire an AppContainer session with the embedded native compatibility adapter.
+    ///
+    /// The adapter supplies null-device access, DOS path translation and private
+    /// runtime coordination objects. It follows child processes; it does not add
+    /// filesystem grants or permit unconfined fallback. [`Self::new`] remains raw.
+    #[cfg(windows)]
+    pub fn with_windows_native_compat(policy: &SandboxPolicy) -> Result<Self, Degradation> {
+        Self::new_impl(policy, true)
+    }
+
+    fn new_impl(policy: &SandboxPolicy, native_compat: bool) -> Result<Self, Degradation> {
+        #[cfg(not(windows))]
+        debug_assert!(!native_compat);
         #[cfg(not(target_os = "linux"))]
         if !policy.fs.self_proc.is_empty() {
             return Err(Degradation {
@@ -602,6 +622,8 @@ impl Sandbox {
                 private_tmp,
                 #[cfg(windows)]
                 windows_leases: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                #[cfg(windows)]
+                native_compat,
             }),
         })
     }
@@ -1535,6 +1557,18 @@ fn prepare_with_resources(
     )?;
     #[cfg(target_os = "windows")]
     let mut prepared = windows::apply(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir)?;
+    #[cfg(windows)]
+    if resources.native_compat {
+        match prepared.launch.as_mut() {
+            Some(windows::WindowsLaunch::AppContainer(plan)) => plan.native_compat = true,
+            _ => {
+                return Err(Degradation {
+                    lost: vec!["native-compat".into()],
+                    reason: Some("native compatibility requires AppContainer confinement".into()),
+                });
+            }
+        }
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let mut prepared = generic_apply(policy, spec, proxy_port, proxy_token, ca_bundle, tmp_dir)?;
 

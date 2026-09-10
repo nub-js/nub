@@ -73,7 +73,7 @@ jobs:
           nmake
           if errorlevel 1 exit /b 1
           cd /d "$root\.native-adapter"
-          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /LD /link "$root\.probe-detours\lib.$lib\detours.lib" /OUT:probe-$name.dll /EXPORT:ProbeMarker,@1
+          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /LD /link "$root\.probe-detours\lib.$lib\detours.lib" advapi32.lib /OUT:probe-$name.dll /EXPORT:ProbeMarker,@1
           if errorlevel 1 exit /b 1
           if not "$name" == "x64" exit /b 0
           cl /nologo /std:c++17 /W4 /WX /MT /EHsc /DPROBE_INJECTOR /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /Fe:injector.exe /link "$root\.probe-detours\lib.$lib\detours.lib"
@@ -95,6 +95,12 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --lib native_adapter_primitives_with_raw_and_plain_controls -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-adapter.log
+      - name: Checking embedded native adapter primitives
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib embedded_native_adapter_primitives_with_raw_and_plain_controls -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-native-adapter.log
       - name: Provisioning the existing pinned tool fixtures
         id: tools
         if: ${{ !cancelled() }}

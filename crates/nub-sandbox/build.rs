@@ -20,6 +20,9 @@
 #[path = "src/catalog.rs"]
 mod catalog;
 
+#[path = "native/build.rs"]
+mod native;
+
 // THE V2 CATALOG IS VALIDATED HERE BUT NOT CODEGEN'D, and the asymmetry with v1 is deliberate.
 // v1's tables are 34 grants of `&'static str`, so literals are free. A v2 catalog is 343 packages of
 // owned `String`/`Vec`/`BTreeMap` with nested version bands and per-OS overlays, and it exists in
@@ -57,6 +60,7 @@ const CATALOG: &str = "data/build-jail-catalog.json";
 const CATALOG_V2: &str = "data/build-jail-catalog-v2.json";
 
 fn main() {
+    native::build();
     println!("cargo:rerun-if-changed={CATALOG}");
     println!("cargo:rerun-if-changed={CATALOG_V2}");
     println!("cargo:rerun-if-changed=build.rs");
