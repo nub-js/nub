@@ -44,7 +44,7 @@ jobs:
           architecture: x64
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
-          python-version: '3.12.10'
+          python-version: '3.13.15'
           architecture: x64
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
         with:
@@ -99,6 +99,7 @@ jobs:
           cargo test -p nub-sandbox --profile fast --lib native_adapter_primitives_with_raw_and_plain_controls -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-adapter.log
       - name: Provisioning the existing pinned tool fixtures
         id: tools
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
@@ -116,7 +117,9 @@ jobs:
             @('go', 'native_tool_functionality_probe::go_unconfined', 'native_tool_functionality_probe::go_tooldirs'),
             @('composer', 'native_tool_functionality_probe::composer_unconfined', 'native_tool_functionality_probe::composer_tooldirs'),
             @('uv', 'python_tool_functionality_probe::uv_unconfined', 'python_tool_functionality_probe::windows_adapter_uv_tooldirs'),
-            @('pip', 'python_tool_functionality_probe::pip_unconfined', 'python_tool_functionality_probe::windows_adapter_pip_tooldirs')
+            @('pip', 'python_tool_functionality_probe::pip_unconfined', 'python_tool_functionality_probe::windows_adapter_pip_tooldirs'),
+            @('git', 'git_tool_functionality_probe::git_windows_complete_runtime_plain', 'git_tool_functionality_probe::git_windows_complete_runtime_tooldirs'),
+            @('git-lfs', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_plain', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_tooldirs')
           )
           $results = @()
           foreach ($case in $cases) {

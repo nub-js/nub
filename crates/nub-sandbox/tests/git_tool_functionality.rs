@@ -95,6 +95,10 @@ fn policy(
     let Value::Object(ref mut entries) = grants else {
         unreachable!("all Git grants are object-form");
     };
+    if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
+        let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
+        entries.insert(adapter, Value::String("r".into()));
+    }
     // Config-only cases have no local remote. Do not turn that absent fixture path into a
     // backend mount-source failure; a real bare remote remains an explicit narrow grant.
     if remote.exists() {

@@ -33,11 +33,22 @@
 //! [`Prepared::degradation`]; an embedder must surface them rather than claiming enforcement.
 //! Windows also rejects an already-shared working root that would defeat its allowlist.
 //!
+#![cfg_attr(
+    all(test, windows),
+    expect(
+        clippy::duplicate_mod,
+        reason = "Integration fixtures own their output helper when compiled as standalone test crates"
+    )
+)]
+
 pub mod arm;
 // Reuse the integration fixtures in the test-only native adapter experiment.
 #[cfg(all(test, windows))]
 extern crate self as nub_sandbox;
 pub mod backend;
+#[cfg(all(test, windows))]
+#[path = "../tests/git_tool_functionality.rs"]
+mod git_tool_functionality_probe;
 #[cfg(all(test, windows))]
 #[path = "../tests/native_tool_functionality.rs"]
 mod native_tool_functionality_probe;
