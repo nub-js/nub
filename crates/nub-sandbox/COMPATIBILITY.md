@@ -25,7 +25,7 @@ The [initial version matrix](https://github.com/nubjs/nub/actions/runs/343481653
 | Yarn 1.22.22 | Pass | Pass | Adapter | Adapter | Install, bin, global install, cache cleanup and reinstall. Linux uses own-process metadata; Windows uses the Node helpers. |
 | Yarn 2.4.2 / 3.8.7 / 4.17.0 | Pass | Pass | Pass | Pass | Install, reinstall and execution through the configured store. |
 | Bun 1.3.2 | Partial | Partial | Blocked | Blocked | Retained install/bin/global/reinstall passes with bundle directory listings. Pruning populated host `bunx` caches requires additional write grants. |
-| Bun 1.4.0 | Pass | Pass | Blocked | Blocked | Linux/macOS retained install/bin/global/cache-cleanup/reinstall passes with a writable cache parent. This version honors private `TMPDIR`. Windows runtime limits remain unresolved. |
+| Bun 1.4.0 | Pass | Pass | Partial | Partial | Install, reinstall and installed-bin execution pass. Windows global archive install/cache-cleanup/reinstall passes; local-folder global installs require unsupported symlink creation. This version honors private `TMPDIR`. |
 | pip 26.2.1 | Pass | Pass | Adapter | Adapter | Local-wheel install, reinstall, import, user install and cache cleanup; Python 3.13.15 startup adapter preserves the package SID on private directories. |
 | uv 0.12.11 | Pass | Pass | Blocked | Blocked | Server interpreter subprocess access fails; Win11 installs packages but its installed tool trampoline fails canonicalization. |
 | Cargo 1.91.1 | Pass | Pass | Blocked | Pass | Build and clean with project-local target. Server subprocess access fails. |
@@ -85,6 +85,19 @@ Relocated NuGet caches can share one writable tool directory. This permits cache
 The directory `/work/nuget` must exist at acquisition. Cache subdirectories may then be created, cleared and recreated during the session. Using the conventional `~/.nuget` parent instead is already covered by `$tooldirs`.
 
 ## Backend restrictions
+
+### Windows Bun package links
+
+The [Bun 1.4 link controls](https://github.com/nubjs/nub/actions/runs/34532980739) distinguish directory permissions from link creation on Server 2022 and Windows 11 arm64. Copying, hard linking and directory junctions work. File and directory symbolic-link creation returns `EPERM`, including with the entire fixture directory writable. A separate withheld file remains inaccessible.
+
+Bun uses symbolic links for a local-folder global install. Its diagnostic mentions copying files, but adding directories does not fix this operation. Installing a local package archive instead, then clearing its cache and reinstalling it, passes with the ordinary tool bundle and a dedicated writable cache parent. The [retained-command test](https://github.com/nubjs/nub/actions/runs/34530694556) also passes project install, reinstall and installed-bin execution on both Windows hosts.
+
+These commands exercise different installation modes:
+
+```sh
+bun install --global ./package      # local-folder links: EPERM in AppContainer
+bun install --global ./package.tgz  # archived package: tested successfully
+```
 
 ### Windows Python compatibility
 
