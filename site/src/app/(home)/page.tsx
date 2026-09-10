@@ -141,19 +141,19 @@ export default async function HomePage() {
         </div>
       </section>
 
-      {/* ----------------------------------------------------------- 7. COMMUNITY & TESTIMONIALS */}
+      {/* ----------------------------------------------------------- 7. ARCHITECTURAL CAPABILITY PILLARS */}
       <section className="relative z-10 py-20 md:py-28 border-b border-[#2e2a25]">
         <div className="w-[85%] mx-auto">
           <div className="mb-10 text-left">
             <span className="text-xs font-mono font-semibold uppercase tracking-wider text-pink flex items-center gap-1.5 mb-2">
               <span className="h-1.5 w-1.5 rounded-full bg-pink" />
-              Open Source Community
+              Architectural Design
             </span>
             <h2 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-white">
-              What developers are saying...
+              Built on uncompromising principles
             </h2>
             <p className="mt-2 text-sm sm:text-base text-zinc-400">
-              Verified feedback from Hacker News, GitHub discussions, and open-source contributors.
+              Additive augmentation, deterministic compatibility, monorepo velocity, and default-deny supply chain defense.
             </p>
           </div>
 
@@ -198,18 +198,18 @@ export default async function HomePage() {
             <div className="flex flex-col gap-2.5 text-xs font-mono text-left">
               <span className="font-semibold text-zinc-200 mb-1">Documentation</span>
               <Link href="/docs" className="text-zinc-400 hover:text-white transition-colors">Getting Started</Link>
-              <Link href="/docs/commands/run" className="text-zinc-400 hover:text-white transition-colors">TypeScript Runner</Link>
-              <Link href="/docs/commands/watch" className="text-zinc-400 hover:text-white transition-colors">Watch Mode</Link>
-              <Link href="/docs/commands/install" className="text-zinc-400 hover:text-white transition-colors">Package Manager</Link>
-              <Link href="/docs/configuration" className="text-zinc-400 hover:text-white transition-colors">Configuration</Link>
+              <Link href="/docs/run" className="text-zinc-400 hover:text-white transition-colors">TypeScript Runner</Link>
+              <Link href="/docs/watch" className="text-zinc-400 hover:text-white transition-colors">Watch Mode</Link>
+              <Link href="/docs/install" className="text-zinc-400 hover:text-white transition-colors">Package Manager</Link>
+              <Link href="/docs/config" className="text-zinc-400 hover:text-white transition-colors">Configuration</Link>
             </div>
 
             {/* Ecosystem */}
             <div className="flex flex-col gap-2.5 text-xs font-mono text-left">
               <span className="font-semibold text-zinc-200 mb-1">Ecosystem</span>
-              <Link href="/docs/commands/nubx" className="text-zinc-400 hover:text-white transition-colors">nubx (19× npx)</Link>
-              <Link href="/docs/commands/node-versions" className="text-zinc-400 hover:text-white transition-colors">Node Versioning</Link>
-              <Link href="/docs/benchmarks" className="text-zinc-400 hover:text-white transition-colors">Benchmarks</Link>
+              <Link href="/docs/nubx" className="text-zinc-400 hover:text-white transition-colors">nubx (19× npx)</Link>
+              <Link href="/docs/node" className="text-zinc-400 hover:text-white transition-colors">Node Versioning</Link>
+              <a href="https://github.com/nubjs/nub/blob/main/benchmarks/results.md" target="_blank" rel="noopener noreferrer" className="text-zinc-400 hover:text-white transition-colors">Benchmarks</a>
               <Link href="/blog" className="text-zinc-400 hover:text-white transition-colors">Blog &amp; Releases</Link>
             </div>
 
@@ -232,7 +232,7 @@ export default async function HomePage() {
               <span>•</span>
               <span>Node.js v{node.major} LTS</span>
               <span>•</span>
-              <span>Zero Lock-In</span>
+              <span>Zero Runtime Lock-In</span>
             </div>
           </div>
         </div>

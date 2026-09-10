@@ -105,7 +105,7 @@ function checkHandCopies() {
   const nubMisses = String(deno.nodePass - deno.pass("nub"));
   const surfaces = [
     {
-      file: path.join(HERE, "../../site/src/app/(home)/page.tsx"),
+      file: path.join(HERE, "../../site/src/components/landing-showcase.tsx"),
       wants: [
         { re: /name: 'Nub', rate: ([\d.]+), tests: '([\d,]+) \/ ([\d,]+)'/, lens: deno, rt: "nub" },
         { re: /name: 'Deno [\d.]+', rate: ([\d.]+), tests: '([\d,]+) \/ ([\d,]+)'/, lens: deno, rt: "deno" },

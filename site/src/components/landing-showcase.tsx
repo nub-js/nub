@@ -138,7 +138,7 @@ export function HeroInstallCommand() {
           <span>→</span>
         </Link>
         <Link
-          href="/docs/commands/run"
+          href="/docs/run"
           className="inline-flex items-center justify-center gap-2 rounded-xl border border-[#38332c] bg-[#141210] px-5 py-2.5 text-xs sm:text-sm font-medium text-zinc-300 hover:border-zinc-500 hover:text-white transition-all cursor-pointer"
         >
           <span>Documentation</span>
@@ -164,7 +164,7 @@ export function HeroInstallCommand() {
         <span className="text-zinc-700 hidden sm:inline">•</span>
         <div className="flex items-center gap-1.5">
           <span className="h-1.5 w-1.5 rounded-full bg-pink" />
-          <span>0 Runtime Lock-In</span>
+          <span>Zero Runtime Lock-In</span>
         </div>
       </div>
     </div>
@@ -208,10 +208,12 @@ export function HeroQuickCommands() {
       </div>
       <div className="divide-y divide-[#1c1a17] mt-1 text-xs">
         {commands.map((c) => (
-          <div
+          <button
             key={c.cmd}
+            type="button"
             onClick={() => handleCopy(c.cmd)}
-            className="group flex items-center justify-between py-2 px-2.5 rounded-lg hover:bg-[#181613] cursor-pointer transition-colors"
+            aria-label={`Copy command: ${c.cmd}`}
+            className="group w-full flex items-center justify-between py-2 px-2.5 rounded-lg hover:bg-[#181613] focus:outline-none focus-visible:ring-1 focus-visible:ring-ember cursor-pointer transition-colors text-left font-mono"
           >
             <div className="flex items-center gap-2.5 overflow-x-auto">
               <span className="text-zinc-600 select-none">$</span>
@@ -221,11 +223,15 @@ export function HeroQuickCommands() {
             </div>
             <div className="flex items-center gap-3 shrink-0 text-[11px] ml-2">
               <span className={`${c.accent} opacity-85 hidden sm:inline`}>{c.desc}</span>
-              <span className="text-zinc-600 group-hover:text-zinc-300 transition-colors font-mono">
-                {copiedCmd === c.cmd ? '✓' : '⧉'}
+              <span className="text-zinc-500 group-hover:text-zinc-300 transition-colors font-mono min-w-[3.5rem] text-right">
+                {copiedCmd === c.cmd ? (
+                  <span className="text-acid font-semibold">Copied!</span>
+                ) : (
+                  <span>Copy</span>
+                )}
               </span>
             </div>
-          </div>
+          </button>
         ))}
       </div>
     </div>
@@ -429,7 +435,7 @@ export function HeroInteractiveStudio() {
             onClick={handleRun}
             className="hidden sm:inline-flex items-center gap-1.5 text-xs text-acid font-semibold hover:underline cursor-pointer"
           >
-            <span>Run script in browser sandbox</span>
+            <span>Preview CLI output</span>
             <span>→</span>
           </button>
         </div>
@@ -453,17 +459,18 @@ export function HeroInteractiveStudio() {
               type="button"
               onClick={handleRun}
               disabled={isRunning}
+              aria-label="Preview CLI output for this example"
               className="flex items-center gap-1.5 rounded-lg bg-white text-zinc-950 px-3 py-1 text-xs font-mono font-semibold hover:bg-zinc-200 transition-colors shadow-sm disabled:opacity-50 cursor-pointer"
             >
               {isRunning ? (
                 <>
                   <span className="inline-block h-1.5 w-1.5 rounded-full bg-ember animate-ping" />
-                  <span>Running...</span>
+                  <span>Generating preview...</span>
                 </>
               ) : (
                 <>
                   <span>▶</span>
-                  <span>Run with nub</span>
+                  <span>Preview output</span>
                 </>
               )}
             </button>
@@ -521,18 +528,18 @@ export function HeroInteractiveStudio() {
           <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#2e2a25] text-zinc-400">
             <div className="flex items-center gap-2">
               <span className="text-acid font-bold">●</span>
-              <span>Stock Node Terminal</span>
+              <span>Sample CLI Output</span>
               {hasRun && (
-                <span className="text-[10px] rounded bg-acid/20 text-acid px-1.5 py-0.2">
-                  Completed in {current.duration}
+                <span className="text-[10px] rounded bg-acid/20 text-acid px-1.5 py-0.5">
+                  Execution benchmark: {current.duration}
                 </span>
               )}
             </div>
-            <span className="text-[11px] text-zinc-500">Node.js LTS execution</span>
+            <span className="text-[11px] text-zinc-500">Terminal preview</span>
           </div>
           <pre className="text-zinc-300 leading-normal whitespace-pre-wrap">
             {isRunning ? (
-              <span className="text-zinc-500 animate-pulse">Running script on isolated worker...</span>
+              <span className="text-zinc-500 animate-pulse">Generating CLI output preview...</span>
             ) : (
               current.output
             )}
@@ -676,7 +683,7 @@ export function RealWorldProductionParallax() {
       subtitle: 'Native process pooling directly in Rust',
       body: 'Executing package.json scripts with npm or pnpm incurs 140ms–400ms of Node CLI bootstrap latency on every invocation. Nub dispatches worker processes directly in <15ms.',
       linkText: 'Explore script runner docs →',
-      linkHref: '/docs/commands/run',
+      linkHref: '/docs/run',
       isExternal: false,
       visual: (
         <div className="rounded-2xl border border-[#2e2a25] bg-[#0a0908] p-5 font-mono text-xs shadow-xl">
@@ -1301,30 +1308,30 @@ export function AsymmetricBentoGrid() {
               Zero Runtime Lock-In. Run on stock Node anytime.
             </h4>
             <p className="mt-3 text-xs sm:text-sm text-zinc-400 leading-relaxed">
-              Nub is <strong className="text-zinc-200">not a runtime fork</strong>. Your code is executed with the stock Node binary you already have. Nub simply transpiles in memory, polyfills missing globals, and feeds TypeScript paths into Node&apos;s native loader hooks.
+              Nub is <strong className="text-zinc-200">not a runtime fork</strong>. Your code executes directly on the stock Node binary you already have. Application code carries zero runtime lock-in, and compatibility mode preserves your existing package manager and lockfile without migration.
             </p>
 
-            {/* The 5 Explicit Negative Constraints */}
+            {/* Negative Constraints & Boundaries */}
             <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono text-xs">
               <div className="flex items-center gap-2 p-2 rounded-lg bg-[#0c0a09] border border-[#24201b]">
-                <span className="text-ember font-bold">✗</span>
-                <span className="text-zinc-300">No Nub global</span>
+                <span className="text-acid font-bold">✔</span>
+                <span className="text-zinc-300">No globalThis.nub global</span>
               </div>
               <div className="flex items-center gap-2 p-2 rounded-lg bg-[#0c0a09] border border-[#24201b]">
-                <span className="text-ember font-bold">✗</span>
+                <span className="text-acid font-bold">✔</span>
                 <span className="text-zinc-300">No nub:* module namespace</span>
               </div>
               <div className="flex items-center gap-2 p-2 rounded-lg bg-[#0c0a09] border border-[#24201b]">
-                <span className="text-ember font-bold">✗</span>
-                <span className="text-zinc-300">No @nub/* npm scope</span>
+                <span className="text-acid font-bold">✔</span>
+                <span className="text-zinc-300">No @nub/* runtime scope</span>
               </div>
               <div className="flex items-center gap-2 p-2 rounded-lg bg-[#0c0a09] border border-[#24201b]">
-                <span className="text-ember font-bold">✗</span>
+                <span className="text-acid font-bold">✔</span>
                 <span className="text-zinc-300">No &quot;nub&quot; field in package.json</span>
               </div>
               <div className="flex items-center gap-2 p-2 rounded-lg bg-[#0c0a09] border border-[#24201b] sm:col-span-2">
-                <span className="text-ember font-bold">✗</span>
-                <span className="text-zinc-300">No nub-named lockfile (mirrors pnpm, bun, or npm)</span>
+                <span className="text-acid font-bold">✔</span>
+                <span className="text-zinc-300">Compat mode: zero lockfile churn (preserves pnpm/bun/npm lockfiles)</span>
               </div>
             </div>
           </div>
@@ -1351,56 +1358,62 @@ export function AsymmetricBentoGrid() {
 }
 
 /* ============================================================================
-   6. COMMUNITY TESTIMONIALS (Real Quotes from Hacker News & GitHub)
+   6. ARCHITECTURAL CAPABILITY PILLARS
 ============================================================================ */
 export function CommunityTestimonials() {
-  const testimonials = [
+  const pillars = [
     {
-      source: 'Hacker News (Show HN)',
-      handle: '@antirez_fan',
-      badge: 'Architecture',
-      text: 'The decision to augment stock Node rather than fork it is genius. I can use Nub locally for instant TypeScript transpilation and my CI / production containers run on plain Node without surprises.',
+      title: 'Additive Augmentation',
+      tag: 'Architecture',
+      accent: 'text-ember',
+      summary: 'Augment stock Node, never fork.',
+      text: 'Nub executes directly on your stock Node runtime through standard extension surfaces—in-memory oxc transpilation, preload hooks, and V8 flag injection. Production and CI run plain Node with byte-for-byte identical semantics.',
     },
     {
-      source: 'GitHub Contributor',
-      handle: '@matteocollina_follower',
-      badge: 'Compatibility',
-      text: 'Zero runtime lock-in is the killer feature. No proprietary globals, no globalThis.nub nonsense. If I ever want to remove Nub, my code still runs byte-for-byte on stock node.',
+      title: 'Deterministic Parity',
+      tag: 'Compatibility',
+      accent: 'text-acid',
+      summary: 'Zero application-code lock-in.',
+      text: 'Application code targets standard Node.js APIs with no proprietary globals, no globalThis.nub, and no nub:* namespace. Code runs byte-for-byte on plain Node without modifications.',
     },
     {
-      source: 'Full-Stack Lead',
-      handle: '@monorepo_architect',
-      badge: 'Speedup',
-      text: 'Replacing tsx and npm run in our monorepo shaved 14 seconds off our local dev test loops. Process pooling directly in Rust makes scripts feel instantaneous.',
+      title: 'Monorepo Velocity',
+      tag: 'Performance',
+      accent: 'text-sky',
+      summary: 'Instant script dispatch.',
+      text: 'Rust-native process pooling eliminates repeated CLI bootstrap overhead, launching workspace scripts and CLI binaries in under 15ms instead of incurring hundreds of milliseconds of Node CLI latency.',
     },
     {
-      source: 'DevOps Engineer',
-      handle: 'pnpm-compat',
-      badge: 'Lockfile Neutrality',
-      text: 'Multi-lockfile parity means our team can adopt Nub incrementally without forcing teammates on other machines or CI pipelines to change their package manager.',
+      title: 'Supply Chain Hardening',
+      tag: 'Security',
+      accent: 'text-pink',
+      summary: 'Active defense by default.',
+      text: 'Deny-by-default build scripts, live OSV vulnerability checks during resolution, and trust downgrade guards prevent supply chain payloads before malicious code ever executes.',
     },
   ];
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-left">
-      {testimonials.map((t) => (
+      {pillars.map((p) => (
         <div
-          key={t.source}
-          className="flex flex-col justify-between rounded-xl border border-[#2e2a25] bg-[#12110f] p-5 shadow-lg"
+          key={p.title}
+          className="flex flex-col justify-between rounded-xl border border-[#2e2a25] bg-[#12110f] p-5 shadow-lg hover:border-[#3d3831] transition-colors"
         >
           <div>
-            <span className="inline-block text-[10px] font-mono uppercase tracking-wider text-ember px-2 py-0.5 rounded bg-[#1c1a17] border border-[#2e2a25] mb-3 font-semibold">
-              {t.badge}
-            </span>
-            <p className="text-xs text-zinc-300 leading-relaxed">
-              &ldquo;{t.text}&rdquo;
-            </p>
-          </div>
-          <div className="mt-4 pt-3 border-t border-[#2e2a25] flex items-center justify-between">
-            <div>
-              <div className="text-xs font-semibold text-white">{t.source}</div>
-              <div className="text-[10px] font-mono text-zinc-500">{t.handle}</div>
+            <div className="flex items-center justify-between mb-3">
+              <span className={`inline-block text-[10px] font-mono uppercase tracking-wider ${p.accent} px-2 py-0.5 rounded bg-[#1c1a17] border border-[#2e2a25] font-semibold`}>
+                {p.tag}
+              </span>
             </div>
+            <h3 className="text-sm font-semibold text-white font-display mb-1.5">
+              {p.title}
+            </h3>
+            <p className="text-xs font-mono text-zinc-400 mb-2">
+              {p.summary}
+            </p>
+            <p className="text-xs text-zinc-300 leading-relaxed font-normal">
+              {p.text}
+            </p>
           </div>
         </div>
       ))}
@@ -1548,10 +1561,10 @@ export function PreFooterCTA() {
 ============================================================================ */
 export function CrossRuntimeCompatBenchmark() {
   const testResults = [
-    { name: 'Node 25.8', rate: 100, tests: '4,368 / 4,368', isNub: false },
-    { name: 'Nub', rate: 98.8, tests: '4,315 / 4,368', isNub: true },
-    { name: 'Deno 2.8', rate: 77.4, tests: '3,380 / 4,368', isNub: false },
-    { name: 'Bun 1.3.14', rate: 40.5, tests: '1,770 / 4,368', isNub: false },
+    { name: 'Node 26.7', rate: 100, tests: '4,690 / 4,690', isNub: false },
+    { name: 'Nub', rate: 98.4, tests: '4,613 / 4,690', isNub: true },
+    { name: 'Deno 2.9', rate: 72.4, tests: '3,397 / 4,690', isNub: false },
+    { name: 'Bun 1.4', rate: 68.5, tests: '3,214 / 4,690', isNub: false },
   ];
 
   return (
@@ -1567,7 +1580,7 @@ export function CrossRuntimeCompatBenchmark() {
           </h3>
         </div>
         <p className="text-xs font-mono text-zinc-400 max-w-sm">
-          Scored against Deno&apos;s Node-compat test corpus (colinhacks/node_test @ node-25.8.1).
+          Node 26.7&rsquo;s own test suite under Deno&rsquo;s compatibility lens (tests/cross-runtime @ node-26.7.0).
         </p>
       </div>
 
@@ -1603,7 +1616,7 @@ export function CrossRuntimeCompatBenchmark() {
           </div>
 
           <p className="mt-6 text-xs text-zinc-500 leading-relaxed border-t border-[#2e2a25] pt-4 font-mono">
-            Deno&apos;s Node-compat corpus, scored against stock Node. Nub&apos;s rare misses come from auto-enabling experimental features and loading native addons.{' '}
+            Node 26.7&rsquo;s own test suite under Deno&rsquo;s compatibility lens, scored against stock Node. Most of Nub&rsquo;s 77 misses are tests that assert on machinery Nub installs itself &mdash; the permission model, module-loader hooks, the test runner, the compile cache &mdash; or on stack and output snapshots its preload changes.{' '}
             <a
               href="https://github.com/nubjs/nub/tree/main/tests/cross-runtime"
               target="_blank"
