@@ -595,11 +595,10 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
 
 #[cfg(target_os = "linux")]
 fn run_self_proc_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
-    run_unix_tool_control(name, tooldirs, unconfined, sample);
+    run_retained_tool_control(name, tooldirs, unconfined, sample);
 }
 
-#[cfg(unix)]
-fn run_unix_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
+fn run_retained_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: Option<usize>) {
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -737,14 +736,28 @@ fn run_unix_tool_control(name: &str, tooldirs: bool, unconfined: bool, sample: O
 #[test]
 #[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
 fn unix_bun132_retained_bundle() {
-    run_unix_tool_control("bun132", true, false, None);
+    run_retained_tool_control("bun132", true, false, None);
 }
 
 #[cfg(unix)]
 #[test]
 #[ignore = "requires pinned Bun versions; full sequence with cache-parent control"]
 fn unix_bun140_retained_bundle() {
-    run_unix_tool_control("bun140", true, false, None);
+    run_retained_tool_control("bun140", true, false, None);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires pinned Bun versions; full retained sequence with cache-parent grant"]
+fn windows_bun132_retained_bundle() {
+    run_retained_tool_control("bun132", true, false, None);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires pinned Bun versions; full retained sequence with cache-parent grant"]
+fn windows_bun140_retained_bundle() {
+    run_retained_tool_control("bun140", true, false, None);
 }
 
 #[cfg(unix)]
