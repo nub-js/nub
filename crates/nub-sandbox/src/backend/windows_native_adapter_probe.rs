@@ -70,6 +70,15 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
     std::fs::write(&file, "allowed").unwrap();
     let canary = root.path().join("withheld");
     std::fs::write(&canary, "withheld").unwrap();
+    let mut ambient: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    ambient.insert(
+        "NUB_ADAPTER_PROBE_FILE".into(),
+        file.to_string_lossy().into_owned(),
+    );
+    ambient.insert(
+        "NUB_ADAPTER_PROBE_CANARY".into(),
+        canary.to_string_lossy().into_owned(),
+    );
     let ctx = CompileCtx::new(
         Homes {
             home: root.path().join("home"),
@@ -79,12 +88,12 @@ fn native_adapter_primitives_with_raw_and_plain_controls() {
         },
         project.clone(),
         ScopeCapabilities::approved(),
-        std::env::vars().collect(),
+        ambient,
     );
     for mode in ["plain", "raw", "adapter"] {
         let mut policy = compile(&json!({
             "fs": {"./": "rw", "$tmp": "rw", binary.parent().unwrap().to_str().unwrap(): "r", adapter.as_str(): "r"},
-            "vars": {"NUB_ADAPTER_PROBE_FILE": file.to_str().unwrap(), "NUB_ADAPTER_PROBE_CANARY": canary.to_str().unwrap()},
+            "vars": {"NUB_ADAPTER_PROBE_FILE": true, "NUB_ADAPTER_PROBE_CANARY": true},
             "net": false,
         }), &ctx).unwrap();
         if mode == "adapter" {

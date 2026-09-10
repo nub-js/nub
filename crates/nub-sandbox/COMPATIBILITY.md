@@ -70,19 +70,26 @@ The writable directory admits the lock/rename protocol without granting all of h
 
 Relocated NuGet caches can share one writable tool directory. This permits cache clearing and recreation without granting the parent of every arbitrary relocation:
 
+| Environment variable supplied by the embedder | Example value |
+| --- | --- |
+| `NUGET_PACKAGES` | `/work/nuget/packages` |
+| `NUGET_HTTP_CACHE_PATH` | `/work/nuget/http-cache` |
+| `NUGET_SCRATCH` | `/work/nuget/scratch` |
+| `NUGET_PLUGINS_CACHE_PATH` | `/work/nuget/plugins-cache` |
+
 ```json
 {
   "fs": {"./": "rw", "$tooldirs": "rw", "/work/nuget": "rw", "$tmp": "rw"},
   "vars": {
-    "NUGET_PACKAGES": "/work/nuget/packages",
-    "NUGET_HTTP_CACHE_PATH": "/work/nuget/http-cache",
-    "NUGET_SCRATCH": "/work/nuget/scratch",
-    "NUGET_PLUGINS_CACHE_PATH": "/work/nuget/plugins-cache"
+    "NUGET_PACKAGES": true,
+    "NUGET_HTTP_CACHE_PATH": true,
+    "NUGET_SCRATCH": true,
+    "NUGET_PLUGINS_CACHE_PATH": true
   }
 }
 ```
 
-The directory `/work/nuget` must exist at acquisition. Cache subdirectories may then be created, cleared and recreated during the session. Using the conventional `~/.nuget` parent instead is already covered by `$tooldirs`.
+The directory `/work/nuget` must exist at acquisition. Cache subdirectories may then be created, cleared and recreated during the session. Using the conventional `~/.nuget` parent instead is already covered by `$tooldirs`. The `true` entries retain the supplied environment values; bare strings in `vars` are type declarations, not literal-value assignments.
 
 ## Backend restrictions
 
