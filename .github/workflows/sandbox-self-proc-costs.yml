@@ -1,4 +1,4 @@
-name: Sandbox metadata release costs
+name: Sandbox metadata and tool-bundle costs
 on:
   push:
     branches: [sandbox-self-proc-costs]
