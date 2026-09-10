@@ -25,7 +25,7 @@ fn documented_compatibility_policies_compile_with_the_supplied_environment() {
         ScopeCapabilities::approved(),
         environment,
     );
-    let document = include_str!("../COMPATIBILITY.md");
+    let document = include_str!("../COMPATIBILITY.md").replace("\r\n", "\n");
     let mut count = 0;
     for block in document.split("```json\n").skip(1) {
         let example = block.split("```").next().unwrap();
