@@ -152,6 +152,8 @@ pub fn landlock_abi() -> Option<u32> {
 // without a Windows machine (the FFI launcher itself stays `#[cfg(windows)]`).
 #[cfg(any(target_os = "windows", test))]
 mod windows;
+#[cfg(all(test, target_os = "windows"))]
+mod windows_native_adapter_probe;
 
 #[cfg(target_os = "windows")]
 pub use windows::windows_publish_appcontainer_read;
