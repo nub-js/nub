@@ -420,6 +420,42 @@ mod linux {
     }
 
     #[test]
+    fn cancellable_metadata_wait_preserves_exit_and_reaps_cancellation() {
+        use std::sync::atomic::AtomicBool;
+        let (root, sandbox) = fixture(&["maps", "stat"]);
+        for _ in 0..8 {
+            let mut child = sandbox
+                .prepare(CommandSpec::new("/bin/true"))
+                .unwrap()
+                .spawn()
+                .unwrap();
+            assert!(
+                child
+                    .wait_cancellable(&AtomicBool::new(false))
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut child = sandbox
+            .prepare(spec(root.path(), "linux::reading_child"))
+            .unwrap()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        while !root.path().join("project/ready").exists() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = child.wait_cancellable(&AtomicBool::new(true)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "cancelled child reaped"
+        );
+    }
+
+    #[test]
     fn cancellation_reclaims_metadata_workers_and_descriptors() {
         if std::env::var_os("SELF_PROC_COUNTER_OWNER").is_none() {
             // Whole-process counts need an isolated test host, not sibling tests'

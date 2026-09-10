@@ -638,13 +638,18 @@ fn run_unix_tool_control(
     if list_ancestors {
         use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
         // Diagnostic only: isolate directory enumeration from file-content access.
-        for path in root
+        let mut paths: Vec<_> = root
             .path()
             .join("project")
             .ancestors()
             .skip(1)
             .take_while(|path| path.parent().is_some())
-        {
+            .map(Path::to_path_buf)
+            .collect();
+        // Bun 1.3 also enumerates the conventional temp directory while pruning,
+        // even with private TMPDIR. Listing grants no file contents or deletion.
+        paths.push(std::fs::canonicalize("/tmp").unwrap());
+        for path in paths {
             policy.fs.rules.entries.push(FsRule {
                 matcher: CanonGlob(path.to_string_lossy().into_owned()),
                 effect: Effect::Allow,
