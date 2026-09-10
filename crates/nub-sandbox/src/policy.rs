@@ -79,6 +79,11 @@ pub enum SelfProcFile {
     Maps,
     Stat,
     Cmdline,
+    Statm,
+    Status,
+    Task,
+    TaskStat,
+    TaskStatus,
 }
 
 impl SelfProcFile {
@@ -87,16 +92,12 @@ impl SelfProcFile {
             "/proc/self/maps" => Some(Self::Maps),
             "/proc/self/stat" => Some(Self::Stat),
             "/proc/self/cmdline" => Some(Self::Cmdline),
+            "/proc/self/statm" => Some(Self::Statm),
+            "/proc/self/status" => Some(Self::Status),
+            "/proc/self/task" => Some(Self::Task),
+            "/proc/self/task/*/stat" => Some(Self::TaskStat),
+            "/proc/self/task/*/status" => Some(Self::TaskStatus),
             _ => None,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Maps => "maps",
-            Self::Stat => "stat",
-            Self::Cmdline => "cmdline",
         }
     }
 }
@@ -165,6 +166,9 @@ pub enum FsOrigin {
     /// A path guessed at — a built-in set member (`$tooldirs`) or a toolchain subtree
     /// derived from the interpreter's location. Absent means "not on this machine".
     Speculative,
+    /// Conventional tool coordination state initialized at acquisition when writable.
+    /// Shared with ordinary tool invocations, so it is not sandbox-owned cleanup data.
+    SharedToolState,
     /// Speculative, PLUS: the subtree is one NUB ITSELF owns and it holds only public
     /// bytes — the PM store, the tools dir, provisioned Node headers. Absent-tolerant
     /// exactly like [`Speculative`](FsOrigin::Speculative); the extra claim is about
@@ -207,7 +211,10 @@ impl FsOrigin {
     /// Whether an ABSENT source is ordinary rather than an authoring mistake. Both
     /// speculated origins tolerate absence; only [`Authored`](FsOrigin::Authored) does not.
     pub fn tolerates_absent(&self) -> bool {
-        matches!(self, FsOrigin::Speculative | FsOrigin::NubOwnedPublic)
+        matches!(
+            self,
+            FsOrigin::Speculative | FsOrigin::NubOwnedPublic | FsOrigin::SharedToolState
+        )
     }
 }
 

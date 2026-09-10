@@ -54,17 +54,15 @@ fn open_path(
     pointer: u64,
     flags: Option<u64>,
 ) -> bool {
-    let mut path = [0u8; 20];
+    let mut path = [0u8; 64];
     let read = unsafe { read_child_mem(req.pid, pointer, &mut path) };
     let read = usize::try_from(read).unwrap_or(0).min(path.len());
-    let file = [
-        (b"/proc/self/maps\0".as_slice(), SelfProcFile::Maps),
-        (b"/proc/self/stat\0".as_slice(), SelfProcFile::Stat),
-        (b"/proc/self/cmdline\0".as_slice(), SelfProcFile::Cmdline),
-    ]
-    .into_iter()
-    .find_map(|(name, file)| path[..read].starts_with(name).then_some(file));
-    let Some(file) = file else {
+    let selected = path[..read]
+        .iter()
+        .position(|byte| *byte == 0)
+        .and_then(|end| std::str::from_utf8(&path[..end]).ok())
+        .and_then(metadata_path);
+    let Some((file, suffix)) = selected else {
         // CONTINUE cannot grant a racing replacement path: Landlock remains the
         // authority for every ordinary open, including all other procfs paths.
         if state.write_matcher.is_some()
@@ -79,7 +77,8 @@ fn open_path(
         | libc::O_LARGEFILE
         | libc::O_NONBLOCK
         | libc::O_NOCTTY
-        | libc::O_NOFOLLOW) as u64;
+        | libc::O_NOFOLLOW
+        | libc::O_DIRECTORY) as u64;
     let Some(flags) = flags.filter(|flags| flags & !permitted_flags == 0) else {
         reply(nfd, req.id, -libc::EACCES);
         return true;
@@ -112,7 +111,10 @@ fn open_path(
         reply(nfd, req.id, -libc::ESRCH);
         return true;
     };
-    let path = cstr(&format!("/proc/{pid}/{}", file.name()));
+    // A numeric task component is resolved beneath this process's task directory;
+    // a TID belonging to a different process is not present there. No path supplied
+    // by the caller can select another process or traverse a procfs magic link.
+    let path = cstr(&format!("/proc/{pid}/{suffix}"));
     let fd = unsafe { libc::open(path.as_ptr(), flags as i32 | libc::O_CLOEXEC) };
     if fd < 0 {
         reply(nfd, req.id, -errno());
@@ -138,4 +140,23 @@ fn open_path(
         reply(nfd, req.id, -errno());
     }
     true
+}
+
+fn metadata_path(path: &str) -> Option<(SelfProcFile, &str)> {
+    let suffix = path.strip_prefix("/proc/self/")?;
+    if let Some(file) = SelfProcFile::from_path(path)
+        && !matches!(file, SelfProcFile::TaskStat | SelfProcFile::TaskStatus)
+    {
+        return Some((file, suffix));
+    }
+    let (tid, file) = suffix.strip_prefix("task/")?.split_once('/')?;
+    if tid.is_empty() || !tid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let file = match file {
+        "stat" => SelfProcFile::TaskStat,
+        "status" => SelfProcFile::TaskStatus,
+        _ => return None,
+    };
+    Some((file, suffix))
 }

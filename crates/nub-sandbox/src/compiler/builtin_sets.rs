@@ -731,6 +731,17 @@ pub fn tooldirs_fs_rules_with_env(
     };
     let mut out = Vec::new();
     let environment_patterns = environment_tooldirs(env);
+    #[cfg(unix)]
+    for pattern in ["/tmp/.dotnet"] {
+        for g in super::defaults::subtree_globs(pattern) {
+            out.push(FsRule {
+                matcher: CanonGlob(canonicalize_glob_prefix(&g)),
+                effect,
+                access,
+                origin: FsOrigin::SharedToolState,
+            });
+        }
+    }
     for pattern in tooldir_patterns() {
         let expanded = expand_symbolic(pattern, homes);
         for g in super::defaults::subtree_globs(&expanded) {
@@ -768,6 +779,29 @@ pub fn tooldirs_fs_rules_with_env(
         }
     }
     Ok(out)
+}
+
+/// Own-process information used by Node, Bun and .NET. These are capability
+/// markers extracted by the fold, not static grants on the compiling process.
+#[cfg(target_os = "linux")]
+pub(crate) fn tool_metadata_rules() -> impl Iterator<Item = FsRule> {
+    [
+        "maps",
+        "stat",
+        "statm",
+        "status",
+        "cmdline",
+        "task",
+        "task/*/stat",
+        "task/*/status",
+    ]
+    .into_iter()
+    .map(|suffix| FsRule {
+        matcher: CanonGlob(format!("/proc/self/{suffix}")),
+        effect: Effect::Allow,
+        access: FsAccess::Read,
+        origin: FsOrigin::Speculative,
+    })
 }
 
 #[cfg(test)]

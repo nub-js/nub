@@ -253,6 +253,8 @@ fn fold_tooldirs_array_entry(
                 )
                 .map_err(|message| CompileError::shape(path, &message))?,
             );
+            #[cfg(target_os = "linux")]
+            out.extend(builtin_sets::tool_metadata_rules());
             Ok(true)
         }
     }
@@ -286,6 +288,8 @@ fn fold_tooldirs_object_entry(
         )
         .map_err(|message| CompileError::shape(path, &message))?,
     );
+    #[cfg(target_os = "linux")]
+    out.extend(builtin_sets::tool_metadata_rules());
     Ok(true)
 }
 

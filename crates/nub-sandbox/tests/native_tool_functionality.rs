@@ -597,34 +597,41 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     operations(name, &tool, root.path(), &env, policy.as_ref());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn run_nuget_self_proc(tooldirs: bool) {
     let tool = tool("nuget");
     let root = fixture();
     let env = env_for(root.path(), &tool);
     write_projects(root.path());
     let mut policy = policy(root.path(), &tool, env, tooldirs);
-    policy.fs.self_proc.extend([
-        nub_sandbox::policy::SelfProcFile::Maps,
-        nub_sandbox::policy::SelfProcFile::Stat,
-        nub_sandbox::policy::SelfProcFile::Cmdline,
-    ]);
-    // Named .NET mutexes use this shared path even with a private TMPDIR.
-    // This fixture explicitly accepts that coordination scope; the catalog does not.
-    std::fs::create_dir_all("/tmp/.dotnet/shm").unwrap();
-    let ctx = CompileCtx::new(
-        Homes {
-            home: root.path().join("home"),
-            cache: root.path().join("cache"),
-            tmp: root.path().join("tmp"),
-            project: root.path().join("project"),
-        },
-        root.path().join("project"),
-        ScopeCapabilities::approved(),
-        BTreeMap::new(),
-    );
-    let shared = compile(&json!({"fs": {"/tmp/.dotnet/shm": "rw"}}), &ctx).unwrap();
-    policy.fs.rules.entries.extend(shared.fs.rules.entries);
+    if !tooldirs {
+        #[cfg(target_os = "linux")]
+        policy.fs.self_proc.extend([
+            nub_sandbox::policy::SelfProcFile::Maps,
+            nub_sandbox::policy::SelfProcFile::Stat,
+            nub_sandbox::policy::SelfProcFile::Cmdline,
+            nub_sandbox::policy::SelfProcFile::Status,
+            nub_sandbox::policy::SelfProcFile::Task,
+            nub_sandbox::policy::SelfProcFile::TaskStat,
+            nub_sandbox::policy::SelfProcFile::TaskStatus,
+        ]);
+        // Named .NET mutexes use this shared path even with a private TMPDIR.
+        // The exact-grant control spells out what the tool bundle supplies.
+        std::fs::create_dir_all("/tmp/.dotnet/shm").unwrap();
+        let ctx = CompileCtx::new(
+            Homes {
+                home: root.path().join("home"),
+                cache: root.path().join("cache"),
+                tmp: root.path().join("tmp"),
+                project: root.path().join("project"),
+            },
+            root.path().join("project"),
+            ScopeCapabilities::approved(),
+            BTreeMap::new(),
+        );
+        let shared = compile(&json!({"fs": {"/tmp/.dotnet/shm": "rw"}}), &ctx).unwrap();
+        policy.fs.rules.entries.extend(shared.fs.rules.entries);
+    }
     let sandbox = Sandbox::acquire(&policy).unwrap();
     for tail in [
         &["--version"][..],
@@ -692,6 +699,13 @@ fn linux_self_proc_nuget_exact() {
 #[test]
 #[ignore = "requires pinned .NET SDK"]
 fn linux_self_proc_nuget_tooldirs() {
+    run_nuget_self_proc(true);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires pinned .NET SDK"]
+fn macos_self_proc_nuget_tooldirs() {
     run_nuget_self_proc(true);
 }
 

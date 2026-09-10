@@ -55,6 +55,7 @@ fn writable_metadata_is_rejected_including_reused_grants() {
         json!({"fs": {"/proc/self/maps": "rw"}}),
         json!({"fs": {"/proc/self/stat": true}}),
         json!({"fs": {"/proc/self/cmdline": "rw"}}),
+        json!({"fs": {"/proc/self/task/*/stat": "rw"}}),
         json!({"fs": ["/proc/self/maps"]}),
         json!({"shared": {"/proc/self/stat": "rw"}, "fs": {"...:#/shared": true}}),
     ] {
@@ -68,6 +69,33 @@ fn writable_metadata_is_rejected_including_reused_grants() {
     )
     .unwrap();
     assert_eq!(policy.fs.self_proc, [SelfProcFile::Stat].into());
+}
+
+#[test]
+fn shared_tool_state_is_initialized_once_and_survives_session_close() {
+    use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("coordination");
+    let mut policy = compile(&json!({"fs": false}), &context(root.path())).unwrap();
+    policy.fs.rules.entries.push(FsRule {
+        matcher: CanonGlob(state.to_string_lossy().into_owned()),
+        effect: Effect::Allow,
+        access: FsAccess::Read,
+        origin: FsOrigin::SharedToolState,
+    });
+    nub_sandbox::Sandbox::acquire(&policy).unwrap().close();
+    assert!(
+        !state.exists(),
+        "read-only acquisition must not create shared state"
+    );
+    policy.fs.rules.entries[0].access = FsAccess::ReadWrite;
+    for _ in 0..2 {
+        nub_sandbox::Sandbox::acquire(&policy).unwrap().close();
+        assert!(
+            state.is_dir(),
+            "shared tool state is not private cleanup data"
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -228,6 +256,85 @@ mod linux {
                 assert!(output.status.success(), "{files:?}: {output:?}");
             }
             sandbox.close();
+        }
+    }
+
+    #[test]
+    fn task_metadata_child() {
+        if std::env::var_os("SELF_PROC_CASE").is_none() {
+            return;
+        }
+        let check = || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            let tasks = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert!(
+                tasks
+                    .iter()
+                    .any(|entry| entry.to_string_lossy() == tid.to_string())
+            );
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+            assert_eq!(stat.split_whitespace().next().unwrap(), tid.to_string());
+            let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).unwrap();
+            assert!(status.contains(&format!("Tgid:\t{}\n", std::process::id())));
+            assert!(
+                std::fs::read_to_string("/proc/self/status")
+                    .unwrap()
+                    .contains("VmRSS:")
+            );
+            assert!(
+                !std::fs::read_to_string("/proc/self/statm")
+                    .unwrap()
+                    .is_empty()
+            );
+            let owner = std::env::var("SELF_PROC_OWNER").unwrap();
+            for path in [
+                format!("/proc/self/task/{tid}/environ"),
+                format!("/proc/self/task/{owner}/stat"),
+                format!("/proc/self/task/../../{owner}/cmdline"),
+                "/proc/self/environ".into(),
+                "/proc/self/mem".into(),
+            ] {
+                assert!(std::fs::read(&path).is_err(), "unexpected read: {path}");
+            }
+            let dir = std::fs::File::open("/proc/self/task").unwrap();
+            let escape = CString::new(format!("../../{owner}/environ")).unwrap();
+            assert_eq!(
+                unsafe { libc::openat(dir.as_raw_fd(), escape.as_ptr(), libc::O_RDONLY) },
+                -1
+            );
+        };
+        check();
+        std::thread::spawn(check).join().unwrap();
+    }
+
+    #[test]
+    fn task_metadata_and_tool_bundle_preserve_process_boundaries() {
+        let files = ["status", "statm", "task", "task/*/stat", "task/*/status"];
+        let (root, sandbox) = fixture(&files);
+        let output = sandbox
+            .prepare(spec(root.path(), "linux::task_metadata_child"))
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        for fs in [
+            json!({"$tooldirs": "rw"}),
+            json!({"$tooldirs": "r"}),
+            json!(["$tooldirs"]),
+        ] {
+            let bundle = compile(&json!({"fs": fs}), &context(root.path())).unwrap();
+            assert_eq!(bundle.fs.self_proc.len(), 8);
+            assert!(
+                bundle
+                    .fs
+                    .rules
+                    .entries
+                    .iter()
+                    .all(|rule| !rule.matcher.as_str().starts_with("/proc/"))
+            );
         }
     }
 

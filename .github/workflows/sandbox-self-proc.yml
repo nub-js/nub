@@ -49,7 +49,7 @@ jobs:
           cargo test -p nub-sandbox --profile fast --lib -- --nocapture 2>&1 | tee reports/lib.log
           cargo test -p nub-sandbox --profile fast --test self_proc -- --nocapture --test-threads=1 2>&1 | tee reports/self-proc.log
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         with:
           node-version: '22.18.0'
       - name: Stressing concurrent Windows profile acquisitions
@@ -58,12 +58,12 @@ jobs:
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --lib windows_cleanup_acquisition_stress -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/acquisition-stress.log
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         with:
           dotnet-version: '10.0.100'
-      - name: Provisioning pinned Linux tool controls
+      - name: Provisioning pinned Unix tool controls
         id: tools
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: |
           node scripts/sandbox-tool-fixtures.mjs > reports/provision.log 2>&1
           cp .sandbox-tool-fixtures/matrix.json reports/js-matrix.json
@@ -87,11 +87,12 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --test tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/js-tools.log
-      - name: Exercising explicit metadata grants with the .NET SDK
-        if: ${{ !cancelled() && runner.os == 'Linux' && steps.tools.outcome == 'success' }}
+      - name: Exercising the .NET SDK tool bundle
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.tools.outcome == 'success' }}
         run: |
           set -o pipefail
-          cargo test -p nub-sandbox --profile fast --test native_tool_functionality linux_self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/dotnet.log
+          cargo test -p nub-sandbox --profile fast --test native_tool_functionality nuget_unconfined -- --ignored --nocapture 2>&1 | tee reports/dotnet-plain.log
+          cargo test -p nub-sandbox --profile fast --test native_tool_functionality self_proc -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/dotnet.log
       - name: Preserving native evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

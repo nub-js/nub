@@ -589,6 +589,7 @@ impl Sandbox {
         }
 
         let mut runtime_policy = policy.clone();
+        initialize_shared_tool_state(&runtime_policy)?;
         let runtime_brokers = capture_runtime_brokers(policy, &mut runtime_policy)?;
         let proxy = start_session_proxy(&runtime_policy, runtime_brokers)?;
         let private_tmp = make_private_tmp(&runtime_policy)?;
@@ -617,6 +618,26 @@ impl Sandbox {
     /// Release this caller's session lease. Submitted commands retain their own lease until
     /// they exit, so closing a sandbox never tears down another active command's resources.
     pub fn close(self) {}
+}
+
+fn initialize_shared_tool_state(policy: &SandboxPolicy) -> Result<(), Degradation> {
+    for rule in &policy.fs.rules.entries {
+        if rule.origin != crate::policy::FsOrigin::SharedToolState
+            || rule.effect != crate::policy::Effect::Allow
+            || rule.access != crate::policy::FsAccess::ReadWrite
+            || rule.matcher.as_str().contains('*')
+        {
+            continue;
+        }
+        std::fs::create_dir_all(rule.matcher.as_str()).map_err(|error| Degradation {
+            lost: vec!["tool-state".into()],
+            reason: Some(format!(
+                "cannot initialize shared tool directory {}: {error}",
+                rule.matcher.as_str()
+            )),
+        })?;
+    }
+    Ok(())
 }
 
 /// Remove idle persistent sandbox resources, recovering interrupted cleanup first.

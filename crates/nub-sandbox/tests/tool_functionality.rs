@@ -610,8 +610,10 @@ fn run_self_proc_tool(name: &str, tooldirs: bool) {
     fs.as_object_mut()
         .unwrap()
         .remove(cache.to_string_lossy().as_ref());
-    fs["/proc/self/maps"] = json!("r");
-    fs["/proc/self/stat"] = json!("r");
+    if !tooldirs {
+        fs["/proc/self/maps"] = json!("r");
+        fs["/proc/self/stat"] = json!("r");
+    }
     let env_refs: Vec<_> = env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))

@@ -55,29 +55,45 @@ It includes SSH keys, package-manager credentials and other readable home files.
 
 ### Explicit Linux process metadata
 
-Some runtimes inspect their own memory map, process statistics or command line. Linux policies can request these files explicitly:
+The tool-directory bundle includes read-only process metadata on Linux. A policy without `$tooldirs` can select individual capabilities:
 
 ```json
 {
   "fs": {
     "./": "rw",
-    "$tooldirs": "rw",
     "$tmp": "rw",
     "/proc/self/maps": "r",
     "/proc/self/stat": "r",
-    "/proc/self/cmdline": "r"
+    "/proc/self/cmdline": "r",
+    "/proc/self/statm": "r",
+    "/proc/self/status": "r",
+    "/proc/self/task": "r",
+    "/proc/self/task/*/stat": "r",
+    "/proc/self/task/*/status": "r"
   },
   "net": false
 }
 ```
 
-These paths refer to the requesting process, including child processes and threads, rather than the process compiling the policy. They grant read access only. None is included in the convenience sets or the default policy. Command-line access exposes that process's own arguments, not its owner's arguments. Other procfs paths, including environment files and numeric-PID aliases, remain excluded.
+These permissions follow the requesting process, including child processes and threads. They never refer to the process compiling the policy.
+
+- The first five paths expose that process's memory map, statistics, command line, memory sizes and status.
+- The task directory permits thread enumeration. The two task patterns permit only numeric thread IDs belonging to that process, and only the selected `stat` or `status` files.
+- All eight permissions are read-only, including when selected through `$tooldirs:rw`.
+- Environment files, memory contents, file-descriptor directories and other processes' metadata remain excluded. Command-line access exposes the requesting process's arguments, not its owner's arguments.
 
 This option requires Linux 5.14 or newer with seccomp user notifications and atomic file-descriptor injection. Unsupported hosts refuse acquisition. macOS and Windows reject these Linux-specific permissions. Policies without these grants do not add read-open notifications; opt-in policies route read opens through the supervisor before ordinary paths continue under Landlock.
 
 ## Tool directories
 
-The set includes package caches, stores, global installations and user-level tool state. Its members cover Nub, npm, pnpm, Yarn, Bun, pip, uv, Cargo/rustup, Go, Gradle, Maven, NuGet, Composer and Git. The [member table and environment mapping](src/compiler/builtin_sets.rs) are the implementation reference.
+The set includes package caches, stores, global installations and user-level tool state. Its members cover Nub, npm, pnpm, Yarn, Bun, pip, uv, Cargo/rustup, Go, Gradle, Maven, NuGet, Composer and Git.
+
+| Additional tool requirement | Scope |
+| --- | --- |
+| Linux process introspection | The eight read-only [self-metadata capabilities](#explicit-linux-process-metadata), for Node, Bun and .NET. No other-process or environment-file access. |
+| Unix .NET coordination | `/tmp/.dotnet`, used by named mutexes even with private temp storage. A writable bundle creates this directory at acquisition; a read-only bundle does not. This is shared tool state, not session-owned data, and session cleanup leaves it in place. |
+
+The [member table and environment mapping](src/compiler/builtin_sets.rs) are the implementation reference. The bundle is opt-in; a policy with only explicit paths gains neither capability automatically.
 
 The [versioned compatibility matrix](COMPATIBILITY.md) records tested commands and backend restrictions. A directory member is not a promise that every command works under every backend.
 
@@ -173,7 +189,7 @@ Coarse `net: true` and `net: false` policies do not start a host-filtering proxy
 
 The environment example inherits named values from the supplied snapshot. A trailing `?` makes a missing value optional. Secret values are sensitive data supplied to the child, not values hidden from it; an allowed child can use them. Unlisted environment values are not implicitly inherited by this explicit policy.
 
-Filtering the environment does not hide files granted through `fs`. The default Linux policy also withholds other processes' `/proc` entries, which can break tools that inspect their own process metadata. Explicit grants under the reserved `/proc` tree are rejected; there is no automatic procfs compatibility fallback.
+Filtering the environment does not hide files granted through `fs`. Linux excludes procfs by default. The [explicit self-metadata permissions](#explicit-linux-process-metadata) grant only the requesting process's selected files; other processes' metadata and environment files remain excluded.
 
 ## Resource and command ownership
 
