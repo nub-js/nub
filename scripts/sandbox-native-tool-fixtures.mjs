@@ -7,6 +7,11 @@ import { execFileSync } from 'node:child_process';
 
 const root = resolve(process.env.NUB_SANDBOX_NATIVE_TOOL_ROOT ?? '.sandbox-native-tool-fixtures');
 const pins = { cargo: '1.91.1', go: '1.25.1', gradle: '8.14', maven: '3.9.11', nuget: '10.0.100', composer: '2.8.12' };
+const selected = process.argv[2]?.startsWith('--tools=') ? process.argv[2].slice(8).split(',') : null;
+if (process.argv.length > 3 || (process.argv[2] && !selected) || selected?.some(name => ![...Object.keys(pins), 'rustup'].includes(name))) {
+  throw new Error('usage: sandbox-native-tool-fixtures.mjs [--tools=cargo,go,composer,...]');
+}
+const wants = name => !selected || selected.includes(name);
 const windows = process.platform === 'win32';
 const platform = windows ? 'windows' : process.platform;
 const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
@@ -133,26 +138,28 @@ function entry(name, program, args, toolRoot, { prefix = [], runtimeRoots = [], 
 }
 
 mkdirSync(root, { recursive: true });
-const rust = await installRust();
-const go = await installGo();
-const jvm = await installJvmTools();
-const composer = await installComposer();
-const dotnet = find('dotnet');
+const rust = wants('cargo') || wants('rustup') ? await installRust() : null;
+const go = wants('go') ? await installGo() : null;
+const jvm = wants('gradle') || wants('maven') ? await installJvmTools() : null;
+const composer = wants('composer') ? await installComposer() : null;
+const dotnet = wants('nuget') ? find('dotnet') : null;
 const dotnetVersionRoot = join(root, 'dotnet-version');
-mkdirSync(dotnetVersionRoot, { recursive: true });
-writeFileSync(join(dotnetVersionRoot, 'global.json'), `${JSON.stringify({ sdk: { version: pins.nuget, rollForward: 'disable' } })}\n`);
+if (dotnet) {
+  mkdirSync(dotnetVersionRoot, { recursive: true });
+  writeFileSync(join(dotnetVersionRoot, 'global.json'), `${JSON.stringify({ sdk: { version: pins.nuget, rollForward: 'disable' } })}\n`);
+}
 const runtimeRoots = [process.env.JAVA_HOME, process.env.DOTNET_ROOT].filter(Boolean);
-if (runtimeRoots.length !== 2) throw new Error('JAVA_HOME and DOTNET_ROOT must be set by workflow setup actions');
+if ((jvm || dotnet) && runtimeRoots.length !== 2) throw new Error('JAVA_HOME and DOTNET_ROOT must be set by workflow setup actions');
 const runtimeEnv = { JAVA_HOME: process.env.JAVA_HOME, DOTNET_ROOT: process.env.DOTNET_ROOT };
 const matrix = [
-  entry('cargo', rust.cargo, ['--version'], rust.toolEnv.CARGO_HOME, { prefix: [`+${pins.cargo}`], runtimeRoots: rust.runtimeRoots, toolEnv: rust.toolEnv }),
-  entry('rustup', rust.rustup, ['--version'], rust.toolEnv.RUSTUP_HOME, { runtimeRoots: [rust.toolEnv.RUSTUP_HOME], toolEnv: rust.toolEnv }),
-  entry('go', go.program, ['version'], go.root, { runtimeRoots: [go.root] }),
-  entry('gradle', jvm.gradle.program, ['--version'], jvm.gradle.root, { runtimeRoots, toolEnv: runtimeEnv }),
-  entry('maven', jvm.maven.program, ['--version'], jvm.maven.root, { runtimeRoots, toolEnv: runtimeEnv, mavenSeed: jvm.maven.seedRepository }),
-  entry('nuget', dotnet, ['--version'], process.env.DOTNET_ROOT, { runtimeRoots, toolEnv: runtimeEnv, cwd: dotnetVersionRoot }),
-  entry('composer', composer.php, ['--version'], composer.root, { prefix: [composer.phar], runtimeRoots: [resolve(composer.php, '..'), ...composer.configRoots] }),
-];
+  wants('cargo') && entry('cargo', rust.cargo, ['--version'], rust.toolEnv.CARGO_HOME, { prefix: [`+${pins.cargo}`], runtimeRoots: rust.runtimeRoots, toolEnv: rust.toolEnv }),
+  wants('rustup') && entry('rustup', rust.rustup, ['--version'], rust.toolEnv.RUSTUP_HOME, { runtimeRoots: [rust.toolEnv.RUSTUP_HOME], toolEnv: rust.toolEnv }),
+  wants('go') && entry('go', go.program, ['version'], go.root, { runtimeRoots: [go.root] }),
+  wants('gradle') && entry('gradle', jvm.gradle.program, ['--version'], jvm.gradle.root, { runtimeRoots, toolEnv: runtimeEnv }),
+  wants('maven') && entry('maven', jvm.maven.program, ['--version'], jvm.maven.root, { runtimeRoots, toolEnv: runtimeEnv, mavenSeed: jvm.maven.seedRepository }),
+  wants('nuget') && entry('nuget', dotnet, ['--version'], process.env.DOTNET_ROOT, { runtimeRoots, toolEnv: runtimeEnv, cwd: dotnetVersionRoot }),
+  wants('composer') && entry('composer', composer.php, ['--version'], composer.root, { prefix: [composer.phar], runtimeRoots: [resolve(composer.php, '..'), ...composer.configRoots] }),
+].filter(Boolean);
 const matrixFile = join(root, 'matrix.json');
 writeFileSync(matrixFile, `${JSON.stringify(matrix, null, 2)}\n`);
 const line = `NUB_SANDBOX_NATIVE_TOOL_MATRIX_FILE=${matrixFile}`;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cstring>
+#include <cstdint>
 #include "detours.h"
 
 static const GUID payload_id = {0x19c47458, 0xe2ad, 0x421d, {0x81, 0x37, 0x52, 0xa1, 0x85, 0xf7, 0xb8, 0x15}};
@@ -17,11 +18,38 @@ struct Payload {
 };
 static Payload state = {};
 
+static USHORT image_machine(HANDLE process) {
+    // Suspended x64 processes on ARM64 can report native-machine via IsWow64Process2.
+    // Read the mapped executable header, not the image path (which can be replaced).
+    uintptr_t address = 0;
+    MEMORY_BASIC_INFORMATION region;
+    while (VirtualQueryEx(process, reinterpret_cast<void*>(address), &region, sizeof(region))) {
+        auto base = static_cast<const BYTE*>(region.BaseAddress);
+        if (region.Type == MEM_IMAGE && region.State == MEM_COMMIT &&
+            region.AllocationBase == region.BaseAddress && !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            IMAGE_DOS_HEADER dos;
+            IMAGE_NT_HEADERS32 pe;
+            if (ReadProcessMemory(process, base, &dos, sizeof(dos), nullptr) &&
+                dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew >= static_cast<LONG>(sizeof(dos)) &&
+                static_cast<SIZE_T>(dos.e_lfanew) < region.RegionSize &&
+                ReadProcessMemory(process, base + dos.e_lfanew, &pe, sizeof(pe), nullptr) &&
+                pe.Signature == IMAGE_NT_SIGNATURE && !(pe.FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+                return pe.FileHeader.Machine;
+            }
+        }
+        uintptr_t next = reinterpret_cast<uintptr_t>(base) + region.RegionSize;
+        if (next <= address) break;
+        address = next;
+    }
+    return 0;
+}
+
 static BOOL inject(HANDLE process, const Payload& source) {
     Payload target = source;
-    USHORT machine = 0, native_machine = 0;
-    if (!IsWow64Process2(process, &machine, &native_machine)) return FALSE;
-    if (!machine) machine = native_machine;
+    USHORT reported = 0, native_machine = 0;
+    IsWow64Process2(process, &reported, &native_machine);
+    USHORT machine = image_machine(process);
+    fprintf(stderr, "ADAPTER_MACHINE image=%04x wow=%04x native=%04x\n", machine, reported, native_machine);
     const char* arch = machine == IMAGE_FILE_MACHINE_AMD64 ? "x64" :
                        machine == IMAGE_FILE_MACHINE_ARM64 ? "arm64" : nullptr;
     if (!arch) { SetLastError(ERROR_EXE_MACHINE_TYPE_MISMATCH); return FALSE; }
@@ -92,7 +120,16 @@ static bool msys_directory(POBJECT_ATTRIBUTES original, OBJECT_ATTRIBUTES& redir
         wcschr(leaf, L'\\') || wcschr(leaf, L'/')) return false;
     ULONG length = 0;
     if (!GetAppContainerNamedObjectPath(nullptr, nullptr, 1024, path, &length)) return false;
-    if (wcscat_s(path, L"\\") || wcscat_s(path, leaf)) return false;
+    if (path[0] != L'\\') {
+        // The Win32 API returns a path relative to this session's BaseNamedObjects.
+        wchar_t relative[1024];
+        wcscpy_s(relative, path);
+        DWORD session_id = 0;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_id)) return false;
+        if (swprintf_s(path, L"\\Sessions\\%lu\\BaseNamedObjects\\%s", session_id, relative) < 0) return false;
+    }
+    size_t end = wcslen(path);
+    if ((end && path[end - 1] != L'\\' && wcscat_s(path, L"\\")) || wcscat_s(path, leaf)) return false;
     name.Buffer = path;
     name.Length = USHORT(wcslen(path) * sizeof(wchar_t));
     name.MaximumLength = USHORT(name.Length + sizeof(wchar_t));
@@ -109,7 +146,7 @@ static NTSTATUS NTAPI create_directory(PHANDLE handle, ACCESS_MASK access, POBJE
     wchar_t path[1024];
     if (!msys_directory(attrs, redirected, name, path)) return true_create_directory(handle, access, attrs);
     NTSTATUS status = true_create_directory(handle, access, &redirected);
-    fprintf(stderr, "ADAPTER_MSYS_DIRECTORY status=%08lx\n", static_cast<unsigned long>(status));
+    fprintf(stderr, "ADAPTER_MSYS_DIRECTORY path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
     return status;
 }
 
@@ -122,14 +159,27 @@ static NTSTATUS NTAPI open_directory(PHANDLE handle, ACCESS_MASK access, POBJECT
 }
 
 static bool is_null(LPCWSTR path) {
-    return path && (!_wcsicmp(path, L"NUL") || !_wcsicmp(path, L"NUL:") ||
-                    !_wcsicmp(path, L"\\\\.\\NUL") || !_wcsicmp(path, L"\\\\?\\NUL"));
+    if (!path) return false;
+    // PHP expands its NUL descriptor to an absolute DOS path before opening it.
+    // Let Windows classify reserved DOS device names rather than matching file suffixes.
+    using DosDeviceName = ULONG (NTAPI*)(PCWSTR);
+    auto address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlIsDosDeviceName_U");
+    DosDeviceName classify;
+    memcpy(&classify, &address, sizeof(address));
+    ULONG part = classify ? classify(path) : 0;
+    return part && LOWORD(part) == 3 * sizeof(wchar_t) &&
+           !_wcsnicmp(path + HIWORD(part) / sizeof(wchar_t), L"NUL", 3);
 }
 
 static HANDLE WINAPI create_file(LPCWSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES security, DWORD disposition,
                                 DWORD flags, HANDLE template_file) {
     HANDLE result = true_create_file(path, access, share, security, disposition, flags, template_file);
+    if (result == INVALID_HANDLE_VALUE && path && (wcsstr(path, L"NUL") || wcsstr(path, L"nul"))) {
+        DWORD error = GetLastError();
+        fprintf(stderr, "ADAPTER_NUL path=%ls access=%08lx flags=%08lx error=%lu recognized=%d\n", path, access, flags, error, is_null(path));
+        SetLastError(error);
+    }
     if (result != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ACCESS_DENIED ||
         !is_null(path) || (flags & FILE_FLAG_OVERLAPPED)) return result;
     // Duplicate a parent-opened real null device, never a regular-file approximation.
