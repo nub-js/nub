@@ -627,7 +627,7 @@ fn run_tool_control(name: &str, label: &str, tooldirs: Option<bool>) {
 }
 
 #[cfg(windows)]
-fn run_python_adapter(name: &str, tooldirs: bool) {
+fn run_python_adapter(name: &str, tooldirs: bool, readable_ancestors: bool) {
     let tool = tool(name);
     let root = fixture();
     let paths = configured_paths(root.path());
@@ -645,7 +645,29 @@ fn run_python_adapter(name: &str, tooldirs: bool) {
         "PYTHONPATH".into(),
         format!("{};{existing}", startup.display()),
     );
-    let policy = grant_policy(&tool, root.path(), &paths, env.clone(), tooldirs);
+    let mut policy = grant_policy(&tool, root.path(), &paths, env.clone(), tooldirs);
+    if readable_ancestors {
+        use nub_sandbox::policy::{CanonGlob, Effect, FsAccess, FsOrigin, FsRule};
+        let mut ancestors = std::collections::BTreeSet::new();
+        for rule in &policy.fs.rules.entries {
+            let path = rule.matcher.as_str().trim_end_matches("/**");
+            if !path.contains('*') {
+                ancestors.extend(Path::new(path).ancestors().skip(1).map(Path::to_path_buf));
+            }
+        }
+        // A bounded diagnostic: read directory nodes, never their descendants.
+        // Distinguish missing ancestor metadata from native canonicalization limits.
+        for path in ancestors {
+            if !path.as_os_str().is_empty() {
+                policy.fs.rules.entries.push(FsRule {
+                    matcher: CanonGlob(path.to_string_lossy().into_owned()),
+                    effect: Effect::Allow,
+                    access: FsAccess::Read,
+                    origin: FsOrigin::Speculative,
+                });
+            }
+        }
+    }
     let retained = Sandbox::acquire(&policy).unwrap();
     // Separate one-shot acquisitions share this live resource throughout the sequence.
     let probe = r#"import os, pathlib, tempfile
@@ -668,6 +690,30 @@ else:
 os.mkdir(p / 'nested', 0o700)
 (p / 'nested' / 'allowed').write_text('NESTED')
 os.mkdir(p / 'ordinary', 0o777)
+import ctypes
+from ctypes import wintypes
+api = ctypes.WinDLL('advapi32', use_last_error=True)
+api.GetNamedSecurityInfoW.argtypes = [wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p)]
+api.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p,
+    wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+free = ctypes.WinDLL('kernel32').LocalFree
+free.argtypes = [ctypes.c_void_p]
+descriptor = ctypes.c_void_p()
+assert api.GetNamedSecurityInfoW(str(p), 1, 4, None, None, None, None, ctypes.byref(descriptor)) == 0
+text = wintypes.LPWSTR()
+try:
+    assert api.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, ctypes.byref(text), None)
+    acl = text.value
+    assert acl.startswith('D:P'), acl
+    assert acl.count('(A;') == 4, acl
+    assert ';;;AC)' not in acl and ';;;S-1-15-2-1)' not in acl, acl
+    assert ';;;S-1-15-2-' in acl, acl
+    print('PRIVATE_DIRECTORY_ACL', acl)
+finally:
+    if text: free(text)
+    free(descriptor)
 print('PRIVATE_DIRECTORY_OK')
 "#;
     assert_success(
@@ -699,28 +745,35 @@ print('PRIVATE_DIRECTORY_OK')
 #[test]
 #[ignore = "requires the pinned native Python tool matrix"]
 fn windows_adapter_pip_exact() {
-    run_python_adapter("pip", false);
+    run_python_adapter("pip", false, false);
 }
 
 #[cfg(windows)]
 #[test]
 #[ignore = "requires the pinned native Python tool matrix"]
 fn windows_adapter_pip_tooldirs() {
-    run_python_adapter("pip", true);
+    run_python_adapter("pip", true, false);
 }
 
 #[cfg(windows)]
 #[test]
 #[ignore = "requires the pinned native Python tool matrix"]
 fn windows_adapter_uv_exact() {
-    run_python_adapter("uv", false);
+    run_python_adapter("uv", false, false);
 }
 
 #[cfg(windows)]
 #[test]
 #[ignore = "requires the pinned native Python tool matrix"]
 fn windows_adapter_uv_tooldirs() {
-    run_python_adapter("uv", true);
+    run_python_adapter("uv", true, false);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the pinned native Python tool matrix"]
+fn windows_adapter_uv_readable_ancestors() {
+    run_python_adapter("uv", true, true);
 }
 
 macro_rules! python_tool_test {
