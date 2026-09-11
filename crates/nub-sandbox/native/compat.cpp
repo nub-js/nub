@@ -126,6 +126,77 @@ static bool initialize_private_security() {
            AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, state.package_sid) &&
            SetSecurityDescriptorDacl(&private_descriptor, TRUE, acl, FALSE);
 }
+// MSYS installs a user-only default DACL and process DACL. Preserve its ACEs,
+// but keep this package able to use its own objects and reopen child processes.
+class PackageAcl {
+    PACL value_ = nullptr;
+public:
+    explicit PackageAcl(PACL original) {
+        ACL_SIZE_INFORMATION info = {};
+        if (!original || !GetAclInformation(original, &info, sizeof(info), AclSizeInformation)) return;
+        DWORD bytes = info.AclBytesInUse + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) +
+                      GetLengthSid(state.package_sid);
+        if (bytes > MAXWORD) return;
+        auto acl = static_cast<PACL>(LocalAlloc(LPTR, bytes));
+        if (!acl) return;
+        memcpy(acl, original, info.AclBytesInUse);
+        acl->AclSize = static_cast<WORD>(bytes);
+        if (!AddAccessAllowedAce(acl, acl->AclRevision, GENERIC_ALL, state.package_sid)) {
+            LocalFree(acl);
+            return;
+        }
+        value_ = acl;
+    }
+    ~PackageAcl() { if (value_) LocalFree(value_); }
+    PackageAcl(const PackageAcl&) = delete;
+    PackageAcl& operator=(const PackageAcl&) = delete;
+    PACL get() const { return value_; }
+};
+using NtToken = NTSTATUS (NTAPI*)(HANDLE, TOKEN_INFORMATION_CLASS, PVOID, ULONG);
+using NtSecurity = NTSTATUS (NTAPI*)(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+static NtToken true_set_token = nullptr;
+static NtSecurity true_set_security = nullptr;
+
+static NTSTATUS NTAPI set_token(HANDLE token, TOKEN_INFORMATION_CLASS kind, PVOID data, ULONG length) {
+    if (kind != TokenDefaultDacl || !data || length != sizeof(TOKEN_DEFAULT_DACL))
+        return true_set_token(token, kind, data, length);
+    // Only adapt tokens belonging to the current package, never an unrelated token.
+    alignas(void*) BYTE info[512];
+    DWORD needed = 0;
+    if (!GetTokenInformation(token, TokenAppContainerSid, info, sizeof(info), &needed))
+        return true_set_token(token, kind, data, length);
+    auto sid = reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(info)->TokenAppContainer;
+    if (!sid || !EqualSid(sid, state.package_sid))
+        return true_set_token(token, kind, data, length);
+    auto original = static_cast<TOKEN_DEFAULT_DACL*>(data);
+    if (!original->DefaultDacl) return true_set_token(token, kind, data, length);
+    PackageAcl acl(original->DefaultDacl);
+    if (!acl.get()) return static_cast<NTSTATUS>(0xc0000017L);
+    TOKEN_DEFAULT_DACL adapted = {acl.get()};
+    return true_set_token(token, kind, &adapted, sizeof(adapted));
+}
+
+static NTSTATUS NTAPI set_security(HANDLE handle, SECURITY_INFORMATION kind, PSECURITY_DESCRIPTOR descriptor) {
+    if (kind != DACL_SECURITY_INFORMATION || GetProcessId(handle) != GetCurrentProcessId())
+        return true_set_security(handle, kind, descriptor);
+    PACL original = nullptr;
+    BOOL present = FALSE, defaulted = FALSE;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorDacl(descriptor, &present, &original, &defaulted) ||
+        !GetSecurityDescriptorControl(descriptor, &control, &revision) || !present || !original)
+        return true_set_security(handle, kind, descriptor);
+    PackageAcl acl(original);
+    if (!acl.get()) return static_cast<NTSTATUS>(0xc0000017L);
+    SECURITY_DESCRIPTOR adapted;
+    const SECURITY_DESCRIPTOR_CONTROL flags =
+        SE_DACL_PROTECTED | SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
+    if (!InitializeSecurityDescriptor(&adapted, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorDacl(&adapted, TRUE, acl.get(), defaulted) ||
+        !SetSecurityDescriptorControl(&adapted, flags, control & flags))
+        return static_cast<NTSTATUS>(0xc0000079L);
+    return true_set_security(handle, kind, &adapted);
+}
 using NtDirectory = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 static BOOL WINAPI anonymous_pipe(PHANDLE read, PHANDLE write, LPSECURITY_ATTRIBUTES security, DWORD size) {
     if (true_anonymous_pipe(read, write, security, size)) return TRUE;
@@ -404,7 +475,9 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (!payload || size != sizeof(Payload)) return FALSE;
     state = *payload;
     if (!initialize_private_security()) return FALSE;
-    if (!resolve_nt(true_create_directory, "NtCreateDirectoryObject") ||
+    if (!resolve_nt(true_set_token, "NtSetInformationToken") ||
+        !resolve_nt(true_set_security, "NtSetSecurityObject") ||
+        !resolve_nt(true_create_directory, "NtCreateDirectoryObject") ||
         !resolve_nt(true_open_directory, "NtOpenDirectoryObject") ||
         !resolve_nt(true_create_pipe, "NtCreateNamedPipeFile") ||
         !resolve_nt(true_open_file, "NtOpenFile") ||
@@ -412,6 +485,8 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         !resolve_nt(query_object, "NtQueryObject")) return FALSE;
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
+    DetourAttach(reinterpret_cast<PVOID*>(&true_set_token), set_token);
+    DetourAttach(reinterpret_cast<PVOID*>(&true_set_security), set_security);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_file), create_file);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_file_a), create_file_a);
     DetourAttach(reinterpret_cast<PVOID*>(&true_final_path), final_path);

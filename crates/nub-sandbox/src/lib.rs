@@ -50,6 +50,9 @@ pub mod backend;
 #[path = "../tests/git_tool_functionality.rs"]
 mod git_tool_functionality_probe;
 #[cfg(all(test, windows))]
+#[path = "../tests/tool_functionality.rs"]
+mod js_tool_functionality_probe;
+#[cfg(all(test, windows))]
 #[path = "../tests/native_tool_functionality.rs"]
 mod native_tool_functionality_probe;
 #[cfg(all(test, windows))]

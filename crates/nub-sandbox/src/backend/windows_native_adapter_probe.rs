@@ -9,6 +9,94 @@ use std::process::Command;
 
 const CHILD: &str = "backend::windows_native_adapter_probe::native_adapter_child";
 
+fn private_object_permissions() -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::GENERIC_ALL;
+    use windows_sys::Win32::Security::{
+        ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetTokenInformation,
+        InitializeAcl, InitializeSecurityDescriptor, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+        SetSecurityDescriptorDacl, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+        TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+        PROCESS_SYNCHRONIZE,
+    };
+    let check = |ok| {
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    let mut token = std::ptr::null_mut();
+    check(unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+            &mut token,
+        )
+    })?;
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut user = [0usize; 64];
+    let mut needed = 0;
+    check(unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            std::mem::size_of_val(&user) as u32,
+            &mut needed,
+        )
+    })?;
+    if std::env::var_os("NUB_ADAPTER_PRIVATE_CHILD").is_some() {
+        return Ok(()); // A child of the modified default DACL can query its own token.
+    }
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut bytes = [0u32; 128];
+    let acl = bytes.as_mut_ptr().cast::<ACL>();
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let sd = std::ptr::addr_of_mut!(descriptor).cast();
+    check(unsafe { InitializeAcl(acl, std::mem::size_of_val(&bytes) as u32, ACL_REVISION) })?;
+    check(unsafe { AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) })?;
+    check(unsafe { InitializeSecurityDescriptor(sd, 1) })?;
+    check(unsafe { SetSecurityDescriptorDacl(sd, 1, acl, 0) })?;
+    let default = TOKEN_DEFAULT_DACL { DefaultDacl: acl };
+    // Reproduce MSYS's user-only token default and process DACL, not a Git-specific API.
+    check(unsafe {
+        SetTokenInformation(
+            token.as_raw_handle(),
+            TokenDefaultDacl,
+            std::ptr::addr_of!(default).cast(),
+            std::mem::size_of_val(&default) as u32,
+        )
+    })?;
+    check(unsafe { SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, sd) })?;
+    drop(token);
+    let reopen = |pid| {
+        let handle =
+            unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+        }
+    };
+    drop(reopen(std::process::id())?);
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(["--exact", CHILD, "--nocapture"])
+        .env("NUB_ADAPTER_PRIVATE_CHILD", "1")
+        .spawn()?;
+    // Retain and reap the child even when reopening fails, as in Git's waitpid.
+    let reopened = reopen(child.id());
+    let status = child.wait()?;
+    drop(reopened?);
+    if !status.success() {
+        return Err(std::io::Error::other("private-object child failed"));
+    }
+    Ok(())
+}
+
 fn anonymous_pipe_bytes() -> std::io::Result<Vec<u8>> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Security::{
@@ -110,6 +198,10 @@ pub(crate) fn inject_probe(pid: u32) -> std::io::Result<()> {
 
 #[test]
 fn native_adapter_child() {
+    if std::env::var_os("NUB_ADAPTER_PRIVATE_CHILD").is_some() {
+        private_object_permissions().unwrap();
+        return;
+    }
     let Ok(file) = std::env::var("NUB_ADAPTER_PROBE_FILE") else {
         return;
     };
@@ -141,6 +233,8 @@ fn native_adapter_child() {
                 && String::from_utf8_lossy(&output.stdout).contains("ADAPTER_PRIMITIVES")
         }));
     }
+    let private_objects = private_object_permissions();
+    eprintln!("ADAPTER_PRIVATE_OBJECTS {private_objects:?}");
     println!(
         "ADAPTER_PRIMITIVES {}",
         json!({
@@ -152,6 +246,7 @@ fn native_adapter_child() {
             "nested": nested,
             "assets_protected": assets,
             "anonymous_pipe": pipe.as_ref().is_ok_and(|bytes| bytes == b"pipe"),
+            "private_objects": private_objects.is_ok(),
         })
     );
     eprintln!("ADAPTER_ERRORS read={nul_read:?} write={nul_write:?} canonical={canonical:?}");
@@ -164,6 +259,7 @@ fn native_adapter_child() {
         assert!(nested.is_none_or(|ok| ok));
         assert!(assets.is_none_or(|ok| ok));
         assert!(pipe.is_ok_and(|bytes| bytes == b"pipe"));
+        assert!(private_objects.is_ok());
     }
 }
 
@@ -355,6 +451,7 @@ fn native_adapter_primitives(probe: bool) {
                 "canonical",
                 "nested",
                 "anonymous_pipe",
+                "private_objects",
             ] {
                 assert_eq!(result[property], true, "{mode} {property}: {result}");
             }

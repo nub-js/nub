@@ -129,8 +129,10 @@ jobs:
           rustup set default-host x86_64-pc-windows-msvc
           node scripts/sandbox-native-tool-fixtures.mjs --tools=cargo,go,composer 2>&1 | tee reports/native-provision.log
           node scripts/sandbox-python-fixtures.mjs 2>&1 | tee reports/python-provision.log
+          node scripts/sandbox-tool-fixtures.mjs 2>&1 | tee reports/js-provision.log
           cp .sandbox-native-tool-fixtures/matrix.json reports/native-matrix.json
           cp .sandbox-python-fixtures/matrix.json reports/python-matrix.json
+          cp .sandbox-tool-fixtures/matrix.json reports/js-matrix.json
       - name: Comparing existing native tool sequences
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         shell: pwsh
@@ -144,6 +146,9 @@ jobs:
             @('git', 'git_tool_functionality_probe::git_windows_complete_runtime_plain', 'git_tool_functionality_probe::git_windows_complete_runtime_tooldirs'),
             @('git-lfs', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_plain', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_tooldirs')
           )
+          foreach ($tool in @('npm', 'pnpm9', 'pnpm10', 'pnpm11', 'yarn1', 'yarn2', 'yarn3', 'yarn4', 'bun132', 'bun140')) {
+            $cases += ,@($tool, "js_tool_functionality_probe::windows_native_$($tool)_plain", "js_tool_functionality_probe::windows_native_$($tool)_tooldirs")
+          }
           $results = @()
           $modes = @('plain', 'raw', 'embedded')
           if ('${{ steps.probe.outcome }}' -eq 'success') { $modes += 'adapter' }

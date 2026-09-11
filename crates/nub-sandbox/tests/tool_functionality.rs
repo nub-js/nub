@@ -1,6 +1,8 @@
 //! Native tool-directory operations, with unconfined and narrow-policy controls.
 #[path = "common/tool_output.rs"]
 mod tool_output;
+#[path = "common/tool_sandbox.rs"]
+mod tool_sandbox;
 use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -105,7 +107,7 @@ fn confined(
     policy: &nub_sandbox::SandboxPolicy,
 ) -> Output {
     eprintln!("CONFINED {program} {args:?}");
-    let sandbox = Sandbox::new(policy).expect("tool sandbox acquires");
+    let sandbox = tool_sandbox::acquire(policy).expect("tool sandbox acquires");
     confined_in(&sandbox, program, args, root)
 }
 
@@ -647,7 +649,7 @@ fn run_retained_tool_control(name: &str, tooldirs: bool, unconfined: bool, sampl
     for key in ["TMPDIR", "TMP", "TEMP"] {
         plain_env.insert(key.into(), plain_tmp.to_string_lossy().into_owned());
     }
-    let sandbox = (!unconfined).then(|| Sandbox::acquire(&policy).unwrap());
+    let sandbox = (!unconfined).then(|| tool_sandbox::acquire(&policy).unwrap());
     let run = |argv: Vec<String>| {
         eprintln!(
             "SELF_PROC {} {} {argv:?}",
@@ -816,7 +818,7 @@ fn windows_bun140_link_primitives_and_global_sources() {
             for key in ["TMPDIR", "TMP", "TEMP"] {
                 plain_env.insert(key.into(), tmp.to_string_lossy().into_owned());
             }
-            let sandbox = (mode != "plain").then(|| Sandbox::acquire(&policy).unwrap());
+            let sandbox = (mode != "plain").then(|| tool_sandbox::acquire(&policy).unwrap());
             let run = |argv: Vec<String>| {
                 if let Some(sandbox) = &sandbox {
                     let prepared = sandbox
@@ -923,7 +925,7 @@ fn bun_shared_cache_control(name: &str) {
     fs[cache.parent().unwrap().to_str().unwrap()] = json!("rw");
     let env: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let policy = policy(root.path(), fs, &env);
-    let sandbox = Sandbox::acquire(&policy).unwrap();
+    let sandbox = tool_sandbox::acquire(&policy).unwrap();
     let setup = sandbox
         .prepare(
             CommandSpec::new(&tool.program)
@@ -1045,6 +1047,80 @@ fn linux_self_proc_bun140_tooldirs() {
     run_self_proc_tool("bun140", true);
 }
 
+#[cfg(windows)]
+macro_rules! native_windows_tool_controls {
+    ($tool:literal, $plain:ident, $tooldirs:ident) => {
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $plain() {
+            run_retained_tool_control($tool, true, true, None);
+        }
+
+        #[test]
+        #[ignore = "requires the pinned native tool matrix"]
+        fn $tooldirs() {
+            run_retained_tool_control($tool, true, false, None);
+        }
+    };
+}
+
+#[cfg(windows)]
+native_windows_tool_controls!("npm", windows_native_npm_plain, windows_native_npm_tooldirs);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "pnpm9",
+    windows_native_pnpm9_plain,
+    windows_native_pnpm9_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "pnpm10",
+    windows_native_pnpm10_plain,
+    windows_native_pnpm10_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "pnpm11",
+    windows_native_pnpm11_plain,
+    windows_native_pnpm11_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "yarn1",
+    windows_native_yarn1_plain,
+    windows_native_yarn1_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "yarn2",
+    windows_native_yarn2_plain,
+    windows_native_yarn2_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "yarn3",
+    windows_native_yarn3_plain,
+    windows_native_yarn3_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "yarn4",
+    windows_native_yarn4_plain,
+    windows_native_yarn4_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "bun132",
+    windows_native_bun132_plain,
+    windows_native_bun132_tooldirs
+);
+#[cfg(windows)]
+native_windows_tool_controls!(
+    "bun140",
+    windows_native_bun140_plain,
+    windows_native_bun140_tooldirs
+);
+
 macro_rules! tool_controls {
     ($tool:literal, $unconfined:ident, $exact:ident, $tooldirs:ident) => {
         #[test]
@@ -1165,7 +1241,7 @@ fn run_node_adapter_control(name: &str, tooldirs: bool, cache_parent: bool) {
         .env
         .constructed
         .insert("NODE_OPTIONS".into(), options);
-    let sandbox = Sandbox::acquire(&policy).expect("adapted session acquires");
+    let sandbox = tool_sandbox::acquire(&policy).expect("adapted session acquires");
     let run = |argv: Vec<String>| {
         eprintln!(
             "ADAPTED {} {} {argv:?}",
