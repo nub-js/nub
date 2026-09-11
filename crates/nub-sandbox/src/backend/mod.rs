@@ -591,6 +591,12 @@ impl Sandbox {
     }
 
     fn new_impl(policy: &SandboxPolicy, native_compat: bool) -> Result<Self, Degradation> {
+        if native_compat && !cfg!(target_env = "msvc") {
+            return Err(Degradation {
+                lost: vec!["native-compat".into()],
+                reason: Some("native compatibility requires an MSVC build".into()),
+            });
+        }
         #[cfg(not(windows))]
         debug_assert!(!native_compat);
         #[cfg(not(target_os = "linux"))]

@@ -2,7 +2,9 @@
 
 use super::windows::windows_registry::{self, Acquired};
 use sha2::{Digest as _, Sha256};
-use std::io::{self, Write as _};
+use std::io;
+#[cfg(target_env = "msvc")]
+use std::io::Write as _;
 #[cfg(target_env = "msvc")]
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -41,13 +43,8 @@ pub(super) fn asset_path(profile: &str) -> io::Result<PathBuf> {
     windows_registry::native_assets_path(profile)
 }
 
+#[cfg(target_env = "msvc")]
 pub(super) fn install(resource: &mut Acquired, path: &Path) -> io::Result<()> {
-    if ASSETS.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native compatibility requires an MSVC build",
-        ));
-    }
     // The protected registry parent prevents an AppContainer from replacing the
     // directory or its DLLs. The launcher later grants only this leaf read/execute.
     resource.record_private_path(path)?;
@@ -61,6 +58,14 @@ pub(super) fn install(resource: &mut Acquired, path: &Path) -> io::Result<()> {
         file.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(not(target_env = "msvc"))]
+pub(super) fn install(_resource: &mut Acquired, _path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native compatibility requires an MSVC build",
+    ))
 }
 
 pub(super) fn inject(process: *mut std::ffi::c_void, path: &Path) -> io::Result<()> {

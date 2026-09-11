@@ -9,6 +9,39 @@ use std::process::Command;
 
 const CHILD: &str = "backend::windows_native_adapter_probe::native_adapter_child";
 
+fn anonymous_pipe_bytes() -> std::io::Result<Vec<u8>> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let descriptor = std::ptr::addr_of_mut!(descriptor).cast();
+    if unsafe { InitializeSecurityDescriptor(descriptor, 1) } == 0
+        || unsafe { SetSecurityDescriptorDacl(descriptor, 1, std::ptr::null(), 0) } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let mut reader = std::ptr::null_mut();
+    let mut writer = std::ptr::null_mut();
+    if unsafe { CreatePipe(&mut reader, &mut writer, &attributes, 16) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut reader = unsafe { std::fs::File::from_raw_handle(reader) };
+    let mut writer = unsafe { std::fs::File::from_raw_handle(writer) };
+    writer.write_all(b"pipe")?;
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn embedded_assets_protected() -> Option<bool> {
     use std::os::windows::ffi::OsStringExt as _;
     use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -79,6 +112,8 @@ fn native_adapter_child() {
         .and_then(|mut f| f.write(b"discarded"));
     let denied = std::fs::read(canary);
     let assets = embedded_assets_protected();
+    let pipe = anonymous_pipe_bytes();
+    eprintln!("ADAPTER_ANONYMOUS_PIPE {pipe:?}");
     let mut nested = None;
     if std::env::var_os("NUB_ADAPTER_PROBE_NESTED").is_none() {
         let output = Command::new(std::env::current_exe().unwrap())
@@ -101,6 +136,7 @@ fn native_adapter_child() {
             "canary_denied": denied.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
             "nested": nested,
             "assets_protected": assets,
+            "anonymous_pipe": pipe.as_ref().is_ok_and(|bytes| bytes == b"pipe"),
         })
     );
     eprintln!("ADAPTER_ERRORS read={nul_read:?} write={nul_write:?} canonical={canonical:?}");
@@ -112,6 +148,7 @@ fn native_adapter_child() {
         assert!(denied.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied));
         assert!(nested.is_none_or(|ok| ok));
         assert!(assets.is_none_or(|ok| ok));
+        assert!(pipe.is_ok_and(|bytes| bytes == b"pipe"));
     }
 }
 
@@ -302,6 +339,7 @@ fn native_adapter_primitives(probe: bool) {
                 "absolute_nul",
                 "canonical",
                 "nested",
+                "anonymous_pipe",
             ] {
                 assert_eq!(result[property], true, "{mode} {property}: {result}");
             }

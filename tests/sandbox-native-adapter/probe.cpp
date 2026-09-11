@@ -95,6 +95,7 @@ static auto true_create_file = CreateFileW;
 static auto true_create_file_a = CreateFileA;
 static auto true_final_path = GetFinalPathNameByHandleW;
 static auto true_create_process = CreateProcessW;
+static auto true_anonymous_pipe = CreatePipe;
 static SECURITY_DESCRIPTOR private_descriptor;
 alignas(ACL) static BYTE private_acl[512];
 
@@ -117,6 +118,30 @@ static bool initialize_private_security() {
            SetSecurityDescriptorDacl(&private_descriptor, TRUE, acl, FALSE);
 }
 using NtDirectory = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+static BOOL WINAPI anonymous_pipe(PHANDLE read, PHANDLE write, LPSECURITY_ATTRIBUTES security, DWORD size) {
+    if (true_anonymous_pipe(read, write, security, size)) return TRUE;
+    if (GetLastError() != ERROR_ACCESS_DENIED) return FALSE;
+    // CreatePipe's internal name is not package-local. Keep the anonymous
+    // stream contract, but create both ends in LOCAL with the package ACL.
+    static volatile LONG serial = 0;
+    wchar_t path[160];
+    if (swprintf_s(path, L"\\\\.\\pipe\\LOCAL\\sandbox-anonymous-%lu-%lu",
+                   GetCurrentProcessId(), static_cast<ULONG>(InterlockedIncrement(&serial))) < 0) return FALSE;
+    SECURITY_ATTRIBUTES attrs = {sizeof(attrs), &private_descriptor, security && security->bInheritHandle};
+    HANDLE input = CreateNamedPipeW(path, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, size, size, 0, &attrs);
+    if (input == INVALID_HANDLE_VALUE) return FALSE;
+    HANDLE output = true_create_file(path, GENERIC_WRITE, 0, &attrs, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (output == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        CloseHandle(input);
+        SetLastError(error);
+        return FALSE;
+    }
+    *read = input;
+    *write = output;
+    return TRUE;
+}
 static NtDirectory true_create_directory = nullptr;
 static NtDirectory true_open_directory = nullptr;
 using NtPipe = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
@@ -387,6 +412,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_file_a), create_file_a);
     DetourAttach(reinterpret_cast<PVOID*>(&true_final_path), final_path);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_process), create_process);
+    DetourAttach(reinterpret_cast<PVOID*>(&true_anonymous_pipe), anonymous_pipe);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_directory), create_directory);
     DetourAttach(reinterpret_cast<PVOID*>(&true_open_directory), open_directory);
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_pipe), create_pipe);

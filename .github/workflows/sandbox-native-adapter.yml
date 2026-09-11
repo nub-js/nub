@@ -113,7 +113,10 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --lib backend::windows::native_child_tests -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-ownership.log
-          cargo test -p nub-sandbox --profile fast --lib backend::windows::cleanup_tests -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-cleanup.log
+          cargo test -p nub-sandbox --profile fast --lib backend::windows::windows_cleanup_tests -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-cleanup.log
+          for report in reports/embedded-ownership.log reports/embedded-cleanup.log; do
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$report" || exit 1
+          done
       - name: Provisioning the existing pinned tool fixtures
         id: tools
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
