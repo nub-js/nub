@@ -40,9 +40,9 @@ The JavaScript fixtures use Node 22.18.0. Windows 11 runs Cargo, Go and the JVM 
 
 ## Explicit Windows native adapter
 
-The [embedded-adapter run](https://github.com/nubjs/nub/actions/runs/34546773523), at `0c510d0dbb`, passes the complete Cargo, Go, Composer, uv and pip sequences on Windows Server 2022 x64 and Windows 11 ARM64. Each has an unconfined control, a raw sandbox control, and a withheld-file canary. The Python sequences also use the Python private-directory helper. Both machines run x64 toolchains; descendants may have another supported architecture.
+The [embedded-adapter run](https://github.com/nubjs/nub/actions/runs/34551785167), at `10c9e74c2c`, passes the complete Cargo, Go, Composer, uv, pip and Git sequences on Windows Server 2022 x64 and Windows 11 ARM64. Each has an unconfined control, a raw sandbox control, and a withheld-file canary. The Python sequences also use the Python private-directory helper. Cargo, Go, Composer and Python use x64 toolchains; Git and descendants may have another supported architecture.
 
-Select this adapter through [`Sandbox::with_windows_native_compat`](README.md#explicit-windows-native-compatibility), not through another filesystem sentinel. Granting more cache paths does not repair native device opens, pipe namespaces or drive-alias queries. The same run checks nested execution, anonymous pipe byte transfer, DLL write denial and protected-registry read denial. Git's local-clone sequence still fails in this run, so it is not an all-tools pass.
+Select this adapter through [`Sandbox::with_windows_native_compat`](README.md#explicit-windows-native-compatibility), not through another filesystem sentinel. Granting more cache paths does not repair native device opens, pipe namespaces or drive-alias queries. The same run checks nested execution, anonymous pipe byte transfer, runtime-owned process permissions, DLL write denial and protected-registry read denial. Git LFS still fails its pre-push hook, so this is not an all-tools pass.
 
 ## Explicit Windows Node adapters
 
@@ -57,9 +57,9 @@ The [fixture](tests/tool_functionality.rs) retains both cache-grant variants. Th
 
 ## Git
 
-The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. Windows sequences remain incomplete because of device and subprocess access restrictions.
+The Unix sequence covers status, add, commit, clone, fetch, push, linked worktrees and Git LFS. It passes on Linux and macOS with explicit grants for the repository/common-directory locations and a dedicated writable global-config directory. macOS also passes the conventional home-level global-config update. With the native adapter, Git 2.55.0.windows.5 passes the same ordinary Git operations on both Windows hosts. Git LFS 3.7.1 still fails at its pre-push hook.
 
-An [installation-closure test](https://github.com/nubjs/nub/actions/runs/34408888398) adds explicit read access to the entire known Git installation. This does not repair the Windows Git/LFS sequences. The [startup controls](https://github.com/nubjs/nub/actions/runs/34409754352) distinguish direct Git from its bundled MSYS shell: direct Git runs in all seven descriptor configurations on Windows 11 arm64, while the shell exits with `0xC0000005` even for a builtin-only command. On Server 2022, Git reports denied `/dev/null` access and shell startup exits with `0xC0000142`. Every plain control passes and every confined denied-file canary remains inaccessible. These results establish the failure stage, not the immediate cause of the Windows 11 access violation.
+Raw Git still fails with [read access to its whole installation](https://github.com/nubjs/nub/actions/runs/34408888398). Its MSYS runtime also needs package-local coordination objects and pipes. MSYS replaces its process and default-object ACLs with user-only entries; those omit the AppContainer identity. The adapter preserves the existing entries and adds the current package identity, allowing Git to reopen and wait for its child processes. These changes affect runtime-owned objects, not filesystem policy.
 
 Git creates an adjacent lock file and renames it when updating global configuration. A grant on an existing file cannot substitute for parent-directory write access on Linux and Windows. For example, with `GIT_CONFIG_GLOBAL=/work/git-config/config` supplied by the embedder:
 
@@ -116,7 +116,7 @@ bun install --global ./package.tgz  # archived package: tested successfully
 
 The [explicit startup adapter](README.md#python-private-directories-on-windows) passes pip 26.2.1's local-wheel install, reinstall, import, user install and cache cleanup with Python 3.13.15 on Server 2022 and Windows 11 arm64. The [native run](https://github.com/nubjs/nub/actions/runs/34523672914) also checks the resulting protected private-directory ACL, nested writes and denied-file canaries.
 
-This does not repair uv's native launcher. The same run still fails uv 0.12.11's interpreter query on Server and its installed entrypoint's path canonicalization on Windows 11. Adding read access to ancestor directory nodes does not repair either failure. These are not missing cache-directory grants, and the startup adapter is not a general native-process compatibility layer.
+The Python helper alone does not repair uv's native launcher. The [combined native/Python adapter run](https://github.com/nubjs/nub/actions/runs/34551785167) passes uv's interpreter query and installed native entrypoint on both hosts. The two helpers address different requirements: protected directory creation and native device/path operations.
 
 ### Windows Gradle network qualification
 
@@ -141,7 +141,7 @@ Bun 1.3.2 hardcodes `/tmp` or `/private/tmp` for `bunx` downloads and pruning. L
 
 The [native path probe](https://github.com/nubjs/nub/actions/runs/34526954315) opens the granted file on both Windows hosts. Its NT path query succeeds, but its drive-letter query returns access denied; both plain queries succeed. The withheld-file canary remains denied.
 
-This is distinct from filesystem read permission. The [Microsoft report](https://github.com/microsoft/mxc/issues/694) identifies object-directory and mount-manager access needed by drive-letter translation. The engine does not modify those machine-wide permissions. The Node adapter handles its own realpath behavior, not arbitrary native programs' path queries.
+This is distinct from filesystem read permission. The [Microsoft report](https://github.com/microsoft/mxc/issues/694) identifies object-directory and mount-manager access needed by drive-letter translation. The engine does not modify those machine-wide permissions. The Node helper adapts Node's realpath behavior; the native adapter resolves permitted file handles through drive aliases captured by the launcher.
 
 ### Linux failure isolation
 

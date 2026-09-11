@@ -229,11 +229,11 @@ let command = sandbox.prepare(
 sandbox.close();
 ```
 
-The adapter preserves the AppContainer identity and filesystem/network enforcement. It supplies a parent-opened null-device handle, resolves permitted file handles through captured drive aliases, and places supported native pipes and MSYS/Cygwin coordination objects in the package's private namespace. These are runtime adaptations, not additional filesystem paths. Interpreter installations, projects and tool state still need explicit grants.
+The adapter preserves the AppContainer identity and filesystem/network enforcement. It supplies a parent-opened null-device handle, resolves permitted file handles through captured drive aliases, and places supported native pipes and MSYS/Cygwin coordination objects in the package's private namespace. MSYS and Cygwin provide Unix-like process and file interfaces on Windows. When those runtimes replace their own process/default-object ACLs, the adapter preserves their entries and adds the current package identity. Interpreter installations, projects and tool state still need explicit grants.
 
-- The launcher embeds x64 and ARM64 compatibility DLLs and injects the matching DLL before resuming each owned command. Ordinary `CreateProcessW` descendants receive the adapter too. Unsupported executable architectures and injection failures return errors; they do not launch an unconfined replacement.
+- The launcher embeds x64 and ARM64 compatibility DLLs (dynamic-link libraries) and injects the matching DLL before resuming each owned command. Microsoft Detours redirects the required Windows API calls inside that process. Ordinary `CreateProcessW` descendants receive the adapter too. Unsupported executable architectures and injection failures return errors; they do not launch an unconfined replacement.
 - Adapter DLLs live under the protected Windows resource registry. The command can read/execute its own DLLs but cannot replace them or read the registry. Equivalent policies with identical adapter bytes share the identity and retained assets. Raw sessions and different adapter versions do not share that identity.
-- Closing a session releases its lease. Bounded idle retention and explicit cleanup own the DLL directory, profile and recorded ACL entries together. No compiler, elevation or installer runs when a user creates a sandbox; building Nub itself requires both MSVC toolsets.
+- Closing a session releases its lease. Bounded idle retention and explicit cleanup own the DLL directory, profile and recorded ACL entries together. No compiler, elevation or installer runs when a user creates a sandbox; building Nub itself requires both Microsoft Visual C++ (MSVC) toolsets.
 - Python's protected-directory adapter remains separate. The [compatibility matrix](COMPATIBILITY.md) distinguishes raw runs from explicit adaptation and records actual operation sequences.
 
 ### Python private directories on Windows
