@@ -56,12 +56,24 @@ static BOOL inject(HANDLE process, const Payload& source) {
     if (!arch) { SetLastError(ERROR_EXE_MACHINE_TYPE_MISMATCH); return FALSE; }
     char path[MAX_PATH];
     if (sprintf_s(path, "%s\\probe-%s.dll", source.directory, arch) < 0) return FALSE;
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        fprintf(stderr, "ADAPTER_INJECT_FAILED attributes path=%s error=%lu\n", path, error);
+        SetLastError(error); return FALSE;
+    }
     if (!DuplicateHandle(GetCurrentProcess(), source.null_device, process,
-                         &target.null_device, 0, FALSE, DUPLICATE_SAME_ACCESS)) return FALSE;
+                         &target.null_device, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        DWORD error = GetLastError();
+        fprintf(stderr, "ADAPTER_INJECT_FAILED duplicate-null handle=%p error=%lu\n", source.null_device, error);
+        SetLastError(error); return FALSE;
+    }
     const char* dll = path;
-    return DetourCopyPayloadToProcess(process, payload_id, &target, sizeof(target)) &&
-           DetourUpdateProcessWithDll(process, &dll, 1);
+    BOOL copied = DetourCopyPayloadToProcess(process, payload_id, &target, sizeof(target));
+    BOOL updated = copied && DetourUpdateProcessWithDll(process, &dll, 1);
+    DWORD error = GetLastError();
+    fprintf(stderr, "ADAPTER_INJECT_RESULT child=%lu copied=%d updated=%d error=%lu\n", GetProcessId(process), copied, updated, error);
+    SetLastError(error);
+    return updated;
 }
 
 #ifdef PROBE_INJECTOR
@@ -399,7 +411,11 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     auto payload = static_cast<Payload*>(DetourFindPayloadEx(payload_id, &size));
     if (!payload || size != sizeof(Payload)) return FALSE;
     state = *payload;
-    if (!initialize_private_security()) return FALSE;
+    if (!initialize_private_security()) {
+        DWORD error = GetLastError();
+        fprintf(stderr, "ADAPTER_ATTACH_FAILED private-security pid=%lu error=%lu\n", GetCurrentProcessId(), error);
+        return FALSE;
+    }
     if (!resolve_nt(true_create_directory, "NtCreateDirectoryObject") ||
         !resolve_nt(true_open_directory, "NtOpenDirectoryObject") ||
         !resolve_nt(true_create_pipe, "NtCreateNamedPipeFile") ||
@@ -418,6 +434,8 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     DetourAttach(reinterpret_cast<PVOID*>(&true_create_pipe), create_pipe);
     DetourAttach(reinterpret_cast<PVOID*>(&true_open_file), open_file);
     DetourAttach(reinterpret_cast<PVOID*>(&true_nt_create_file), nt_create_file);
-    return DetourTransactionCommit() == NO_ERROR;
+    LONG result = DetourTransactionCommit();
+    fprintf(stderr, "ADAPTER_ATTACH_RESULT pid=%lu result=%ld\n", GetCurrentProcessId(), result);
+    return result == NO_ERROR;
 }
 #endif

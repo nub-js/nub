@@ -254,6 +254,11 @@ fn assert_recovered(profile: &str, private: &Path, caller: &Path, foreign: &Fore
         private.display()
     );
     assert!(!super::launch::test_profile_has_ace(profile, caller).unwrap());
+    assert!(
+        !windows_registry::native_assets_path(profile)
+            .unwrap()
+            .exists()
+    );
     assert!(super::launch::test_profile_has_ace(&foreign.profile, caller).unwrap());
     assert_eq!(
         std::fs::read(caller.join("caller-owned.txt")).unwrap(),
@@ -268,11 +273,21 @@ fn assert_recovered(profile: &str, private: &Path, caller: &Path, foreign: &Fore
 
 fn crash_transitions(root: &Path) {
     let _cleanup = CleanupAfterTest;
-    for stage in [
+    let mut stages = vec![
         "profile-created",
         "private-root-created",
         "acl-installed-before-ready",
-    ] {
+    ];
+    if std::env::var_os("NUB_NATIVE_EMBEDDED_ADAPTER").is_some() {
+        stages.extend([
+            "native-assets-journaled",
+            "native-assets-created",
+            "native-asset-written",
+            "native-assets-installed",
+            "native-assets-granted",
+        ]);
+    }
+    for stage in stages {
         let caller = root.join(stage);
         std::fs::create_dir(&caller).unwrap();
         std::fs::write(caller.join("caller-owned.txt"), b"caller-owned").unwrap();
@@ -286,10 +301,7 @@ fn crash_transitions(root: &Path) {
             !entry.leases.is_empty(),
             "journal must retain the dead owner's lease until recovery"
         );
-        assert!(
-            private.is_dir(),
-            "profile creation did not leave its private root"
-        );
+        assert_eq!(private.is_dir(), stage != "native-assets-journaled");
         if stage == "acl-installed-before-ready" {
             assert!(super::launch::test_profile_has_ace(&profile, &caller).unwrap());
         }
@@ -306,14 +318,14 @@ fn interrupted_cleanup(root: &Path) {
     let private = resource.private_tmp().unwrap().to_path_buf();
     std::fs::write(private.join("owned-file"), b"owned").unwrap();
     drop(resource);
-    let (crashed_profile, _) = crash_owner(root, "fault-cleanup", "cleanup-private-removed");
+    let (crashed_profile, removed) = crash_owner(root, "fault-cleanup", "cleanup-private-removed");
     assert_eq!(crashed_profile, profile);
     let entry = windows_registry::test_entry(&profile)
         .unwrap()
         .expect("interrupted cleanup discarded ownership");
     assert_eq!(entry.state, windows_registry::EntryState::Closing);
     assert!(
-        !private.exists(),
+        !removed.exists(),
         "fault did not occur after private deletion"
     );
     assert_recovered(&profile, &private, root, &foreign);

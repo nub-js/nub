@@ -2264,6 +2264,8 @@ pub(super) mod launch {
                         false,
                         false,
                     )?;
+                    #[cfg(test)]
+                    test_crash_transition("native-assets-granted", &name, path);
                 }
                 acquisition_step(
                     "profile-journal",
@@ -3561,7 +3563,7 @@ pub(super) mod launch {
     }
 
     #[cfg(test)]
-    fn test_crash_transition(stage: &str, profile: &str, private_root: &Path) {
+    pub(crate) fn test_crash_transition(stage: &str, profile: &str, private_root: &Path) {
         if !matches!(
             std::env::var("__NUB_WINDOWS_CLEANUP_FIXTURE").as_deref(),
             Ok("fault-acquire" | "fault-cleanup")

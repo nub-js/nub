@@ -48,7 +48,25 @@ pub(super) fn install(resource: &mut Acquired, path: &Path) -> io::Result<()> {
     // The protected registry parent prevents an AppContainer from replacing the
     // directory or its DLLs. The launcher later grants only this leaf read/execute.
     resource.record_private_path(path)?;
+    #[cfg(test)]
+    super::windows::launch::test_crash_transition(
+        "native-assets-journaled",
+        &resource.entry.profile_name,
+        path,
+    );
     std::fs::create_dir(path)?;
+    resource.record_mutation(windows_registry::AclMutation {
+        path: path.to_string_lossy().into_owned(),
+        kind: windows_registry::AclKind::Subtree,
+        access: windows_sys::Win32::Foundation::GENERIC_READ
+            | windows_sys::Win32::Foundation::GENERIC_EXECUTE,
+    })?;
+    #[cfg(test)]
+    super::windows::launch::test_crash_transition(
+        "native-assets-created",
+        &resource.entry.profile_name,
+        path,
+    );
     for (name, bytes) in ASSETS {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -56,7 +74,19 @@ pub(super) fn install(resource: &mut Acquired, path: &Path) -> io::Result<()> {
             .open(path.join(name))?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        super::windows::launch::test_crash_transition(
+            "native-asset-written",
+            &resource.entry.profile_name,
+            path,
+        );
     }
+    #[cfg(test)]
+    super::windows::launch::test_crash_transition(
+        "native-assets-installed",
+        &resource.entry.profile_name,
+        path,
+    );
     Ok(())
 }
 
