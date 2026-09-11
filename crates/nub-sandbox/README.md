@@ -216,6 +216,26 @@ sandbox.close();
 nub_sandbox::cleanup()?;
 ```
 
+### Explicit Windows native compatibility
+
+Windows embedders can select the native adapter when creating a session. Ordinary acquisition remains unchanged:
+
+```rust,ignore
+let sandbox = Sandbox::with_windows_native_compat(&policy)?;
+let command = sandbox.prepare(
+    CommandSpec::new("cargo").args(["build", "--offline"]).cwd(project),
+)?;
+// Run and collect the prepared command through the usual execution API.
+sandbox.close();
+```
+
+The adapter preserves the AppContainer identity and filesystem/network enforcement. It supplies a parent-opened null-device handle, resolves permitted file handles through captured drive aliases, and places supported native pipes and MSYS/Cygwin coordination objects in the package's private namespace. These are runtime adaptations, not additional filesystem paths. Interpreter installations, projects and tool state still need explicit grants.
+
+- The launcher embeds x64 and ARM64 compatibility DLLs and injects the matching DLL before resuming each owned command. Ordinary `CreateProcessW` descendants receive the adapter too. Unsupported executable architectures and injection failures return errors; they do not launch an unconfined replacement.
+- Adapter DLLs live under the protected Windows resource registry. The command can read/execute its own DLLs but cannot replace them or read the registry. Equivalent policies with identical adapter bytes share the identity and retained assets. Raw sessions and different adapter versions do not share that identity.
+- Closing a session releases its lease. Bounded idle retention and explicit cleanup own the DLL directory, profile and recorded ACL entries together. No compiler, elevation or installer runs when a user creates a sandbox; building Nub itself requires both MSVC toolsets.
+- Python's protected-directory adapter remains separate. The [compatibility matrix](COMPATIBILITY.md) distinguishes raw runs from explicit adaptation and records actual operation sequences.
+
 ### Python private directories on Windows
 
 Python versions affected by [CPython #134587](https://github.com/python/cpython/issues/134587) create private directories with an ACL that excludes their own AppContainer. Broader ancestor grants cannot fix the non-inheriting child ACL.
@@ -290,6 +310,8 @@ The CLI runs the same recovery operation without loading project configuration. 
 ```sh
 nub sandbox cleanup
 ```
+
+Cleanup does not delete a directory whose recorded object identity is missing or no longer matches. This can happen after an external replacement or a crash between directory creation and its identity being journaled. The entry remains tracked, counts toward the resource bound, and requires the reported path to be inspected rather than repeatedly retrying an unsafe deletion. A later successful cleanup removes the retained record.
 
 The Windows build jail also publishes read access to Nub-owned public package caches. Those cache permissions are intentional shared storage metadata, not a particular session's grants; sandbox cleanup does not revoke them.
 

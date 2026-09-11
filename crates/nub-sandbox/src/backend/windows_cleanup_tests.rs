@@ -281,6 +281,7 @@ fn crash_transitions(root: &Path) {
     if std::env::var_os("NUB_NATIVE_EMBEDDED_ADAPTER").is_some() {
         stages.extend([
             "native-assets-journaled",
+            "native-assets-before-identity",
             "native-assets-created",
             "native-asset-written",
             "native-assets-installed",
@@ -304,6 +305,18 @@ fn crash_transitions(root: &Path) {
         assert_eq!(private.is_dir(), stage != "native-assets-journaled");
         if stage == "acl-installed-before-ready" {
             assert!(super::launch::test_profile_has_ace(&profile, &caller).unwrap());
+        }
+        if stage == "native-assets-before-identity" {
+            assert!(cleanup_resources().is_err());
+            let retained = windows_registry::test_entry(&profile).unwrap().unwrap();
+            assert_eq!(retained.state, windows_registry::EntryState::RecoveryNeeded);
+            assert!(
+                private.is_dir(),
+                "an unidentified directory must not be deleted"
+            );
+            // Only the fixture knows that this is its freshly created empty leaf.
+            // Recovery must retain the journal until that ambiguity is resolved.
+            std::fs::remove_dir(&private).unwrap();
         }
         assert_recovered(&profile, &private, &caller, &foreign);
     }

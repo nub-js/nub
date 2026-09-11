@@ -27,16 +27,22 @@ The [initial version matrix](https://github.com/nubjs/nub/actions/runs/343481653
 | Bun 1.3.2 | Partial | Partial | Blocked | Blocked | Retained install/bin/global/reinstall passes with bundle directory listings. Pruning populated host `bunx` caches requires additional write grants. |
 | Bun 1.4.0 | Pass | Pass | Partial | Partial | Install, reinstall and installed-bin execution pass. Windows global archive install/cache-cleanup/reinstall passes; local-folder global installs require unsupported symlink creation. This version honors private `TMPDIR`. |
 | pip 26.2.1 | Pass | Pass | Adapter | Adapter | Local-wheel install, reinstall, import, user install and cache cleanup; Python 3.13.15 startup adapter preserves the package SID on private directories. |
-| uv 0.12.11 | Pass | Pass | Blocked | Blocked | Server interpreter subprocess access fails; Win11 installs packages but its installed tool trampoline fails canonicalization. |
-| Cargo 1.91.1 | Pass | Pass | Blocked | Pass | Build and clean with project-local target. Server subprocess access fails. |
+| uv 0.12.11 | Pass | Pass | Adapter | Adapter | Install, import, package and installed tool execution with native and Python private-directory adapters. Raw native subprocess/trampoline operations fail. |
+| Cargo 1.91.1 | Pass | Pass | Adapter | Pass | Build and clean with project-local target. Server requires native compatibility. |
 | rustup 1.29.0 / 1.29.1 | Pass | Pass | Pass | Pass | Installed-toolchain and home queries, not new toolchain installation. |
-| Go 1.25.1 | Pass | Pass | Blocked | Pass | User config, build, install and cache cleanup; Server compilation fails opening `NUL`. |
+| Go 1.25.1 | Pass | Pass | Adapter | Pass | User config, build, install and cache cleanup. Server requires native compatibility. |
 | Gradle 8.14 | Pass | Pass | Qualified | Qualified | Offline task twice and daemon cleanup pass after acknowledging the specific full-networking limitation. |
 | Maven 3.9.11 | Pass | Pass | Pass | Pass | Offline validation and clean; both execute the user startup file. |
 | .NET SDK 10.0.100 / NuGet | Pass | Pass | Pass | Pass | Restore, build, cache cleanup and restore. Unix bundle includes process metadata/shared coordination; cache replacement uses a stable writable parent. |
-| Composer 2.8.12 | Pass | Pass | Blocked | Pass | Cold/warm install without plugins or scripts, then cache cleanup. Server subprocess access fails. |
+| Composer 2.8.12 | Pass | Pass | Adapter | Pass | Cold/warm install without plugins or scripts, then cache cleanup. Server requires native compatibility. |
 
 The JavaScript fixtures use Node 22.18.0. Windows 11 runs Cargo, Go and the JVM through x64 emulation; .NET uses ARM64. Bun 1.3.2 also uses x64 emulation there. These are recorded versions, not minimum supported versions. Distinct pnpm and Yarn versions exercise their storage layouts; adding a directory member does not establish compatibility with untested runtimes.
+
+## Explicit Windows native adapter
+
+The [embedded-adapter run](https://github.com/nubjs/nub/actions/runs/34546773523), at `0c510d0dbb`, passes the complete Cargo, Go, Composer, uv and pip sequences on Windows Server 2022 x64 and Windows 11 ARM64. Each has an unconfined control, a raw sandbox control, and a withheld-file canary. The Python sequences also use the Python private-directory helper. Both machines run x64 toolchains; descendants may have another supported architecture.
+
+Select this adapter through [`Sandbox::with_windows_native_compat`](README.md#explicit-windows-native-compatibility), not through another filesystem sentinel. Granting more cache paths does not repair native device opens, pipe namespaces or drive-alias queries. The same run checks nested execution, anonymous pipe byte transfer, DLL write denial and protected-registry read denial. Git's local-clone sequence still fails in this run, so it is not an all-tools pass.
 
 ## Explicit Windows Node adapters
 

@@ -16,8 +16,29 @@ struct Payload {
     HANDLE null_device;
     char directory[MAX_PATH];
     wchar_t devices[26][MAX_PATH];
+    alignas(void*) BYTE user_sid[SECURITY_MAX_SID_SIZE];
+    alignas(void*) BYTE package_sid[SECURITY_MAX_SID_SIZE];
+    BOOL identities_captured;
 };
 static Payload state = {};
+
+static bool capture_identities(HANDLE process, Payload& payload) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;
+    alignas(void*) BYTE user[512], package[512];
+    DWORD needed = 0;
+    BOOL ok = GetTokenInformation(token, TokenUser, user, sizeof(user), &needed) &&
+              GetTokenInformation(token, TokenAppContainerSid, package, sizeof(package), &needed);
+    DWORD error = GetLastError();
+    CloseHandle(token);
+    if (!ok) { SetLastError(error); return false; }
+    auto package_sid = reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(package)->TokenAppContainer;
+    if (!package_sid) { SetLastError(ERROR_INVALID_SID); return false; }
+    if (!CopySid(sizeof(payload.user_sid), payload.user_sid, reinterpret_cast<TOKEN_USER*>(user)->User.Sid) ||
+        !CopySid(sizeof(payload.package_sid), payload.package_sid, package_sid)) return false;
+    payload.identities_captured = TRUE;
+    return true;
+}
 
 static USHORT image_machine(HANDLE process) {
     // Suspended x64 processes on ARM64 can report native-machine via IsWow64Process2.
@@ -47,6 +68,9 @@ static USHORT image_machine(HANDLE process) {
 
 static BOOL inject(HANDLE process, const Payload& source) {
     Payload target = source;
+    // CreateProcessW descendants keep this user/package identity even when a
+    // runtime replaces its token DACL and can no longer query its own token.
+    if (!target.identities_captured && !capture_identities(process, target)) return FALSE;
     USHORT reported = 0, native_machine = 0;
     IsWow64Process2(process, &reported, &native_machine);
     USHORT machine = image_machine(process);
@@ -112,21 +136,12 @@ static SECURITY_DESCRIPTOR private_descriptor;
 alignas(ACL) static BYTE private_acl[512];
 
 static bool initialize_private_security() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    alignas(void*) BYTE user[512], package[512];
-    DWORD needed = 0;
-    BOOL ok = GetTokenInformation(token, TokenUser, user, sizeof(user), &needed) &&
-              GetTokenInformation(token, TokenAppContainerSid, package, sizeof(package), &needed);
-    CloseHandle(token);
-    if (!ok) return false;
-    auto package_sid = reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(package)->TokenAppContainer;
-    if (!package_sid) return false;
+    if (!state.identities_captured) return false;
     auto acl = reinterpret_cast<PACL>(private_acl);
     return InitializeSecurityDescriptor(&private_descriptor, SECURITY_DESCRIPTOR_REVISION) &&
            InitializeAcl(acl, sizeof(private_acl), ACL_REVISION) &&
-           AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, reinterpret_cast<TOKEN_USER*>(user)->User.Sid) &&
-           AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, package_sid) &&
+           AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, state.user_sid) &&
+           AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, state.package_sid) &&
            SetSecurityDescriptorDacl(&private_descriptor, TRUE, acl, FALSE);
 }
 using NtDirectory = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
@@ -143,7 +158,7 @@ static BOOL WINAPI anonymous_pipe(PHANDLE read, PHANDLE write, LPSECURITY_ATTRIB
     HANDLE input = CreateNamedPipeW(path, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, size, size, 0, &attrs);
     if (input == INVALID_HANDLE_VALUE) return FALSE;
-    HANDLE output = true_create_file(path, GENERIC_WRITE, 0, &attrs, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE output = true_create_file(path, GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0, &attrs, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (output == INVALID_HANDLE_VALUE) {
         DWORD error = GetLastError();
         CloseHandle(input);

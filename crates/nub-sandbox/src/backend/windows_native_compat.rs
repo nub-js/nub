@@ -55,6 +55,12 @@ pub(super) fn install(resource: &mut Acquired, path: &Path) -> io::Result<()> {
         path,
     );
     std::fs::create_dir(path)?;
+    #[cfg(test)]
+    super::windows::launch::test_crash_transition(
+        "native-assets-before-identity",
+        &resource.entry.profile_name,
+        path,
+    );
     resource.record_mutation(windows_registry::AclMutation {
         path: path.to_string_lossy().into_owned(),
         kind: windows_registry::AclKind::Subtree,

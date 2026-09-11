@@ -10,12 +10,12 @@ use std::process::Command;
 const CHILD: &str = "backend::windows_native_adapter_probe::native_adapter_child";
 
 fn anonymous_pipe_bytes() -> std::io::Result<Vec<u8>> {
-    use std::os::windows::io::FromRawHandle as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Security::{
         InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
         SetSecurityDescriptorDacl,
     };
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeInfo};
     let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let descriptor = std::ptr::addr_of_mut!(descriptor).cast();
     if unsafe { InitializeSecurityDescriptor(descriptor, 1) } == 0
@@ -35,6 +35,21 @@ fn anonymous_pipe_bytes() -> std::io::Result<Vec<u8>> {
     }
     let mut reader = unsafe { std::fs::File::from_raw_handle(reader) };
     let mut writer = unsafe { std::fs::File::from_raw_handle(writer) };
+    for pipe in [&reader, &writer] {
+        let mut flags = 0;
+        if unsafe {
+            GetNamedPipeInfo(
+                pipe.as_raw_handle(),
+                &mut flags,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     writer.write_all(b"pipe")?;
     drop(writer);
     let mut bytes = Vec::new();
