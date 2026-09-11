@@ -5,8 +5,10 @@
 
 #[path = "common/tool_output.rs"]
 mod tool_output;
+#[path = "common/tool_sandbox.rs"]
+mod tool_sandbox;
 
-use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
+use nub_sandbox::{CommandSpec, CompileCtx, Homes, ScopeCapabilities, compile};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -199,8 +201,8 @@ fn invoke(
         }
         Control::Exact | Control::ToolDirs => {
             eprintln!("CONFINED {} git {args:?}", control.name());
-            let sandbox =
-                Sandbox::new(policy.expect("confined Git policy")).expect("Git sandbox acquires");
+            let sandbox = tool_sandbox::acquire(policy.expect("confined Git policy"))
+                .expect("Git sandbox acquires");
             let prepared = sandbox
                 .prepare(
                     CommandSpec::new("git")

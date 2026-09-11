@@ -18,7 +18,6 @@ fn compiler(target: &str) -> cc::Build {
     build
         .target(target)
         .cpp(true)
-        .static_crt(true)
         .opt_level(2)
         .include("native/detours")
         .flag("/std:c++17")
@@ -43,7 +42,11 @@ pub fn build() {
     ] {
         let dir = out.join(arch);
         std::fs::create_dir_all(&dir).expect("native adapter build directory");
-        let mut command = compiler(target).get_compiler().to_command();
+        // DLLs carry their CRT; the static parent library follows Rust's CRT mode.
+        let mut command = compiler(target)
+            .static_crt(true)
+            .get_compiler()
+            .to_command();
         command.current_dir(&dir).arg("/LD");
         for source in std::iter::once(PathBuf::from("native/compat.cpp")).chain(
             SOURCES

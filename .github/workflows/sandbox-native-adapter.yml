@@ -84,8 +84,12 @@ jobs:
           "NUB_NATIVE_ADAPTER_PROBE_DIR=$root\.native-adapter" >> $env:GITHUB_ENV
           Get-FileHash .native-adapter/*.dll, .native-adapter/injector.exe | ConvertTo-Json >> reports/environment.txt
       - name: Checking sandbox targets
+        id: compile
         shell: bash
-        run: cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings 2>&1 | tee reports/clippy.log
+          cargo test -p nub-sandbox --profile fast --lib --no-run 2>&1 | tee reports/test-build.log
       - name: Compiling documented compatibility policies
         shell: bash
         run: cargo test -p nub-sandbox --profile fast --test compatibility_examples -- --nocapture
@@ -101,9 +105,18 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --lib embedded_native_adapter_primitives_with_raw_and_plain_controls -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-native-adapter.log
+      - name: Checking native ownership and cleanup with the embedded adapter
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        shell: bash
+        env:
+          NUB_NATIVE_EMBEDDED_ADAPTER: '1'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib backend::windows::native_child_tests -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-ownership.log
+          cargo test -p nub-sandbox --profile fast --lib backend::windows::cleanup_tests -- --nocapture --test-threads=1 2>&1 | tee reports/embedded-cleanup.log
       - name: Provisioning the existing pinned tool fixtures
         id: tools
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
@@ -127,9 +140,11 @@ jobs:
           )
           $results = @()
           foreach ($case in $cases) {
-            foreach ($mode in @('plain', 'raw', 'adapter')) {
+            foreach ($mode in @('plain', 'raw', 'adapter', 'embedded')) {
               Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
+              Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
               if ($mode -eq 'adapter') { $env:NUB_NATIVE_ADAPTER_PROBE_ENABLE = '1' }
+              if ($mode -eq 'embedded') { $env:NUB_NATIVE_EMBEDDED_ADAPTER = '1' }
               $test = if ($mode -eq 'plain') { $case[1] } else { $case[2] }
               & cargo test -p nub-sandbox --profile fast --lib $test -- --exact --ignored --nocapture --test-threads=1 *> "reports/$($case[0])-$mode.log"
               $code = $LASTEXITCODE
@@ -139,6 +154,7 @@ jobs:
             }
           }
           Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
+          Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
           $results | ConvertTo-Json > reports/tool-results.json
           if ($results | Where-Object { $_.mode -ne 'raw' -and $_.exit -ne 0 }) { exit 1 }
           exit 0

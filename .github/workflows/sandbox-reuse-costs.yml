@@ -3,7 +3,7 @@ name: Reusable sandbox release costs
 on:
   workflow_dispatch:
   push:
-    branches: [sandbox-reuse-epic]
+    branches: [sandbox-reuse-epic, sandbox-native-adapter-costs]
     paths:
       - .github/workflows/sandbox-reuse-costs.yml
       - crates/nub-sandbox/tests/lifecycle_costs.rs
@@ -48,6 +48,14 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --release --test lifecycle_costs native_session_costs_and_unique_policy_churn -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/costs.log
+      - name: Measuring embedded adapter acquisition, reuse and cleanup
+        if: ${{ runner.os == 'Windows' }}
+        env:
+          NUB_SANDBOX_WIN_TIMING: '1'
+          NUB_NATIVE_EMBEDDED_ADAPTER: '1'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --release --test lifecycle_costs native_session_costs_and_unique_policy_churn -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/costs-embedded.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

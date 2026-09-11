@@ -1,6 +1,6 @@
 //! Native pip and uv operations with local-wheel, exact-grant, and `$tooldirs` controls.
 
-use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
+use nub_sandbox::{CommandSpec, CompileCtx, Homes, ScopeCapabilities, compile};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -148,6 +148,8 @@ fn exact_grants(paths: &[(&Path, &str)]) -> Value {
 
 #[path = "common/tool_output.rs"]
 mod tool_output;
+#[path = "common/tool_sandbox.rs"]
+mod tool_sandbox;
 
 fn confined(
     program: &Path,
@@ -156,7 +158,7 @@ fn confined(
     policy: &nub_sandbox::SandboxPolicy,
 ) -> Output {
     eprintln!("CONFINED {} {args:?}", program.display());
-    let sandbox = Sandbox::new(policy).expect("Python sandbox acquires");
+    let sandbox = tool_sandbox::acquire(policy).expect("Python sandbox acquires");
     let prepared = sandbox
         .prepare(
             CommandSpec::new(program.to_string_lossy().into_owned())
@@ -672,7 +674,7 @@ fn run_python_adapter(name: &str, tooldirs: bool, readable_ancestors: bool) {
             }
         }
     }
-    let retained = Sandbox::acquire(&policy).unwrap();
+    let retained = tool_sandbox::acquire(&policy).unwrap();
     // Separate one-shot acquisitions share this live resource throughout the sequence.
     let probe = r#"import os, pathlib, tempfile
 assert getattr(os.mkdir, '_appcontainer_compatible', False)

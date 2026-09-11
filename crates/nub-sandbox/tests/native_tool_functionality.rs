@@ -2,8 +2,10 @@
 
 #[path = "common/tool_output.rs"]
 mod tool_output;
+#[path = "common/tool_sandbox.rs"]
+mod tool_sandbox;
 
-use nub_sandbox::{CommandSpec, CompileCtx, Homes, Sandbox, ScopeCapabilities, compile};
+use nub_sandbox::{CommandSpec, CompileCtx, Homes, ScopeCapabilities, compile};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -296,7 +298,7 @@ fn run(
         .collect::<Vec<_>>();
     match policy {
         Some(policy) => {
-            let sandbox = Sandbox::new(policy).expect("sandbox acquires");
+            let sandbox = tool_sandbox::acquire(policy).expect("sandbox acquires");
             let spec = if tool.shell {
                 CommandSpec::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()))
                     .verbatim_command_line(format!(
@@ -651,7 +653,7 @@ fn run_case(name: &str, tooldirs: Option<bool>) {
     if let Some(policy) = &policy {
         let secret = root.path().join("withheld");
         std::fs::write(&secret, "WITHHELD").unwrap();
-        let sandbox = Sandbox::acquire(policy).unwrap();
+        let sandbox = tool_sandbox::acquire(policy).unwrap();
         let output = tool_output::output(
             sandbox
                 .prepare(
@@ -709,7 +711,7 @@ fn run_nuget_self_proc(tooldirs: bool) {
         let shared = compile(&json!({"fs": {"/tmp/.dotnet/shm": "rw"}}), &ctx).unwrap();
         policy.fs.rules.entries.extend(shared.fs.rules.entries);
     }
-    let sandbox = Sandbox::acquire(&policy).unwrap();
+    let sandbox = tool_sandbox::acquire(&policy).unwrap();
     for tail in [
         &["--version"][..],
         &["restore", "--ignore-failed-sources"][..],
@@ -795,7 +797,7 @@ fn windows_gradle_with_limited_network() {
     let env = env_for(root.path(), &tool);
     write_projects(root.path());
     let policy = policy(root.path(), &tool, env.clone(), true);
-    let sandbox = Sandbox::acquire(&policy).expect("limited-network sandbox acquires");
+    let sandbox = tool_sandbox::acquire(&policy).expect("limited-network sandbox acquires");
     for tail in [
         &["--offline", "--no-daemon", "--stacktrace", "fixture"][..],
         &["--offline", "--no-daemon", "--stacktrace", "fixture"][..],

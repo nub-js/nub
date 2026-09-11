@@ -1,8 +1,9 @@
 //! Embedded native compatibility assets owned by the persistent Windows lease.
 
-use super::windows_registry::{self, Acquired};
+use super::windows::windows_registry::{self, Acquired};
 use sha2::{Digest as _, Sha256};
 use std::io::{self, Write as _};
+#[cfg(target_env = "msvc")]
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -28,7 +29,10 @@ pub(super) fn version() -> &'static str {
             hash.update(name.as_bytes());
             hash.update(bytes);
         }
-        format!("{:x}", hash.finalize())
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     });
     &VERSION
 }
@@ -65,7 +69,7 @@ pub(super) fn inject(process: *mut std::ffi::c_void, path: &Path) -> io::Result<
         unsafe extern "C" {
             fn sandbox_native_inject(process: *mut std::ffi::c_void, directory: *const u16) -> u32;
         }
-        let path = super::strip_verbatim_prefix(path.to_path_buf());
+        let path = super::windows::strip_verbatim_prefix(path.to_path_buf());
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         // SAFETY: the launcher owns this suspended process handle, and the FFI
         // copies the terminated directory string before returning.

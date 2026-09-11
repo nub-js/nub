@@ -273,8 +273,12 @@ static HANDLE WINAPI create_file(LPCWSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES security, DWORD disposition,
                                 DWORD flags, HANDLE template_file) {
     HANDLE result = true_create_file(path, access, share, security, disposition, flags, template_file);
-    if (result != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ACCESS_DENIED ||
-        !is_null(path) || (flags & FILE_FLAG_OVERLAPPED)) return result;
+    DWORD error = GetLastError();
+    if (result != INVALID_HANDLE_VALUE || error != ERROR_ACCESS_DENIED ||
+        !is_null(path) || (flags & FILE_FLAG_OVERLAPPED)) {
+        SetLastError(error);
+        return result;
+    }
     // Duplicate a parent-opened real null device, never a regular-file approximation.
     HANDLE duplicate = INVALID_HANDLE_VALUE;
     if (!DuplicateHandle(GetCurrentProcess(), state.null_device, GetCurrentProcess(),

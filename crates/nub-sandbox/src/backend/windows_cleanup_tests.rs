@@ -48,7 +48,7 @@ fn plan(root: &Path, mode: &str) -> AppContainerLaunch {
         allow_internet: false,
         egress_funnel: None,
         private_tmp: true,
-        native_compat: false,
+        native_compat: std::env::var_os("NUB_NATIVE_EMBEDDED_ADAPTER").is_some(),
         stdout: WindowsStdio::Null,
         stderr: WindowsStdio::Null,
     }

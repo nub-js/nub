@@ -9,6 +9,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+#[path = "common/tool_sandbox.rs"]
+mod tool_sandbox;
+
 #[test]
 fn cost_child() {
     println!("SANDBOX_COST_CHILD_OK");
@@ -22,7 +25,7 @@ fn cost_owner() {
     let root = Path::new(&root);
     let tree = std::env::var_os("SANDBOX_COST_OWNER_TREE");
     let start = Instant::now();
-    let session = Sandbox::acquire(&policy(root, tree.as_deref().map(Path::new))).unwrap();
+    let session = tool_sandbox::acquire(&policy(root, tree.as_deref().map(Path::new))).unwrap();
     run(&session, root);
     println!("SANDBOX_COST_OWNER_MS {}", elapsed(start));
     if std::env::var_os("SANDBOX_COST_OWNER_CRASH").is_some() {
@@ -126,6 +129,7 @@ fn record(scenario: &str, phase: &str, sample: usize, ms: f64) {
         json!({
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "scenario": scenario, "phase": phase, "sample": sample, "ms": ms,
+            "native_adapter": cfg!(windows) && std::env::var_os("NUB_NATIVE_EMBEDDED_ADAPTER").is_some(),
         })
     );
 }
@@ -205,7 +209,7 @@ fn native_session_costs_and_unique_policy_churn() {
             let policy = policy(&root, tool_tree);
             record(scenario, "resolve", sample, elapsed(start));
             let start = Instant::now();
-            let session = Sandbox::acquire(&policy).unwrap();
+            let session = tool_sandbox::acquire(&policy).unwrap();
             record(scenario, "acquire", sample, elapsed(start));
             let start = Instant::now();
             run(&session, &root);
@@ -220,7 +224,7 @@ fn native_session_costs_and_unique_policy_churn() {
             record(scenario, "evict", sample, elapsed(start));
             record(scenario, "fresh-total", sample, elapsed(total));
         }
-        let session = Sandbox::acquire(&policy(&root, tool_tree)).unwrap();
+        let session = tool_sandbox::acquire(&policy(&root, tool_tree)).unwrap();
         run(&session, &root);
         for sample in 0..32 {
             let start = Instant::now();
@@ -256,7 +260,7 @@ fn native_session_costs_and_unique_policy_churn() {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("caller-output"), b"keep").unwrap();
         let start = Instant::now();
-        let session = Sandbox::acquire(&policy(&root, None)).unwrap();
+        let session = tool_sandbox::acquire(&policy(&root, None)).unwrap();
         run(&session, &root);
         session.close();
         record("unique-policy", "create-run-close", sample, elapsed(start));

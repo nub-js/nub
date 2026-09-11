@@ -684,7 +684,7 @@ enum WinNetPlan {
 /// a genuine network path, and rewriting it would change which host is addressed. A real
 /// network working directory is not something cmd.exe supports anyway, so stripping there
 /// would trade one failure for a less obvious one.
-fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+pub(super) fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
         Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
         _ => path,
