@@ -53,6 +53,7 @@ jobs:
           php-version: '8.4'
           coverage: none
       - name: Building the isolated native probe
+        id: probe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force reports, .native-adapter | Out-Null
@@ -76,7 +77,7 @@ jobs:
           cl /nologo /std:c++17 /W4 /WX /MT /EHsc /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /LD /link "$root\.probe-detours\lib.$lib\detours.lib" advapi32.lib /OUT:probe-$name.dll /EXPORT:ProbeMarker,@1
           if errorlevel 1 exit /b 1
           if not "$name" == "x64" exit /b 0
-          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /DPROBE_INJECTOR /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /Fe:injector.exe /link "$root\.probe-detours\lib.$lib\detours.lib"
+          cl /nologo /std:c++17 /W4 /WX /MT /EHsc /DPROBE_INJECTOR /I"$root\.probe-detours\include" "$root\tests\sandbox-native-adapter\probe.cpp" /Fe:injector.exe /link "$root\.probe-detours\lib.$lib\detours.lib" advapi32.lib
           "@ | Set-Content ".native-adapter/build-$name.cmd"
             cmd /c ".\.native-adapter\build-$name.cmd" *> "reports/native-build-$name.log"
             if ($LASTEXITCODE -ne 0) { Get-Content "reports/native-build-$name.log"; exit $LASTEXITCODE }
@@ -85,22 +86,24 @@ jobs:
           Get-FileHash .native-adapter/*.dll, .native-adapter/injector.exe | ConvertTo-Json >> reports/environment.txt
       - name: Checking sandbox targets
         id: compile
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           cargo clippy -p nub-sandbox --profile fast --all-targets --all-features -- -D warnings 2>&1 | tee reports/clippy.log
           cargo test -p nub-sandbox --profile fast --lib --no-run 2>&1 | tee reports/test-build.log
       - name: Compiling documented compatibility policies
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         shell: bash
         run: cargo test -p nub-sandbox --profile fast --test compatibility_examples -- --nocapture
       - name: Comparing raw and adapted native operations
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && steps.probe.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
           cargo test -p nub-sandbox --profile fast --lib native_adapter_primitives_with_raw_and_plain_controls -- --ignored --nocapture --test-threads=1 2>&1 | tee reports/native-adapter.log
       - name: Checking embedded native adapter primitives
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
@@ -142,8 +145,10 @@ jobs:
             @('git-lfs', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_plain', 'git_tool_functionality_probe::git_windows_complete_runtime_lfs_tooldirs')
           )
           $results = @()
+          $modes = @('plain', 'raw', 'embedded')
+          if ('${{ steps.probe.outcome }}' -eq 'success') { $modes += 'adapter' }
           foreach ($case in $cases) {
-            foreach ($mode in @('plain', 'raw', 'adapter', 'embedded')) {
+            foreach ($mode in $modes) {
               Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
               Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
               if ($mode -eq 'adapter') { $env:NUB_NATIVE_ADAPTER_PROBE_ENABLE = '1' }
