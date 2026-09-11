@@ -1,5 +1,7 @@
 //! Native Cargo/rustup, Go, JVM, NuGet, and Composer tool-directory controls.
 
+#[path = "common/tool_msys.rs"]
+mod tool_msys;
 #[path = "common/tool_output.rs"]
 mod tool_output;
 #[path = "common/tool_sandbox.rs"]
@@ -188,6 +190,7 @@ fn policy(
     tooldirs: bool,
 ) -> nub_sandbox::SandboxPolicy {
     let mut fs = Map::new();
+    tool_msys::grant(&mut fs);
     if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
         let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
         fs.insert(adapter, Value::String("r".into()));
@@ -296,6 +299,11 @@ fn run(
         .cloned()
         .chain(args.iter().map(|arg| (*arg).to_string()))
         .collect::<Vec<_>>();
+    let (program, args) = if tool.shell {
+        (tool.program.clone(), args)
+    } else {
+        tool_msys::command(&tool.program, args)
+    };
     match policy {
         Some(policy) => {
             let sandbox = tool_sandbox::acquire(policy).expect("sandbox acquires");
@@ -309,7 +317,7 @@ fn run(
                     .redact_stdout(true)
                     .redact_stderr(true)
             } else {
-                CommandSpec::new(tool.program.to_string_lossy().into_owned())
+                CommandSpec::new(program.to_string_lossy().into_owned())
                     .args(args.iter().cloned())
                     .cwd(root.join("project"))
                     .redact_stdout(true)
@@ -337,7 +345,7 @@ fn run(
                 command.args(["/d", "/s", "/c", &command_line(&tool.program, &args)]);
                 command
             } else {
-                let mut command = Command::new(&tool.program);
+                let mut command = Command::new(&program);
                 command.args(&args);
                 command
             };

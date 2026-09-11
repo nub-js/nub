@@ -38,6 +38,9 @@ jobs:
       - name: Recording the source and real tool tree
         run: |
           mkdir -p reports
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
+          fi
           { git rev-parse HEAD; rustc -Vv; uname -a; } > reports/environment.txt
           npm install --prefix .sandbox-cost-tool --ignore-scripts --no-audit --no-fund npm@11.6.2
           cp .sandbox-cost-tool/package-lock.json reports/tool-package-lock.json

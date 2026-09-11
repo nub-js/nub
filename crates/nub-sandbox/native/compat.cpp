@@ -134,7 +134,7 @@ public:
     explicit PackageAcl(PACL original) {
         ACL_SIZE_INFORMATION info = {};
         if (!original || !GetAclInformation(original, &info, sizeof(info), AclSizeInformation)) return;
-        DWORD bytes = info.AclBytesInUse + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) +
+        DWORD bytes = info.AclBytesInUse + DWORD(sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
                       GetLengthSid(state.package_sid);
         if (bytes > MAXWORD) return;
         auto acl = static_cast<PACL>(LocalAlloc(LPTR, bytes));
@@ -193,7 +193,7 @@ static NTSTATUS NTAPI set_security(HANDLE handle, SECURITY_INFORMATION kind, PSE
         SE_DACL_PROTECTED | SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
     if (!InitializeSecurityDescriptor(&adapted, SECURITY_DESCRIPTOR_REVISION) ||
         !SetSecurityDescriptorDacl(&adapted, TRUE, acl.get(), defaulted) ||
-        !SetSecurityDescriptorControl(&adapted, flags, control & flags))
+        !SetSecurityDescriptorControl(&adapted, flags, static_cast<SECURITY_DESCRIPTOR_CONTROL>(control & flags)))
         return static_cast<NTSTATUS>(0xc0000079L);
     return true_set_security(handle, kind, &adapted);
 }

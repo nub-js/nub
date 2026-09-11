@@ -111,6 +111,7 @@ fn policy(root: &Path, fs: Value, env: BTreeMap<String, String>) -> nub_sandbox:
         Value::Object(entries) => entries,
         _ => panic!("fixture filesystem policy must be an object"),
     };
+    tool_msys::grant(&mut fs);
     if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
         let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
         fs.insert(adapter, Value::String("r".into()));
@@ -146,6 +147,8 @@ fn exact_grants(paths: &[(&Path, &str)]) -> Value {
     Value::Object(entries)
 }
 
+#[path = "common/tool_msys.rs"]
+mod tool_msys;
 #[path = "common/tool_output.rs"]
 mod tool_output;
 #[path = "common/tool_sandbox.rs"]
@@ -158,6 +161,7 @@ fn confined(
     policy: &nub_sandbox::SandboxPolicy,
 ) -> Output {
     eprintln!("CONFINED {} {args:?}", program.display());
+    let (program, args) = tool_msys::command(program, args.to_vec());
     let sandbox = tool_sandbox::acquire(policy).expect("Python sandbox acquires");
     let prepared = sandbox
         .prepare(
@@ -183,6 +187,7 @@ fn unconfined(
     env: &BTreeMap<String, String>,
 ) -> Output {
     eprintln!("UNCONFINED {} {args:?}", program.display());
+    let (program, args) = tool_msys::command(program, args.to_vec());
     let mut command = Command::new(program);
     command.args(args).current_dir(root.join("project"));
     command.env_clear();

@@ -1,4 +1,6 @@
 //! Native tool-directory operations, with unconfined and narrow-policy controls.
+#[path = "common/tool_msys.rs"]
+mod tool_msys;
 #[path = "common/tool_output.rs"]
 mod tool_output;
 #[path = "common/tool_sandbox.rs"]
@@ -70,6 +72,11 @@ fn policy(root: &Path, fs: Value, extra_env: &[(&str, &str)]) -> nub_sandbox::Sa
         _ => panic!("fixture filesystem policy must be an object or array"),
     };
     fs.insert("./".into(), Value::String("rw".into()));
+    tool_msys::grant(&mut fs);
+    if std::env::var_os("NUB_NATIVE_ADAPTER_PROBE_ENABLE").is_some() {
+        let adapter = std::env::var("NUB_NATIVE_ADAPTER_PROBE_DIR").unwrap();
+        fs.insert(adapter, Value::String("r".into()));
+    }
     fs.insert("$tmp".into(), Value::String("rw".into()));
     let homes = Homes {
         home: root.join("home"),
@@ -657,11 +664,12 @@ fn run_retained_tool_control(name: &str, tooldirs: bool, unconfined: bool, sampl
             if tooldirs { "$tooldirs" } else { "exact" }
         );
         let started = std::time::Instant::now();
+        let (program, arguments) = tool_msys::command(&tool.program, argv.clone());
         let output = if let Some(sandbox) = &sandbox {
             let prepared = sandbox
                 .prepare(
-                    CommandSpec::new(&tool.program)
-                        .args(argv.clone())
+                    CommandSpec::new(&program)
+                        .args(arguments.clone())
                         .cwd(root.path().join("project"))
                         .redact_stdout(true)
                         .redact_stderr(true),
@@ -674,8 +682,8 @@ fn run_retained_tool_control(name: &str, tooldirs: bool, unconfined: bool, sampl
             );
             tool_output::output(prepared)
         } else {
-            Command::new(&tool.program)
-                .args(&argv)
+            Command::new(&program)
+                .args(&arguments)
                 .env_clear()
                 .envs(&plain_env)
                 .current_dir(root.path().join("project"))
@@ -875,7 +883,15 @@ fn windows_bun140_link_primitives_and_global_sources() {
                 bundle_archive_passed = output.status.success();
             }
             if output.status.success() {
-                assert!(global.join("bin/fixture-bin.exe").is_file());
+                let bin = global.join("bin/fixture-bin.exe");
+                assert!(bin.is_file());
+                let script = format!(
+                    "process.stdout.write(require('child_process').execFileSync({}));",
+                    serde_json::to_string(&bin).unwrap()
+                );
+                let executed = run(vec!["-e".into(), script]);
+                assert_success(tool, "installed global entrypoint", &executed);
+                assert!(String::from_utf8_lossy(&executed.stdout).contains("fixture-bin-ok"));
                 assert_success(
                     tool,
                     "cache prune after global install",
@@ -904,7 +920,14 @@ fn windows_bun140_link_primitives_and_global_sources() {
 }
 
 #[cfg(unix)]
-fn bun_shared_cache_control(name: &str) {
+fn bun_shared_cache_control(name: &str, host_tmp: bool) {
+    if host_tmp {
+        assert_eq!(
+            std::env::var("GITHUB_ACTIONS").as_deref(),
+            Ok("true"),
+            "the host-cache cleanup control requires a disposable CI runner"
+        );
+    }
     let tools = tools();
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let root = fixture();
@@ -921,8 +944,13 @@ fn bun_shared_cache_control(name: &str) {
         .unwrap();
     let canary = shared.path().join("withheld");
     std::fs::write(&canary, "outside-session").unwrap();
+    let outside = root.path().join("outside-secret");
+    std::fs::write(&outside, "outside-policy").unwrap();
     let mut fs = grant_fs(tool, root.path(), &cache, &global, true);
     fs[cache.parent().unwrap().to_str().unwrap()] = json!("rw");
+    if host_tmp {
+        fs["/tmp"] = json!("rw");
+    }
     let env: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let policy = policy(root.path(), fs, &env);
     let sandbox = tool_sandbox::acquire(&policy).unwrap();
@@ -957,8 +985,31 @@ fn bun_shared_cache_control(name: &str) {
     );
     let output = tool_output::output(prepared);
     eprintln!("BUN_SHARED_CACHE {name} {output:?}");
-    assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside-session");
-    if name == "bun132" {
+    if host_tmp {
+        assert_success(tool, "explicit host-temp cache cleanup", &output);
+        assert!(
+            !shared.path().exists(),
+            "Bun removed the populated host cache"
+        );
+        let script = format!(
+            "try{{require('fs').readFileSync({});process.exit(91)}}catch(e){{if(!['EPERM','EACCES'].includes(e.code))throw e}};console.log('CANARY_DENIED')",
+            serde_json::to_string(&outside).unwrap()
+        );
+        let prepared = sandbox
+            .prepare(
+                CommandSpec::new(&tool.program)
+                    .args(["-e", &script])
+                    .cwd(root.path().join("project"))
+                    .redact_stdout(true)
+                    .redact_stderr(true),
+            )
+            .unwrap();
+        assert!(prepared.degradation.lost.is_empty());
+        let denied = tool_output::output(prepared);
+        assert_success(tool, "canary outside the explicit temp grant", &denied);
+        assert!(String::from_utf8_lossy(&denied.stdout).contains("CANARY_DENIED"));
+    } else if name == "bun132" {
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside-session");
         assert!(
             !output.status.success(),
             "shared cache deletion requires a separate grant"
@@ -972,6 +1023,7 @@ fn bun_shared_cache_control(name: &str) {
             "Bun 1.3 ignores private TMPDIR here"
         );
     } else {
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside-session");
         assert_success(tool, "private bunx cache cleanup", &output);
         assert!(!private.exists(), "Bun 1.4 must clear the private cache");
     }
@@ -982,14 +1034,21 @@ fn bun_shared_cache_control(name: &str) {
 #[test]
 #[ignore = "requires pinned Bun; populated shared-cache enforcement control"]
 fn unix_bun132_shared_cache_is_not_writable() {
-    bun_shared_cache_control("bun132");
+    bun_shared_cache_control("bun132", false);
 }
 
 #[cfg(unix)]
 #[test]
 #[ignore = "requires pinned Bun; populated shared-cache enforcement control"]
 fn unix_bun140_shared_cache_is_not_writable() {
-    bun_shared_cache_control("bun140");
+    bun_shared_cache_control("bun140", false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires pinned Bun on disposable CI: removes the user's host bunx caches"]
+fn unix_bun132_explicit_host_temp_cache_cleanup() {
+    bun_shared_cache_control("bun132", true);
 }
 
 #[cfg(target_os = "linux")]

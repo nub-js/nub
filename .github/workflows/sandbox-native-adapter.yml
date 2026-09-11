@@ -150,15 +150,22 @@ jobs:
             $cases += ,@($tool, "js_tool_functionality_probe::windows_native_$($tool)_plain", "js_tool_functionality_probe::windows_native_$($tool)_tooldirs")
           }
           $results = @()
+          $gitExec = (& git --exec-path).Trim()
+          $msysRoot = Split-Path (Split-Path (Split-Path $gitExec))
+          if (!(Test-Path "$msysRoot/usr/bin/bash.exe")) { throw "Git's MSYS shell is missing: $msysRoot" }
           $modes = @('plain', 'raw', 'embedded')
           if ('${{ steps.probe.outcome }}' -eq 'success') { $modes += 'adapter' }
           foreach ($case in $cases) {
-            foreach ($mode in $modes) {
+            $toolModes = $modes
+            if ($case[0] -notin @('git', 'git-lfs')) { $toolModes += @('msys-plain', 'msys-embedded') }
+            foreach ($mode in $toolModes) {
+              Remove-Item Env:NUB_SANDBOX_TOOL_MSYS_ROOT -ErrorAction SilentlyContinue
               Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
               Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
               if ($mode -eq 'adapter') { $env:NUB_NATIVE_ADAPTER_PROBE_ENABLE = '1' }
-              if ($mode -eq 'embedded') { $env:NUB_NATIVE_EMBEDDED_ADAPTER = '1' }
-              $test = if ($mode -eq 'plain') { $case[1] } else { $case[2] }
+              if ($mode -in @('embedded', 'msys-embedded')) { $env:NUB_NATIVE_EMBEDDED_ADAPTER = '1' }
+              if ($mode.StartsWith('msys-')) { $env:NUB_SANDBOX_TOOL_MSYS_ROOT = $msysRoot }
+              $test = if ($mode -in @('plain', 'msys-plain')) { $case[1] } else { $case[2] }
               & cargo test -p nub-sandbox --profile fast --lib $test -- --exact --ignored --nocapture --test-threads=1 *> "reports/$($case[0])-$mode.log"
               $code = $LASTEXITCODE
               $results += @{ tool = $case[0]; mode = $mode; test = $test; exit = $code }
@@ -167,10 +174,19 @@ jobs:
             }
           }
           Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
+          Remove-Item Env:NUB_SANDBOX_TOOL_MSYS_ROOT -ErrorAction SilentlyContinue
           Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
           $results | ConvertTo-Json > reports/tool-results.json
           if ($results | Where-Object { $_.mode -ne 'raw' -and $_.exit -ne 0 }) { exit 1 }
           exit 0
+      - name: Checking archived Bun packages and real global entrypoints
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        shell: bash
+        env:
+          NUB_NATIVE_EMBEDDED_ADAPTER: '1'
+        run: |
+          set -o pipefail
+          cargo test -p nub-sandbox --profile fast --lib js_tool_functionality_probe::windows_bun140_link_primitives_and_global_sources -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee reports/bun-global-entrypoint.log
       - name: Preserving native evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

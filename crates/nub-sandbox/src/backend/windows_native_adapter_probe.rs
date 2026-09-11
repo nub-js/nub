@@ -217,7 +217,7 @@ fn native_adapter_child() {
         .write(true)
         .open(absolute_nul)
         .and_then(|mut f| f.write(b"discarded"));
-    let denied = std::fs::read(canary);
+    let denied = std::fs::read(&canary);
     let assets = embedded_assets_protected();
     let pipe = anonymous_pipe_bytes();
     eprintln!("ADAPTER_ANONYMOUS_PIPE {pipe:?}");
@@ -235,6 +235,24 @@ fn native_adapter_child() {
     }
     let private_objects = private_object_permissions();
     eprintln!("ADAPTER_PRIVATE_OBJECTS {private_objects:?}");
+    let denied_after = std::fs::read(&canary);
+    let host_denied = {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
+        let pid = std::env::var("NUB_ADAPTER_PROBE_HOST_PID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let handle = unsafe { OpenProcess(PROCESS_VM_READ, 0, pid) };
+        if handle.is_null() {
+            unsafe { GetLastError() == ERROR_ACCESS_DENIED }
+        } else {
+            unsafe {
+                CloseHandle(handle);
+            }
+            false
+        }
+    };
     println!(
         "ADAPTER_PRIMITIVES {}",
         json!({
@@ -247,6 +265,8 @@ fn native_adapter_child() {
             "assets_protected": assets,
             "anonymous_pipe": pipe.as_ref().is_ok_and(|bytes| bytes == b"pipe"),
             "private_objects": private_objects.is_ok(),
+            "host_process_denied": host_denied,
+            "canary_after_object_changes": denied_after.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
         })
     );
     eprintln!("ADAPTER_ERRORS read={nul_read:?} write={nul_write:?} canonical={canonical:?}");
@@ -260,6 +280,10 @@ fn native_adapter_child() {
         assert!(assets.is_none_or(|ok| ok));
         assert!(pipe.is_ok_and(|bytes| bytes == b"pipe"));
         assert!(private_objects.is_ok());
+        assert!(host_denied);
+        assert!(
+            denied_after.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
     }
 }
 
@@ -297,6 +321,10 @@ fn native_adapter_primitives(probe: bool) {
         "NUB_ADAPTER_PROBE_CANARY".into(),
         canary.to_string_lossy().into_owned(),
     );
+    ambient.insert(
+        "NUB_ADAPTER_PROBE_HOST_PID".into(),
+        std::process::id().to_string(),
+    );
     let ctx = CompileCtx::new(
         Homes {
             home: root.path().join("home"),
@@ -311,7 +339,7 @@ fn native_adapter_primitives(probe: bool) {
     for mode in ["plain", "raw", if probe { "adapter" } else { "embedded" }] {
         let mut config = json!({
             "fs": {"./": "rw", "$tmp": "rw", binary.parent().unwrap().to_str().unwrap(): "r"},
-            "vars": {"NUB_ADAPTER_PROBE_FILE": true, "NUB_ADAPTER_PROBE_CANARY": true},
+            "vars": {"NUB_ADAPTER_PROBE_FILE": true, "NUB_ADAPTER_PROBE_CANARY": true, "NUB_ADAPTER_PROBE_HOST_PID": true},
             "net": false,
         });
         if let Some(adapter) = &adapter {
@@ -437,6 +465,8 @@ fn native_adapter_primitives(probe: bool) {
             .unwrap();
         let result: serde_json::Value = serde_json::from_str(marker).unwrap();
         assert_eq!(result["canary_denied"], mode != "plain");
+        assert_eq!(result["canary_after_object_changes"], mode != "plain");
+        assert_eq!(result["host_process_denied"], mode != "plain");
         if mode == "embedded" {
             assert_eq!(result["assets_protected"], true);
         }
