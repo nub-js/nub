@@ -774,17 +774,35 @@ fn run_lfs_with_runtime(control: Control, mut runtime: Vec<PathBuf>) {
             &[],
         ),
     );
-    assert_success(
-        "push LFS object",
-        invoke(
-            root.path(),
-            &clone,
-            &["push", "origin", "HEAD:main"],
-            control,
-            policy.as_ref(),
-            &[],
-        ),
+    let pushed = invoke(
+        root.path(),
+        &clone,
+        &["push", "origin", "HEAD:main"],
+        control,
+        policy.as_ref(),
+        &[],
     );
+    if !pushed.status.success() {
+        eprintln!(
+            "LFS_PRE_PUSH_HOOK {:?}",
+            std::fs::read_to_string(clone.join(".git/hooks/pre-push"))
+        );
+        let remote_path = root.path().join("remote.git");
+        for args in [
+            vec!["lfs", "logs", "last"],
+            vec![
+                "-c",
+                "alias.sandbox-hook=!sh -x .git/hooks/pre-push",
+                "sandbox-hook",
+                "origin",
+                remote_path.to_str().unwrap(),
+            ],
+        ] {
+            let output = invoke(root.path(), &clone, &args, control, policy.as_ref(), &[]);
+            eprintln!("LFS_HOOK_DIAGNOSTIC {args:?} {output:?}");
+        }
+    }
+    assert_success("push LFS object", pushed);
     let consumer = project.join("lfs-consumer");
     assert_success(
         "clone and fetch LFS object",

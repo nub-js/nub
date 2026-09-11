@@ -92,6 +92,21 @@ fn policy(root: &Path, fs: Value, extra_env: &[(&str, &str)]) -> nub_sandbox::Sa
         env.clone(),
     );
     let mut policy = compile(&json!({"fs": fs, "net": false}), &ctx).expect("tool policy compiles");
+    #[cfg(windows)]
+    if std::env::var_os("NUB_NATIVE_ANCESTOR_NODES").is_some() {
+        // Compare the Unix listing primitive on Windows before extending the bundle.
+        for ancestor in root.ancestors() {
+            let extra = compile(&json!({"fs": {ancestor.to_str().unwrap(): "r"}}), &ctx).unwrap();
+            policy.fs.rules.entries.extend(
+                extra
+                    .fs
+                    .rules
+                    .entries
+                    .into_iter()
+                    .filter(|rule| !rule.matcher.0.ends_with("/**")),
+            );
+        }
+    }
     policy.env.constructed = env;
     policy
 }
@@ -475,6 +490,48 @@ fn assert_success(tool: &Tool, phase: &str, output: &Output) {
     );
 }
 
+fn install_args(tool: &Tool) -> &'static [&'static str] {
+    match tool.kind.as_str() {
+        "npm" => &["install", "--ignore-scripts", "--no-audit", "--no-fund"],
+        "pnpm" | "yarn1" | "bun" => &["install", "--ignore-scripts"],
+        "yarn" if tool.name == "yarn2" => &["install", "--skip-builds"],
+        "yarn" => &["install", "--mode=skip-build"],
+        _ => unreachable!(),
+    }
+}
+
+fn bin_args(tool: &Tool) -> &'static [&'static str] {
+    match tool.kind.as_str() {
+        "npm" => &["exec", "--", "fixture-bin"],
+        "pnpm" => &["exec", "fixture-bin"],
+        "yarn1" => &["run", "fixture-bin"],
+        "yarn" if tool.name == "yarn2" => &["run", "fixture-bin"],
+        "yarn" => &["exec", "fixture-bin"],
+        "bun" => &["x", "--no-install", "fixture-bin"],
+        _ => unreachable!(),
+    }
+}
+
+fn global_args(tool: &Tool, package: String) -> Option<Vec<String>> {
+    Some(match tool.kind.as_str() {
+        "npm" | "bun" => vec!["install".into(), "--global".into(), package],
+        "pnpm" => vec!["add".into(), "--global".into(), package],
+        "yarn1" => vec!["global".into(), "add".into(), package],
+        "yarn" => return None,
+        _ => unreachable!(),
+    })
+}
+
+fn prune_args(tool: &Tool) -> &'static [&'static str] {
+    match tool.kind.as_str() {
+        "npm" => &["cache", "clean", "--force"],
+        "pnpm" => &["store", "prune"],
+        "yarn1" | "yarn" => &["cache", "clean"],
+        "bun" => &["pm", "cache", "rm"],
+        _ => unreachable!(),
+    }
+}
+
 fn run_normal_operations(
     tool: &Tool,
     root: &Path,
@@ -487,26 +544,10 @@ fn run_normal_operations(
         Some(policy) => invoke_confined(tool, tail, root, env, policy),
         None => invoke_unconfined(tool, tail, root, env),
     };
-    let install: &[&str] = match tool.kind.as_str() {
-        "npm" => &["install", "--ignore-scripts", "--no-audit", "--no-fund"],
-        "pnpm" => &["install", "--ignore-scripts"],
-        "yarn1" => &["install", "--ignore-scripts"],
-        "yarn" if tool.name == "yarn2" => &["install", "--skip-builds"],
-        "yarn" => &["install", "--mode=skip-build"],
-        "bun" => &["install", "--ignore-scripts"],
-        _ => unreachable!(),
-    };
+    let install = install_args(tool);
     assert_success(tool, "local install", &run(install));
     assert_success(tool, "warm reinstall", &run(install));
-    let exec: &[&str] = match tool.kind.as_str() {
-        "npm" => &["exec", "--", "fixture-bin"],
-        "pnpm" => &["exec", "fixture-bin"],
-        "yarn1" => &["run", "fixture-bin"],
-        "yarn" if tool.name == "yarn2" => &["run", "fixture-bin"],
-        "yarn" => &["exec", "fixture-bin"],
-        "bun" => &["x", "--no-install", "fixture-bin"],
-        _ => unreachable!(),
-    };
+    let exec = bin_args(tool);
     let output = run(exec);
     assert_success(tool, "installed-bin execution", &output);
     assert!(
@@ -531,25 +572,13 @@ fn run_global_install_and_cache_prune(
         return;
     }
     let package = root.join("project/package").to_string_lossy().into_owned();
-    let global = match tool.kind.as_str() {
-        "npm" => vec!["install".into(), "--global".into(), package],
-        "pnpm" => vec!["add".into(), "--global".into(), package],
-        "yarn1" => vec!["global".into(), "add".into(), package],
-        "bun" => vec!["install".into(), "--global".into(), package],
-        _ => unreachable!(),
-    };
+    let global = global_args(tool, package).unwrap();
     assert_success(
         tool,
         "configured global install",
         &invoke_owned(tool, &global, root, env, policy),
     );
-    let prune: Vec<String> = match tool.kind.as_str() {
-        "npm" => vec!["cache".into(), "clean".into(), "--force".into()],
-        "pnpm" => vec!["store".into(), "prune".into()],
-        "yarn1" => vec!["cache".into(), "clean".into()],
-        "bun" => vec!["pm".into(), "cache".into(), "rm".into()],
-        _ => unreachable!(),
-    };
+    let prune: Vec<String> = prune_args(tool).iter().map(|arg| (*arg).into()).collect();
     assert_success(
         tool,
         "configured cache prune",
@@ -704,34 +733,21 @@ fn run_retained_tool_control(name: &str, tooldirs: bool, unconfined: bool, sampl
         assert_success(
             tool,
             "retained install",
-            &run(args(tool, &["install", "--ignore-scripts"])),
+            &run(args(tool, install_args(tool))),
         );
     }
-    let bin = if tool.kind == "bun" {
-        vec!["x", "--no-install", "fixture-bin"]
-    } else {
-        vec!["run", "fixture-bin"]
-    };
-    let output = run(args(tool, &bin));
+    let output = run(args(tool, bin_args(tool)));
     assert_success(tool, "installed bin", &output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture-bin-ok"));
     let package = root.path().join("project/package").display().to_string();
-    let global = if tool.kind == "bun" {
-        vec!["install".into(), "--global".into(), package]
-    } else {
-        vec!["global".into(), "add".into(), package]
-    };
-    assert_success(tool, "global install", &run(args_owned(tool, &global)));
-    let prune = if tool.kind == "bun" {
-        vec!["pm", "cache", "rm"]
-    } else {
-        vec!["cache", "clean"]
-    };
-    assert_success(tool, "cache prune", &run(args(tool, &prune)));
+    if let Some(global) = global_args(tool, package) {
+        assert_success(tool, "global install", &run(args_owned(tool, &global)));
+    }
+    assert_success(tool, "cache prune", &run(args(tool, prune_args(tool))));
     assert_success(
         tool,
         "retained reinstall after prune",
-        &run(args(tool, &["install", "--ignore-scripts"])),
+        &run(args(tool, install_args(tool))),
     );
     let mut denied_paths = vec![canary.to_string_lossy().into_owned()];
     if cfg!(target_os = "linux") {

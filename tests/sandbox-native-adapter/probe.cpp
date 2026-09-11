@@ -312,6 +312,8 @@ static NTSTATUS NTAPI open_file(PHANDLE handle, ACCESS_MASK access, POBJECT_ATTR
     bool mapped = pipe_name(attrs, redirected, name, path);
     NTSTATUS status = true_open_file(handle, access, mapped ? &redirected : attrs, io, share, options);
     if (mapped) fprintf(stderr, "ADAPTER_PIPE_OPEN path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
+    if (status == static_cast<NTSTATUS>(0xc0000022L) && attrs && attrs->ObjectName)
+        fprintf(stderr, "ADAPTER_FILE_DENIED pid=%lu access=%08lx root=%p path=%.*ls\n", GetCurrentProcessId(), access, attrs->RootDirectory, int(attrs->ObjectName->Length / sizeof(wchar_t)), attrs->ObjectName->Buffer);
     return status;
 }
 
@@ -325,6 +327,8 @@ static NTSTATUS NTAPI nt_create_file(PHANDLE handle, ACCESS_MASK access, POBJECT
     NTSTATUS status = true_nt_create_file(handle, access, mapped ? &redirected : attrs, io, allocation,
         attributes, share, disposition, options, ea, ea_length);
     if (mapped) fprintf(stderr, "ADAPTER_PIPE_CLIENT path=%ls status=%08lx\n", path, static_cast<unsigned long>(status));
+    if (status == static_cast<NTSTATUS>(0xc0000022L) && attrs && attrs->ObjectName)
+        fprintf(stderr, "ADAPTER_FILE_DENIED pid=%lu access=%08lx root=%p path=%.*ls\n", GetCurrentProcessId(), access, attrs->RootDirectory, int(attrs->ObjectName->Length / sizeof(wchar_t)), attrs->ObjectName->Buffer);
     return status;
 }
 
@@ -459,6 +463,7 @@ static BOOL WINAPI create_process(LPCWSTR application, LPWSTR command,
                                   LPSECURITY_ATTRIBUTES thread_attrs, BOOL inherit,
                                   DWORD flags, LPVOID environment, LPCWSTR cwd,
                                   LPSTARTUPINFOW startup, LPPROCESS_INFORMATION child) {
+    fprintf(stderr, "ADAPTER_CREATE_PROCESS pid=%lu application=%ls command=%ls\n", GetCurrentProcessId(), application ? application : L"(null)", command ? command : L"(null)");
     if (!true_create_process(application, command, process_attrs, thread_attrs, inherit,
                              flags | CREATE_SUSPENDED, environment, cwd, startup, child)) return FALSE;
     if (!inject(child->hProcess, state)) {

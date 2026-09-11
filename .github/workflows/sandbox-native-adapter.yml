@@ -19,7 +19,7 @@ jobs:
       matrix:
         os: [windows-2022, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       RUSTUP_OVERRIDE_HOST_TRIPLE: x86_64-pc-windows-msvc
     steps:
@@ -158,23 +158,28 @@ jobs:
           foreach ($case in $cases) {
             $toolModes = $modes
             if ($case[0] -notin @('git', 'git-lfs')) { $toolModes += @('msys-plain', 'msys-embedded') }
+            if ($case[0] -eq 'bun132') { $toolModes += @('nodes-embedded', 'nodes-adapter') }
             foreach ($mode in $toolModes) {
               Remove-Item Env:NUB_SANDBOX_TOOL_MSYS_ROOT -ErrorAction SilentlyContinue
+              Remove-Item Env:NUB_NATIVE_ANCESTOR_NODES -ErrorAction SilentlyContinue
               Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
               Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
-              if ($mode -eq 'adapter') { $env:NUB_NATIVE_ADAPTER_PROBE_ENABLE = '1' }
-              if ($mode -in @('embedded', 'msys-embedded')) { $env:NUB_NATIVE_EMBEDDED_ADAPTER = '1' }
+              if ($mode -in @('adapter', 'nodes-adapter')) { $env:NUB_NATIVE_ADAPTER_PROBE_ENABLE = '1' }
+              if ($mode -in @('embedded', 'msys-embedded', 'nodes-embedded')) { $env:NUB_NATIVE_EMBEDDED_ADAPTER = '1' }
+              if ($mode.StartsWith('nodes-')) { $env:NUB_NATIVE_ANCESTOR_NODES = '1' }
               if ($mode.StartsWith('msys-')) { $env:NUB_SANDBOX_TOOL_MSYS_ROOT = $msysRoot }
               $test = if ($mode -in @('plain', 'msys-plain')) { $case[1] } else { $case[2] }
               & cargo test -p nub-sandbox --profile fast --lib $test -- --exact --ignored --nocapture --test-threads=1 *> "reports/$($case[0])-$mode.log"
               $code = $LASTEXITCODE
               $results += @{ tool = $case[0]; mode = $mode; test = $test; exit = $code }
+              $results | ConvertTo-Json > reports/tool-results.json
               Write-Host "$($case[0]) $mode exit=$code"
               Get-Content "reports/$($case[0])-$mode.log" -Tail 20
             }
           }
           Remove-Item Env:NUB_NATIVE_ADAPTER_PROBE_ENABLE -ErrorAction SilentlyContinue
           Remove-Item Env:NUB_SANDBOX_TOOL_MSYS_ROOT -ErrorAction SilentlyContinue
+          Remove-Item Env:NUB_NATIVE_ANCESTOR_NODES -ErrorAction SilentlyContinue
           Remove-Item Env:NUB_NATIVE_EMBEDDED_ADAPTER -ErrorAction SilentlyContinue
           $results | ConvertTo-Json > reports/tool-results.json
           if ($results | Where-Object { $_.mode -ne 'raw' -and $_.exit -ne 0 }) { exit 1 }
