@@ -106,6 +106,10 @@ fn confined(
 ) -> Output {
     eprintln!("CONFINED {program} {args:?}");
     let sandbox = Sandbox::new(policy).expect("tool sandbox acquires");
+    confined_in(&sandbox, program, args, root)
+}
+
+fn confined_in(sandbox: &Sandbox, program: &str, args: &[&str], root: &Path) -> Output {
     let prepared = sandbox
         .prepare(
             CommandSpec::new(program)
@@ -185,6 +189,15 @@ fn tools() -> Vec<Tool> {
 #[test]
 fn git_global_config_updates_an_existing_xdg_config_and_its_lock() {
     let git = require_git();
+    let confined_git =
+        |program, args: &[&str], root: &Path, policy: &nub_sandbox::SandboxPolicy| {
+            // Test the config grant independently of Windows' raw null-device limit.
+            #[cfg(windows)]
+            let sandbox = Sandbox::with_windows_native_compat(policy).unwrap();
+            #[cfg(not(windows))]
+            let sandbox = Sandbox::new(policy).unwrap();
+            confined_in(&sandbox, program, args, root)
+        };
     let unconfined_root = fixture();
     let args = [
         "config",
@@ -215,7 +228,7 @@ fn git_global_config_updates_an_existing_xdg_config_and_its_lock() {
     // that permits Git's create-lock/rename protocol without writable home.
     let exact_root = fixture();
     let git_config = prepare_config(exact_root.path());
-    let exact = confined(
+    let exact = confined_git(
         git,
         &args,
         exact_root.path(),
@@ -239,7 +252,7 @@ fn git_global_config_updates_an_existing_xdg_config_and_its_lock() {
 
     let tool_root = fixture();
     let tool_config = prepare_config(tool_root.path());
-    let tool_dirs = confined(
+    let tool_dirs = confined_git(
         git,
         &args,
         tool_root.path(),

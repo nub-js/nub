@@ -16,8 +16,8 @@ struct Payload {
     HANDLE null_device;
     char directory[MAX_PATH];
     wchar_t devices[26][MAX_PATH];
-    alignas(void*) BYTE user_sid[SECURITY_MAX_SID_SIZE];
-    alignas(void*) BYTE package_sid[SECURITY_MAX_SID_SIZE];
+    DWORD user_sid[SECURITY_MAX_SID_SIZE / sizeof(DWORD)];
+    DWORD package_sid[SECURITY_MAX_SID_SIZE / sizeof(DWORD)];
     BOOL identities_captured;
 };
 static Payload state = {};
